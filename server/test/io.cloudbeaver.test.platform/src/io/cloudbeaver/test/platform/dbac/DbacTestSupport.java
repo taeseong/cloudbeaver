@@ -18,6 +18,7 @@ package io.cloudbeaver.test.platform.dbac;
 
 import io.cloudbeaver.service.dbac.db.DbacSchema;
 import io.cloudbeaver.service.dbac.db.DbacSchemaConstants;
+import org.jkiss.code.NotNull;
 import org.jkiss.code.Nullable;
 import org.jkiss.dbeaver.DBException;
 import org.jkiss.dbeaver.model.connection.InternalDatabaseConfig;
@@ -83,6 +84,7 @@ final class DbacTestSupport {
     /** SQLSTATE meaning the transaction was already unusable; a symptom, never a diagnosis. */
     static final String SQL_STATE_IN_FAILED_TRANSACTION = "25P02";
 
+    @NotNull
     static SQLSchemaScriptSource realScriptSource() {
         return new ClassLoaderScriptSource(
             DbacSchema.class.getClassLoader(),
@@ -97,19 +99,22 @@ final class DbacTestSupport {
      * {@link AssertionError} is not an {@code Exception}, so it is not swallowed by the {@code catch
      * (Exception e)} in {@code SQLSchemaManager.updateSchema} and reaches the test unchanged.
      */
+    @NotNull
     static SQLSchemaScriptSource createScriptIsForbidden() {
         SQLSchemaScriptSource delegate = realScriptSource();
         return new SQLSchemaScriptSource() {
             @Override
-            public Reader openSchemaCreateScript(DBRProgressMonitor monitor, String specificPrefix) {
+            @NotNull
+            public Reader openSchemaCreateScript(@NotNull DBRProgressMonitor monitor, @NotNull String specificPrefix) {
                 throw new AssertionError(
                     "The create script must not be opened: on PostgreSQL the translator strips "
                         + "IF NOT EXISTS, so replaying it over an existing schema cannot work");
             }
 
             @Override
-            public Reader openSchemaUpdateScript(DBRProgressMonitor monitor, int versionNumber, String prefix)
-                throws IOException, DBException {
+            @Nullable
+            public Reader openSchemaUpdateScript(@NotNull DBRProgressMonitor monitor, int versionNumber, @NotNull String prefix)
+                    throws IOException, DBException {
                 return delegate.openSchemaUpdateScript(monitor, versionNumber, prefix);
             }
         };
@@ -120,30 +125,36 @@ final class DbacTestSupport {
      * (pass a value below 1 for a complete chain). Used to drive the update-chain tripwire without
      * touching the shipped resources.
      */
+    @NotNull
     static SQLSchemaScriptSource updateScriptsExcept(int missingVersion) {
         return new SQLSchemaScriptSource() {
             @Override
-            public Reader openSchemaCreateScript(DBRProgressMonitor monitor, String specificPrefix) {
+            @NotNull
+            public Reader openSchemaCreateScript(@NotNull DBRProgressMonitor monitor, @NotNull String specificPrefix) {
                 throw new AssertionError("The chain check must not open the create script");
             }
 
             @Override
-            public Reader openSchemaUpdateScript(DBRProgressMonitor monitor, int version, String prefix) {
+            @Nullable
+            public Reader openSchemaUpdateScript(@NotNull DBRProgressMonitor monitor, int version, @NotNull String prefix) {
                 return version == missingVersion ? null : new StringReader("SELECT 1;\n");
             }
         };
     }
 
     /** Test only script source used to inject a failing migration. */
-    static SQLSchemaScriptSource fixedScriptSource(String script) {
+    @NotNull
+    static SQLSchemaScriptSource fixedScriptSource(@NotNull String script) {
         return new SQLSchemaScriptSource() {
             @Override
-            public Reader openSchemaCreateScript(DBRProgressMonitor monitor, String specificPrefix) {
+            @NotNull
+            public Reader openSchemaCreateScript(@NotNull DBRProgressMonitor monitor, @NotNull String specificPrefix) {
                 return new StringReader(script);
             }
 
             @Override
-            public Reader openSchemaUpdateScript(DBRProgressMonitor monitor, int versionNumber, String prefix) {
+            @Nullable
+            public Reader openSchemaUpdateScript(@NotNull DBRProgressMonitor monitor, int versionNumber, @NotNull String prefix) {
                 return null;
             }
         };
@@ -156,11 +167,13 @@ final class DbacTestSupport {
      * is released once both have decided what the schema state is and are about to write to it, which is
      * the only window in which they can actually collide.
      */
-    static SQLSchemaVersionManager barrier(SQLSchemaVersionManager delegate, CyclicBarrier barrier) {
+    @NotNull
+    static SQLSchemaVersionManager barrier(@NotNull SQLSchemaVersionManager delegate, @NotNull CyclicBarrier barrier) {
         return new SQLSchemaVersionManager() {
             @Override
-            public int getCurrentSchemaVersion(DBRProgressMonitor monitor, Connection connection, String schemaName)
-                throws DBException, SQLException {
+            public int getCurrentSchemaVersion(
+                @NotNull DBRProgressMonitor monitor, @NotNull Connection connection, @NotNull String schemaName)
+                    throws DBException, SQLException {
                 int version = delegate.getCurrentSchemaVersion(monitor, connection, schemaName);
                 await(barrier);
                 return version;
@@ -173,14 +186,14 @@ final class DbacTestSupport {
 
             @Override
             public void updateCurrentSchemaVersion(
-                DBRProgressMonitor monitor, Connection connection, String schemaName, int version
+                @NotNull DBRProgressMonitor monitor, @NotNull Connection connection, @NotNull String schemaName, int version
             ) throws DBException, SQLException {
                 delegate.updateCurrentSchemaVersion(monitor, connection, schemaName, version);
             }
         };
     }
 
-    private static void await(CyclicBarrier barrier) throws DBException {
+    private static void await(@NotNull CyclicBarrier barrier) throws DBException {
         try {
             barrier.await(60, java.util.concurrent.TimeUnit.SECONDS);
         } catch (Exception e) {
@@ -201,10 +214,10 @@ final class DbacTestSupport {
      * @param firstRecorded first SQLException seen on the racing node's connection, or {@code null}
      */
     static void assertAcceptableRaceFailure(
-        Throwable error,
+        @NotNull Throwable error,
         @Nullable SQLException firstRecorded,
-        Set<String> allowedSqlStates,
-        String context
+        @NotNull Set<String> allowedSqlStates,
+        @NotNull String context
     ) {
         SQLException cause = firstRecorded != null ? firstRecorded : findSqlException(error);
         Assertions.assertNotNull(
@@ -226,7 +239,8 @@ final class DbacTestSupport {
      * Wraps a connection so the first {@link SQLException} thrown by any statement executed on it is
      * captured, before the migration runner's retry can replace it with a follow-up error.
      */
-    static Connection recording(Connection target, AtomicReference<SQLException> firstError) {
+    @NotNull
+    static Connection recording(@NotNull Connection target, @NotNull AtomicReference<SQLException> firstError) {
         return (Connection) Proxy.newProxyInstance(
             DbacTestSupport.class.getClassLoader(),
             new Class<?>[]{Connection.class},
@@ -242,8 +256,9 @@ final class DbacTestSupport {
             });
     }
 
+    @NotNull
     private static Object recordingStatement(
-        Statement target, Class<?> iface, AtomicReference<SQLException> firstError) {
+        @NotNull Statement target, @NotNull Class<?> iface, @NotNull AtomicReference<SQLException> firstError) {
         return Proxy.newProxyInstance(
             DbacTestSupport.class.getClassLoader(),
             new Class<?>[]{iface},
@@ -257,8 +272,9 @@ final class DbacTestSupport {
             });
     }
 
-    private static Object invoke(Object target, java.lang.reflect.Method method, Object[] args)
-        throws Throwable {
+    @Nullable
+    private static Object invoke(@NotNull Object target, @NotNull java.lang.reflect.Method method, @Nullable Object[] args)
+            throws Throwable {
         try {
             return method.invoke(target, args);
         } catch (InvocationTargetException e) {
@@ -277,8 +293,9 @@ final class DbacTestSupport {
      * Wraps a connection so that another node inserts the version row on {@code other} just before this
      * connection attempts its own INSERT, producing a genuine unique violation every time.
      */
+    @NotNull
     static Connection insertVersionRowConcurrently(
-        Connection target, Connection other, String schema, int otherVersion) {
+        @NotNull Connection target, @NotNull Connection other, @NotNull String schema, int otherVersion) {
         return (Connection) Proxy.newProxyInstance(
             DbacTestSupport.class.getClassLoader(),
             new Class<?>[]{Connection.class},
@@ -297,7 +314,8 @@ final class DbacTestSupport {
     }
 
     /** Wraps a connection so the version INSERT fails with a chosen SQLSTATE. */
-    static Connection failVersionInsertWith(Connection target, String sqlState) {
+    @NotNull
+    static Connection failVersionInsertWith(@NotNull Connection target, @NotNull String sqlState) {
         return (Connection) Proxy.newProxyInstance(
             DbacTestSupport.class.getClassLoader(),
             new Class<?>[]{Connection.class},
@@ -310,7 +328,8 @@ final class DbacTestSupport {
     }
 
     /** Wraps a connection so rolling back to a savepoint always fails. */
-    static Connection failSavepointRollback(Connection target) {
+    @NotNull
+    static Connection failSavepointRollback(@NotNull Connection target) {
         return (Connection) Proxy.newProxyInstance(
             DbacTestSupport.class.getClassLoader(),
             new Class<?>[]{Connection.class},
@@ -322,14 +341,14 @@ final class DbacTestSupport {
             });
     }
 
-    private static boolean isInsert(java.lang.reflect.Method method, Object[] args) {
+    private static boolean isInsert(@NotNull java.lang.reflect.Method method, @Nullable Object[] args) {
         return "prepareStatement".equals(method.getName())
             && args != null && args.length > 0
             && String.valueOf(args[0]).toUpperCase(java.util.Locale.ROOT).startsWith("INSERT");
     }
 
     /** True when the connection can still be used, i.e. the transaction was not left aborted. */
-    static boolean isUsable(Connection connection, String schema) {
+    static boolean isUsable(@NotNull Connection connection, @NotNull String schema) {
         try (Statement dbStat = connection.createStatement();
              ResultSet dbResult = dbStat.executeQuery(
                  "SELECT COUNT(*) FROM " + schema + "." + DbacSchemaConstants.VERSION_TABLE_NAME)
@@ -340,7 +359,8 @@ final class DbacTestSupport {
         }
     }
 
-    static SQLException findSqlException(Throwable error) {
+    @Nullable
+    static SQLException findSqlException(@Nullable Throwable error) {
         for (Throwable current = error; current != null; current = current.getCause()) {
             if (current instanceof SQLException sqlException) {
                 return sqlException;
@@ -352,7 +372,8 @@ final class DbacTestSupport {
         return null;
     }
 
-    static String describe(Throwable error) {
+    @NotNull
+    static String describe(@Nullable Throwable error) {
         if (error == null) {
             return "no error";
         }
@@ -375,7 +396,8 @@ final class DbacTestSupport {
 
     // ---------------------------------------------------------------- schema queries
 
-    static Integer readVersion(Connection connection) throws SQLException {
+    @Nullable
+    static Integer readVersion(@NotNull Connection connection) throws SQLException {
         try (PreparedStatement dbStat = connection.prepareStatement(
             "SELECT VERSION FROM {table_prefix}" + DbacSchemaConstants.VERSION_TABLE_NAME
                 + " WHERE MODULE_ID=?")
@@ -387,7 +409,7 @@ final class DbacTestSupport {
         }
     }
 
-    static int countVersionRows(Connection connection) throws SQLException {
+    static int countVersionRows(@NotNull Connection connection) throws SQLException {
         try (PreparedStatement dbStat = connection.prepareStatement(
             "SELECT COUNT(*) FROM {table_prefix}" + DbacSchemaConstants.VERSION_TABLE_NAME
                 + " WHERE MODULE_ID=?")
@@ -399,7 +421,7 @@ final class DbacTestSupport {
         }
     }
 
-    static void deleteVersionRow(Connection connection) throws SQLException {
+    static void deleteVersionRow(@NotNull Connection connection) throws SQLException {
         try (PreparedStatement dbStat = connection.prepareStatement(
             "DELETE FROM {table_prefix}" + DbacSchemaConstants.VERSION_TABLE_NAME + " WHERE MODULE_ID=?")
         ) {
@@ -408,13 +430,14 @@ final class DbacTestSupport {
         }
     }
 
-    static void execute(Connection connection, String sql) throws SQLException {
+    static void execute(@NotNull Connection connection, @NotNull String sql) throws SQLException {
         try (Statement dbStat = connection.createStatement()) {
             dbStat.execute(sql);
         }
     }
 
     /** Reads the production create script and returns its individual statements, comments removed. */
+    @NotNull
     static List<String> createScriptStatements() throws Exception {
         StringBuilder text = new StringBuilder();
         try (Reader reader = realScriptSource().openSchemaCreateScript(
@@ -439,49 +462,56 @@ final class DbacTestSupport {
     }
 
     /** A minimal config exposing only what {@code SQLSchemaManager} reads. */
-    static InternalDatabaseConfig config(InternalDatabaseConfig base, String schema) {
+    @NotNull
+    static InternalDatabaseConfig config(@Nullable InternalDatabaseConfig base, @NotNull String schema) {
         return new InternalDatabaseConfig() {
             @Override
+            @NotNull
             public String getDriver() {
                 return base == null ? "test" : base.getDriver();
             }
 
             @Override
-            public void setDriver(String driver) {
+            public void setDriver(@NotNull String driver) {
                 throw new UnsupportedOperationException();
             }
 
             @Override
+            @NotNull
             public String getUrl() {
                 return base == null ? "" : base.getUrl();
             }
 
             @Override
-            public void setUrl(String url) {
+            public void setUrl(@NotNull String url) {
                 throw new UnsupportedOperationException();
             }
 
             @Override
+            @NotNull
             public String getUser() {
                 return base == null ? "" : base.getUser();
             }
 
             @Override
+            @NotNull
             public String getPassword() {
                 return base == null ? "" : base.getPassword();
             }
 
             @Override
+            @NotNull
             public String getSchema() {
                 return schema;
             }
 
             @Override
-            public void setSchema(String s) {
+            public void setSchema(@NotNull String s) {
                 throw new UnsupportedOperationException();
             }
 
             @Override
+            @NotNull
             public Pool getPool() {
                 return base == null ? new Pool() : base.getPool();
             }

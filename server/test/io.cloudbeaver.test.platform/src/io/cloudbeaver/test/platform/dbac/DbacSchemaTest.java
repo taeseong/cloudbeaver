@@ -25,6 +25,8 @@ import io.cloudbeaver.service.dbac.db.DbacSchemaValidator;
 import io.cloudbeaver.service.dbac.db.DbacSchemaVersionManager;
 import io.cloudbeaver.service.security.EmbeddedSecurityControllerFactory;
 import io.cloudbeaver.service.security.db.CBDatabase;
+import org.jkiss.code.NotNull;
+import org.jkiss.code.Nullable;
 import org.jkiss.dbeaver.model.connection.InternalDatabaseConfig;
 import org.jkiss.dbeaver.model.runtime.DBRProgressMonitor;
 import org.jkiss.dbeaver.model.runtime.LoggingProgressMonitor;
@@ -172,7 +174,7 @@ public class DbacSchemaTest {
     @Test
     public void repeatedSchemaUpdateDoesNotRerunAnyMigration() throws Exception {
         try (Connection connection = database.openConnection()) {
-            long historyRowsBefore = countRows(connection, "{table_prefix}" + DbacSchemaConstants.TABLE_TW_HISTORY);
+            final long historyRowsBefore = countRows(connection, "{table_prefix}" + DbacSchemaConstants.TABLE_TW_HISTORY);
 
             // Version manager already reports the installed version, so SQLSchemaManager will neither
             // create nor upgrade.
@@ -292,9 +294,10 @@ public class DbacSchemaTest {
 
     // ---------------------------------------------------------------- helpers
 
+    @NotNull
     private static SQLSchemaManager newSchemaManager(
-        Connection connection,
-        InternalDatabaseConfig config
+        @NotNull Connection connection,
+        @NotNull InternalDatabaseConfig config
     ) {
         return new SQLSchemaManager(
             DbacSchemaConstants.SCHEMA_ID,
@@ -313,7 +316,8 @@ public class DbacSchemaTest {
             null);
     }
 
-    private static List<String> readAllVersionRows(Connection connection, String table) throws SQLException {
+    @NotNull
+    private static List<String> readAllVersionRows(@NotNull Connection connection, @NotNull String table) throws SQLException {
         List<String> rows = new ArrayList<>();
         try (PreparedStatement dbStat = connection.prepareStatement(
             "SELECT MODULE_ID, VERSION FROM " + table + " ORDER BY MODULE_ID");
@@ -326,7 +330,9 @@ public class DbacSchemaTest {
         return rows;
     }
 
-    private static Integer readVersion(Connection connection, String table, String moduleId) throws SQLException {
+    @Nullable
+    private static Integer readVersion(
+        @NotNull Connection connection, @NotNull String table, @NotNull String moduleId) throws SQLException {
         try (PreparedStatement dbStat = connection.prepareStatement(
             "SELECT VERSION FROM " + table + " WHERE MODULE_ID=?")
         ) {
@@ -337,7 +343,7 @@ public class DbacSchemaTest {
         }
     }
 
-    private static long countRows(Connection connection, String table) throws SQLException {
+    private static long countRows(@NotNull Connection connection, @NotNull String table) throws SQLException {
         try (PreparedStatement dbStat = connection.prepareStatement("SELECT COUNT(*) FROM " + table);
              ResultSet dbResult = dbStat.executeQuery()
         ) {
@@ -360,8 +366,8 @@ public class DbacSchemaTest {
      * precisely because probing accepts an object the migration could never have created, and a test that
      * probes is a test that passes for the wrong reason.
      */
-    private static boolean tableExists(Connection connection, String schemaName, String tableName)
-        throws SQLException {
+    private static boolean tableExists(@NotNull Connection connection, @NotNull String schemaName, @NotNull String tableName)
+            throws SQLException {
         DatabaseMetaData metaData = connection.getMetaData();
         String schema = DbacIdentifiers.fold(metaData, resolveSchema(connection, schemaName));
         String table = DbacIdentifiers.fold(metaData, tableName);
@@ -389,56 +395,64 @@ public class DbacSchemaTest {
      * Never null - passing null to JDBC metadata means "any schema", which would let a table created by
      * another test in a different schema satisfy the assertion.
      */
-    private static String resolveSchema(Connection connection, String configuredSchema) throws SQLException {
+    @NotNull
+    private static String resolveSchema(@NotNull Connection connection, @Nullable String configuredSchema) throws SQLException {
         if (configuredSchema != null && !configuredSchema.isEmpty()) {
             return configuredSchema;
         }
         return connection.getSchema();
     }
 
-    private static InternalDatabaseConfig withSchema(InternalDatabaseConfig base, String schema) {
+    @NotNull
+    private static InternalDatabaseConfig withSchema(@NotNull InternalDatabaseConfig base, @NotNull String schema) {
         return new InternalDatabaseConfig() {
             @Override
+            @NotNull
             public String getDriver() {
                 return base.getDriver();
             }
 
             @Override
-            public void setDriver(String driver) {
+            public void setDriver(@NotNull String driver) {
                 throw new UnsupportedOperationException();
             }
 
             @Override
+            @NotNull
             public String getUrl() {
                 return base.getUrl();
             }
 
             @Override
-            public void setUrl(String url) {
+            public void setUrl(@NotNull String url) {
                 throw new UnsupportedOperationException();
             }
 
             @Override
+            @NotNull
             public String getUser() {
                 return base.getUser();
             }
 
             @Override
+            @NotNull
             public String getPassword() {
                 return base.getPassword();
             }
 
             @Override
+            @NotNull
             public String getSchema() {
                 return schema;
             }
 
             @Override
-            public void setSchema(String s) {
+            public void setSchema(@NotNull String s) {
                 throw new UnsupportedOperationException();
             }
 
             @Override
+            @NotNull
             public Pool getPool() {
                 return base.getPool();
             }

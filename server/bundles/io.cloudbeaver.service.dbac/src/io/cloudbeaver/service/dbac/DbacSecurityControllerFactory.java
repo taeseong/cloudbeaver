@@ -22,6 +22,7 @@ import io.cloudbeaver.model.config.WebDatabaseConfig;
 import io.cloudbeaver.service.dbac.db.DbacSchema;
 import io.cloudbeaver.service.security.EmbeddedSecurityControllerFactory;
 import io.cloudbeaver.service.security.db.CBDatabase;
+import org.jkiss.code.NotNull;
 
 /**
  * Security controller factory which additionally registers the fork-owned DBAC schema module.
@@ -36,7 +37,8 @@ public class DbacSecurityControllerFactory<T extends ServletAuthApplication>
     extends EmbeddedSecurityControllerFactory<T> {
 
     @Override
-    protected CBDatabase makeDatabase(ServletApplication application, WebDatabaseConfig databaseConfig) {
+    @NotNull
+    protected CBDatabase makeDatabase(@NotNull ServletApplication application, @NotNull WebDatabaseConfig databaseConfig) {
         return new CBDatabase(application, databaseConfig, DbacSchema.getSchemaConfigs());
     }
 }

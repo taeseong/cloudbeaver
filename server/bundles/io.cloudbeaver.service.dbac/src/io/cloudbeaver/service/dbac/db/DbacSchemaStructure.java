@@ -236,19 +236,23 @@ public final class DbacSchemaStructure {
         return TYPE_NAME_ALIASES.get(normalized);
     }
 
-    private static Column varchar(String name, int size, boolean nullable) {
+    @NotNull
+    private static Column varchar(@NotNull String name, int size, boolean nullable) {
         return new Column(name, Types.VARCHAR, TYPE_VARCHAR, size, nullable);
     }
 
-    private static Column integer(String name, boolean nullable) {
+    @NotNull
+    private static Column integer(@NotNull String name, boolean nullable) {
         return new Column(name, Types.INTEGER, TYPE_INTEGER, SIZE_NOT_CHECKED, nullable);
     }
 
-    private static Column bigint(String name, boolean nullable) {
+    @NotNull
+    private static Column bigint(@NotNull String name, boolean nullable) {
         return new Column(name, Types.BIGINT, TYPE_BIGINT, SIZE_NOT_CHECKED, nullable);
     }
 
-    private static Column timestamp(String name, boolean nullable) {
+    @NotNull
+    private static Column timestamp(@NotNull String name, boolean nullable) {
         return new Column(name, Types.TIMESTAMP, TYPE_TIMESTAMP, SIZE_NOT_CHECKED, nullable);
     }
 

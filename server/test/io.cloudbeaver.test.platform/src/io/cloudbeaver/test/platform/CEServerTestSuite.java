@@ -39,7 +39,7 @@ import org.junit.platform.suite.api.Suite;
 @Suite
 @SelectClasses(
     {
-//        ConnectionsTest.class,
+        // ConnectionsTest.class,
         SQLQueryTranslatorTest.class,
         AuthenticationTest.class,
         ResourceManagerTest.class,

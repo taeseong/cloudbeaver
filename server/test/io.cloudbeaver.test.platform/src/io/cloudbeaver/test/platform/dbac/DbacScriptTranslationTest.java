@@ -18,6 +18,7 @@ package io.cloudbeaver.test.platform.dbac;
 
 import io.cloudbeaver.service.dbac.db.DbacSchema;
 import io.cloudbeaver.service.dbac.db.DbacSchemaConstants;
+import org.jkiss.code.NotNull;
 import org.jkiss.dbeaver.ext.h2.model.H2SQLDialect;
 import org.jkiss.dbeaver.ext.postgresql.model.PostgreDialect;
 import org.jkiss.dbeaver.model.impl.sql.BasicSQLDialect;
@@ -250,7 +251,7 @@ public class DbacScriptTranslationTest {
      * This exercises the same assertion against every forbidden family.
      */
     @Test
-    public void aStatefulUpdateScriptWouldBeRejected() {
+    public void statefulUpdateScriptWouldBeRejected() {
         for (String prefix : DbacScriptStatements.FORBIDDEN_STATEMENT_PREFIXES) {
             List<String> statements = executableStatements(prefix + " something;\n");
             Assertions.assertEquals(1, statements.size());
@@ -302,6 +303,7 @@ public class DbacScriptTranslationTest {
 
     // ---------------------------------------------------------------- helpers
 
+    @NotNull
     private static SQLSchemaScriptSource scriptSource() {
         return new ClassLoaderScriptSource(
             DbacSchema.class.getClassLoader(),
@@ -309,7 +311,8 @@ public class DbacScriptTranslationTest {
             DbacSchemaConstants.UPDATE_SCRIPT_PREFIX);
     }
 
-    private static String translateCreateScript(SQLDialect targetDialect) throws Exception {
+    @NotNull
+    private static String translateCreateScript(@NotNull SQLDialect targetDialect) throws Exception {
         String normalized = normalizedScript(
             scriptSource().openSchemaCreateScript(MONITOR, targetDialect.getDialectId()));
         return SQLQueryTranslator.translateScript(
@@ -317,11 +320,13 @@ public class DbacScriptTranslationTest {
     }
 
     /** Reads a script and substitutes the placeholder exactly the way the migration runner does. */
-    private static String normalizedScript(Reader reader) throws Exception {
+    @NotNull
+    private static String normalizedScript(@NotNull Reader reader) throws Exception {
         return CommonUtils.normalizeTableNames(rawScript(reader), TEST_SCHEMA);
     }
 
-    private static String rawScript(Reader reader) throws Exception {
+    @NotNull
+    private static String rawScript(@NotNull Reader reader) throws Exception {
         try (Reader r = reader) {
             StringBuilder sb = new StringBuilder();
             char[] buffer = new char[4096];
@@ -338,11 +343,12 @@ public class DbacScriptTranslationTest {
      * Delegates to {@link DbacScriptStatements}, whose exact behaviour is pinned by
      * {@code DbacScriptStatementsTest} - the instrument these tests measure with is itself tested.
      */
-    private static List<String> executableStatements(String translatedScript) {
+    @NotNull
+    private static List<String> executableStatements(@NotNull String translatedScript) {
         return DbacScriptStatements.split(translatedScript);
     }
 
-    private static int countStartingWith(List<String> statements, String keyword) {
+    private static int countStartingWith(@NotNull List<String> statements, @NotNull String keyword) {
         return DbacScriptStatements.countStartingWith(statements, keyword);
     }
 }

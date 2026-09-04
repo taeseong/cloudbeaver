@@ -16,6 +16,9 @@
  */
 package io.cloudbeaver.test.platform.dbac;
 
+import org.jkiss.code.NotNull;
+import org.jkiss.code.Nullable;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -40,7 +43,8 @@ public final class DbacScriptStatements {
      * upper case, whitespace collapsed to single spaces, leading blank and comment lines removed.
      * Blank pieces are dropped, as {@code executeScript} drops them.
      */
-    public static List<String> split(String translatedScript) {
+    @NotNull
+    public static List<String> split(@NotNull String translatedScript) {
         List<String> statements = new ArrayList<>();
         for (String piece : translatedScript.split(";")) {
             String statement = stripLeading(piece);
@@ -58,7 +62,8 @@ public final class DbacScriptStatements {
      * Only the <i>leading</i> run is removed. Everything from the first SQL token onwards is kept exactly
      * as it is, including any trailing comment, because that is what the database receives.
      */
-    public static String stripLeading(String piece) {
+    @NotNull
+    public static String stripLeading(@NotNull String piece) {
         String[] lines = piece.split("\n", -1);
         int first = 0;
         while (first < lines.length) {
@@ -77,7 +82,7 @@ public final class DbacScriptStatements {
     }
 
     /** Number of statements whose first token sequence is {@code keyword}. */
-    public static int countStartingWith(List<String> statements, String keyword) {
+    public static int countStartingWith(@NotNull List<String> statements, @NotNull String keyword) {
         int count = 0;
         for (String statement : statements) {
             if (statement.startsWith(keyword)) {
@@ -104,7 +109,8 @@ public final class DbacScriptStatements {
      * Returns the forbidden family a statement belongs to, or {@code null} when it is stateless.
      * Used instead of an assertion so both the JUnit tests and the offline harness can report on it.
      */
-    public static String forbiddenFamilyOf(String normalizedStatement) {
+    @Nullable
+    public static String forbiddenFamilyOf(@NotNull String normalizedStatement) {
         for (String prefix : FORBIDDEN_STATEMENT_PREFIXES) {
             if (normalizedStatement.equals(prefix) || normalizedStatement.startsWith(prefix + " ")
                 || normalizedStatement.startsWith(prefix + "(")) {

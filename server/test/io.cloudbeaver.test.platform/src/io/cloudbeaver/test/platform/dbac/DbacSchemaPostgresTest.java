@@ -22,6 +22,8 @@ import io.cloudbeaver.service.dbac.db.DbacSchemaConstants;
 import io.cloudbeaver.service.dbac.db.DbacSchemaReport;
 import io.cloudbeaver.service.dbac.db.DbacSchemaValidator;
 import io.cloudbeaver.service.dbac.db.DbacSchemaVersionManager;
+import org.jkiss.code.NotNull;
+import org.jkiss.code.Nullable;
 import org.jkiss.dbeaver.DBException;
 import org.jkiss.dbeaver.ext.postgresql.model.PostgreDialect;
 import org.jkiss.dbeaver.model.connection.InternalDatabaseConfig;
@@ -765,7 +767,7 @@ public class DbacSchemaPostgresTest {
 
     // ---------------------------------------------------------------- helpers
 
-    private void runRace(String schema, SQLSchemaScriptSource scriptSource) throws Exception {
+    private void runRace(@NotNull String schema, @NotNull SQLSchemaScriptSource scriptSource) throws Exception {
         CyclicBarrier barrier = new CyclicBarrier(2);
         List<AtomicReference<Throwable>> results = List.of(new AtomicReference<>(), new AtomicReference<>());
         // The runner retries a failed statement on the same connection, so on PostgreSQL the exception
@@ -837,10 +839,12 @@ public class DbacSchemaPostgresTest {
     }
 
     /** Forces the create branch of {@code SQLSchemaManager} regardless of the real state. */
+    @NotNull
     private static SQLSchemaVersionManager alwaysAbsentVersionManager() {
         return new SQLSchemaVersionManager() {
             @Override
-            public int getCurrentSchemaVersion(DBRProgressMonitor monitor, Connection connection, String schemaName) {
+            public int getCurrentSchemaVersion(
+                @NotNull DBRProgressMonitor monitor, @NotNull Connection connection, @NotNull String schemaName) {
                 return DbacSchemaConstants.SCHEMA_NOT_PRESENT;
             }
 
@@ -851,17 +855,17 @@ public class DbacSchemaPostgresTest {
 
             @Override
             public void updateCurrentSchemaVersion(
-                DBRProgressMonitor monitor, Connection connection, String schemaName, int version) {
+                @NotNull DBRProgressMonitor monitor, @NotNull Connection connection, @NotNull String schemaName, int version) {
                 // not reached: the create script fails first
             }
         };
     }
 
-    private static boolean mentions(String statement, String tableName) {
+    private static boolean mentions(@NotNull String statement, @NotNull String tableName) {
         return statement.toUpperCase(java.util.Locale.ROOT).contains(tableName);
     }
 
-    private static int count(Connection connection, String sql, String schema) throws SQLException {
+    private static int count(@NotNull Connection connection, @NotNull String sql, @NotNull String schema) throws SQLException {
         try (PreparedStatement dbStat = connection.prepareStatement(sql)) {
             dbStat.setString(1, schema);
             try (ResultSet dbResult = dbStat.executeQuery()) {
@@ -871,6 +875,7 @@ public class DbacSchemaPostgresTest {
         }
     }
 
+    @NotNull
     private static Properties credentials() {
         Properties props = new Properties();
         props.setProperty("user", USER);
@@ -878,10 +883,12 @@ public class DbacSchemaPostgresTest {
         return props;
     }
 
+    @NotNull
     private static Connection connect() throws SQLException {
         return driver.connect(URL, credentials());
     }
 
+    @Nullable
     private static File findDriverJar() {
         File dir = new File(System.getProperty("user.dir"));
         for (int i = 0; i < 6 && dir != null; i++, dir = dir.getParentFile()) {
@@ -895,7 +902,8 @@ public class DbacSchemaPostgresTest {
         return null;
     }
 
-    private static String freshSchema(String name) throws Exception {
+    @NotNull
+    private static String freshSchema(@NotNull String name) throws Exception {
         try (Connection connection = connect(); Statement dbStat = connection.createStatement()) {
             dbStat.execute("DROP SCHEMA IF EXISTS " + name + " CASCADE");
             dbStat.execute("CREATE SCHEMA " + name);
@@ -903,30 +911,34 @@ public class DbacSchemaPostgresTest {
         return name;
     }
 
+    @NotNull
     private static DbacSchemaVersionManager versionManager() {
         return versionManager(DbacSchemaConstants.CURRENT_SCHEMA_VERSION);
     }
 
     /** A manager that believes the shipped version is {@code latest}, for multi-version CAS scenarios. */
+    @NotNull
     private static DbacSchemaVersionManager versionManager(int latest) {
         return managerWithScripts(latest, DbacSchema.getScriptSource());
     }
 
     /** A manager whose update-script chain is supplied by the test, for tripwire scenarios. */
-    private static DbacSchemaVersionManager managerWithScripts(int latest, SQLSchemaScriptSource source) {
+    @NotNull
+    private static DbacSchemaVersionManager managerWithScripts(int latest, @NotNull SQLSchemaScriptSource source) {
         return new DbacSchemaVersionManager(latest, DbacSchemaConstants.SCHEMA_ID, source);
     }
 
+    @NotNull
     private static SQLSchemaScriptSource updateScriptsExcept(int missingVersion) {
         return DbacTestSupport.updateScriptsExcept(missingVersion);
     }
 
     private interface SchemaBody {
-        void run(Connection raw, Connection proxied, String schema) throws Exception;
+        void run(@NotNull Connection raw, @NotNull Connection proxied, @NotNull String schema) throws Exception;
     }
 
     /** Installs the schema in a fresh namespace through the real migration, then runs the body. */
-    private void withInstalledSchema(String name, SchemaBody body) throws Exception {
+    private void withInstalledSchema(@NotNull String name, @NotNull SchemaBody body) throws Exception {
         String schema = freshSchema(name);
         try (Connection raw = connect()) {
             InternalDatabaseConfig config = configFor(schema);
@@ -937,7 +949,7 @@ public class DbacSchemaPostgresTest {
     }
 
     /** Sets the stored version directly, bypassing the manager, to build a starting state. */
-    private static void forceVersion(Connection connection, int version) throws SQLException {
+    private static void forceVersion(@NotNull Connection connection, int version) throws SQLException {
         try (PreparedStatement dbStat = connection.prepareStatement(
             "UPDATE {table_prefix}" + DbacSchemaConstants.VERSION_TABLE_NAME
                 + " SET VERSION=? WHERE MODULE_ID=?")) {
@@ -956,10 +968,11 @@ public class DbacSchemaPostgresTest {
         }
     }
 
+    @NotNull
     private static SQLSchemaManager schemaManager(
-        Connection connection,
-        InternalDatabaseConfig config,
-        SQLSchemaScriptSource scriptSource
+        @NotNull Connection connection,
+        @NotNull InternalDatabaseConfig config,
+        @NotNull SQLSchemaScriptSource scriptSource
     ) {
         return new SQLSchemaManager(
             DbacSchemaConstants.SCHEMA_ID,
@@ -973,7 +986,8 @@ public class DbacSchemaPostgresTest {
             null);
     }
 
-    private static InternalDatabaseConfig configFor(String schema) {
+    @NotNull
+    private static InternalDatabaseConfig configFor(@NotNull String schema) {
         return DbacTestSupport.config(null, schema);
     }
 }

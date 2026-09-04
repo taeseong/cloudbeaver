@@ -73,7 +73,7 @@ public final class DbacIdentifiers {
      */
     @NotNull
     public static String requireUnquotableSchema(@NotNull DatabaseMetaData metaData, @NotNull String schema)
-        throws SQLException, DBException {
+            throws SQLException, DBException {
         if (schema.isEmpty()) {
             // An empty schema would be passed to JDBC metadata as "objects with no schema", which matches
             // whatever the driver decides. The module never guesses a schema.

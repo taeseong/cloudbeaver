@@ -25,6 +25,7 @@ import io.cloudbeaver.service.dbac.db.DbacSchemaValidator;
 import io.cloudbeaver.service.dbac.db.DbacSchemaVersionManager;
 import io.cloudbeaver.service.security.EmbeddedSecurityControllerFactory;
 import io.cloudbeaver.service.security.db.CBDatabase;
+import org.jkiss.code.NotNull;
 import org.jkiss.dbeaver.DBException;
 import org.jkiss.dbeaver.model.connection.InternalDatabaseConfig;
 import org.jkiss.dbeaver.model.runtime.DBRProgressMonitor;
@@ -90,7 +91,7 @@ public class DbacSchemaRecoveryTest {
     public void h2DoesNotRollBackDdl() throws Exception {
         String schema = freshSchema("DBAC_REC_DDL");
         try (Connection connection = database.openConnection()) {
-            boolean autoCommit = connection.getAutoCommit();
+            final boolean autoCommit = connection.getAutoCommit();
             connection.setAutoCommit(false);
             try (Statement dbStat = connection.createStatement()) {
                 dbStat.execute("CREATE TABLE " + schema + ".DDL_ROLLBACK_PROBE (ID INTEGER)");
@@ -591,7 +592,7 @@ public class DbacSchemaRecoveryTest {
 
     // ---------------------------------------------------------------- helpers
 
-    private void runRace(String schema) throws Exception {
+    private void runRace(@NotNull String schema) throws Exception {
         CyclicBarrier barrier = new CyclicBarrier(2);
         List<AtomicReference<Throwable>> results = List.of(new AtomicReference<>(), new AtomicReference<>());
         // The runner retries a failed statement, so the exception that escapes can be a follow-up error.
@@ -666,12 +667,13 @@ public class DbacSchemaRecoveryTest {
         }
     }
 
-    private static boolean mentions(String statement, String tableName) {
+    private static boolean mentions(@NotNull String statement, @NotNull String tableName) {
         return statement.toUpperCase(Locale.ROOT).contains(tableName);
     }
 
     /** Returns the real CREATE TABLE statement of one table, so partial states use exactly the real DDL. */
-    private static String statementFor(String tableName) throws Exception {
+    @NotNull
+    private static String statementFor(@NotNull String tableName) throws Exception {
         for (String statement : DbacTestSupport.createScriptStatements()) {
             String upper = statement.toUpperCase(Locale.ROOT);
             if (upper.contains("CREATE TABLE") && upper.contains(tableName)) {
@@ -681,22 +683,25 @@ public class DbacSchemaRecoveryTest {
         throw new IllegalStateException("CREATE TABLE statement not found for " + tableName);
     }
 
+    @NotNull
     private static DbacSchemaVersionManager versionManager() {
         return versionManager(DbacSchemaConstants.CURRENT_SCHEMA_VERSION);
     }
 
     /** A manager that believes the shipped version is {@code latest}, for multi-version CAS scenarios. */
+    @NotNull
     private static DbacSchemaVersionManager versionManager(int latest) {
         return managerWithScripts(latest, DbacSchema.getScriptSource());
     }
 
     /** A manager whose update-script chain is supplied by the test, for tripwire scenarios. */
-    private static DbacSchemaVersionManager managerWithScripts(int latest, SQLSchemaScriptSource source) {
+    @NotNull
+    private static DbacSchemaVersionManager managerWithScripts(int latest, @NotNull SQLSchemaScriptSource source) {
         return new DbacSchemaVersionManager(latest, DbacSchemaConstants.SCHEMA_ID, source);
     }
 
     /** Sets the stored version directly, bypassing the manager, to build a starting state. */
-    private static void forceVersion(Connection connection, int version) throws SQLException {
+    private static void forceVersion(@NotNull Connection connection, int version) throws SQLException {
         try (PreparedStatement dbStat = connection.prepareStatement(
             "UPDATE {table_prefix}" + DbacSchemaConstants.VERSION_TABLE_NAME
                 + " SET VERSION=? WHERE MODULE_ID=?")) {
@@ -715,10 +720,11 @@ public class DbacSchemaRecoveryTest {
         }
     }
 
+    @NotNull
     private static SQLSchemaManager schemaManager(
-        Connection connection,
-        InternalDatabaseConfig config,
-        SQLSchemaScriptSource scriptSource
+        @NotNull Connection connection,
+        @NotNull InternalDatabaseConfig config,
+        @NotNull SQLSchemaScriptSource scriptSource
     ) {
         return new SQLSchemaManager(
             DbacSchemaConstants.SCHEMA_ID,
@@ -732,7 +738,8 @@ public class DbacSchemaRecoveryTest {
             null);
     }
 
-    private static String freshSchema(String name) throws Exception {
+    @NotNull
+    private static String freshSchema(@NotNull String name) throws Exception {
         try (Connection connection = database.openConnection();
              Statement dbStat = connection.createStatement()
         ) {
@@ -742,7 +749,8 @@ public class DbacSchemaRecoveryTest {
         return name;
     }
 
-    private static boolean tableExists(Connection connection, String schema, String tableName) throws SQLException {
+    private static boolean tableExists(
+        @NotNull Connection connection, @NotNull String schema, @NotNull String tableName) throws SQLException {
         try (ResultSet dbResult = connection.getMetaData().getTables(
             null, schema.toUpperCase(Locale.ROOT), tableName, new String[]{"TABLE"})
         ) {
@@ -750,7 +758,8 @@ public class DbacSchemaRecoveryTest {
         }
     }
 
-    private static InternalDatabaseConfig withSchema(String schema) {
+    @NotNull
+    private static InternalDatabaseConfig withSchema(@NotNull String schema) {
         return DbacTestSupport.config(database.getDatabaseConfig(), schema);
     }
 }

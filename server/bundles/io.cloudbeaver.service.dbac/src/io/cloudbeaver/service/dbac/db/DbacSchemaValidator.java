@@ -57,7 +57,7 @@ public final class DbacSchemaValidator {
      * @throws DBException if anything is missing or does not match; the caller must fail initialization
      */
     public static void validate(@NotNull Connection connection, @NotNull String schema)
-        throws DBException, SQLException {
+            throws DBException, SQLException {
         DbacSchemaReport report = inspect(connection, schema);
         if (!report.isComplete()) {
             throw new DBException(
@@ -79,7 +79,7 @@ public final class DbacSchemaValidator {
      */
     @NotNull
     public static DbacSchemaReport inspect(@NotNull Connection connection, @NotNull String schema)
-        throws SQLException, DBException {
+            throws SQLException, DBException {
         DatabaseMetaData metaData = connection.getMetaData();
         String resolvedSchema = DbacIdentifiers.requireUnquotableSchema(metaData, schema);
 
@@ -343,6 +343,7 @@ public final class DbacSchemaValidator {
         return actualSchema == null || DbacIdentifiers.sameIdentifier(expectedSchema, actualSchema);
     }
 
+    @NotNull
     private static String describeNullable(int nullable) {
         return switch (nullable) {
             case DatabaseMetaData.columnNoNulls -> "NOT NULL";

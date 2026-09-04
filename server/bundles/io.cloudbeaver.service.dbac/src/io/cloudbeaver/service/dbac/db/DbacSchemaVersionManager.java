@@ -92,6 +92,8 @@ public class DbacSchemaVersionManager implements SQLSchemaVersionManager {
     private final SQLSchemaScriptSource scriptSource;
 
     /**
+     * Builds a version manager for the DBAC schema module.
+     *
      * @param scriptSource the same source {@code InternalDB.updateSchema} builds for this module, used to
      *                     check the update script chain before an upgrade is allowed to start
      */
@@ -107,9 +109,9 @@ public class DbacSchemaVersionManager implements SQLSchemaVersionManager {
 
     @Override
     public int getCurrentSchemaVersion(
-        DBRProgressMonitor monitor,
-        Connection connection,
-        String schemaName
+        @NotNull DBRProgressMonitor monitor,
+        @NotNull Connection connection,
+        @NotNull String schemaName
     ) throws DBException, SQLException {
         String schema = resolveEffectiveSchema(connection, schemaName);
         DbacSchemaReport report = DbacSchemaValidator.inspect(connection, schema);
@@ -220,8 +222,8 @@ public class DbacSchemaVersionManager implements SQLSchemaVersionManager {
      *
      * @param fromVersion version currently installed; scripts are required for every version above it
      */
-    private void requireCompleteUpdateScriptChain(DBRProgressMonitor monitor, int fromVersion)
-        throws DBException {
+    private void requireCompleteUpdateScriptChain(@NotNull DBRProgressMonitor monitor, int fromVersion)
+            throws DBException {
         List<Integer> missing = new ArrayList<>();
         for (int version = fromVersion + 1; version <= currentSchemaVersion; version++) {
             try (Reader script = scriptSource.openSchemaUpdateScript(monitor, version, null)) {
@@ -266,7 +268,7 @@ public class DbacSchemaVersionManager implements SQLSchemaVersionManager {
      */
     @Override
     public void updateCurrentSchemaVersion(
-        DBRProgressMonitor monitor,
+        @NotNull DBRProgressMonitor monitor,
         @NotNull Connection connection,
         @NotNull String schemaName,
         int version
@@ -307,7 +309,7 @@ public class DbacSchemaVersionManager implements SQLSchemaVersionManager {
      * Inserts the version row, resolving a concurrent insert without leaving the transaction aborted.
      */
     private void insertVersionRow(@NotNull Connection connection, @NotNull String schema, int version)
-        throws DBException, SQLException {
+            throws DBException, SQLException {
         // A savepoint is only possible - and only needed - inside an explicit transaction. In autocommit
         // mode a failed statement rolls back by itself and nothing else is at risk.
         Savepoint savepoint = connection.getAutoCommit() ? null : trySetSavepoint(connection);
@@ -410,7 +412,7 @@ public class DbacSchemaVersionManager implements SQLSchemaVersionManager {
      * @return number of rows changed; 1 on success, 0 when the precondition did not hold
      */
     private int compareAndSetVersion(@NotNull Connection connection, int expectedPrevious, int target)
-        throws SQLException {
+            throws SQLException {
         try (PreparedStatement dbStat = connection.prepareStatement(
             "UPDATE {table_prefix}" + DbacSchemaConstants.VERSION_TABLE_NAME
                 + " SET VERSION=?,UPDATE_TIME=CURRENT_TIMESTAMP WHERE MODULE_ID=? AND VERSION=?")
@@ -424,7 +426,7 @@ public class DbacSchemaVersionManager implements SQLSchemaVersionManager {
 
     @Nullable
     private Integer readModuleVersion(@NotNull Connection connection, @NotNull String schema)
-        throws SQLException, DBException {
+            throws SQLException, DBException {
         try (PreparedStatement dbStat = connection.prepareStatement(
             "SELECT VERSION FROM {table_prefix}" + DbacSchemaConstants.VERSION_TABLE_NAME
                 + " WHERE MODULE_ID=?")
@@ -452,7 +454,7 @@ public class DbacSchemaVersionManager implements SQLSchemaVersionManager {
      */
     @NotNull
     private String resolveEffectiveSchema(@NotNull Connection connection, @Nullable String configuredSchema)
-        throws DBException, SQLException {
+            throws DBException, SQLException {
         String schema = CommonUtils.isEmpty(configuredSchema) ? connection.getSchema() : configuredSchema;
         if (CommonUtils.isEmpty(schema)) {
             throw new DBException(

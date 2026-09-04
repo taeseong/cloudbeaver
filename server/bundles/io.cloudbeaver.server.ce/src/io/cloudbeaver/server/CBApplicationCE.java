@@ -48,6 +48,7 @@ public class CBApplicationCE extends CBApplication<CBServerConfig> {
     }
 
     @Override
+    @NotNull
     public SMController createSecurityController(@NotNull SMCredentialsProvider credentialsProvider) throws DBException {
         return new DbacSecurityControllerFactory<>().createSecurityService(
             this,
@@ -56,7 +57,9 @@ public class CBApplicationCE extends CBApplication<CBServerConfig> {
             getServerConfiguration().getSecurityManagerConfiguration()
         );
     }
+
     @Override
+    @NotNull
     public SMAdminController getAdminSecurityController(@NotNull SMCredentialsProvider credentialsProvider) throws DBException {
         return new DbacSecurityControllerFactory<>().createSecurityService(
             this,
@@ -66,6 +69,7 @@ public class CBApplicationCE extends CBApplication<CBServerConfig> {
         );
     }
 
+    @NotNull
     protected SMAdminController createGlobalSecurityController() throws DBException {
         return new DbacSecurityControllerFactory<>().createSecurityService(
             this,
