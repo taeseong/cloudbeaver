@@ -76,7 +76,7 @@ public abstract class BaseServletPlatform extends BasePlatformImpl {
         // Remove temp folder
         if (tempFolder != null) {
 
-            if (!ContentUtils.deleteFileRecursive(tempFolder.toFile())) {
+            if (!ContentUtils.deleteFileRecursive(tempFolder)) {
                 log.warn("Can't delete temp folder '" + tempFolder.toAbsolutePath() + "'");
             }
             tempFolder = null;

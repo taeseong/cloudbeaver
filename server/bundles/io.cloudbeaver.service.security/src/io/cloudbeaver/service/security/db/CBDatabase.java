@@ -57,7 +57,9 @@ import org.jkiss.utils.SecurityUtils;
 import java.io.*;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.sql.Connection;
 import java.sql.Driver;
 import java.sql.PreparedStatement;
@@ -209,7 +211,7 @@ public class CBDatabase extends InternalDB<WebDatabaseConfig> {
         if (CommonUtils.isEmpty(databaseConfig.getPassword())) {
             databaseConfig.setPassword(SecurityUtils.generatePassword(8));
             try {
-                IOUtils.writeFileFromString(pwdFile, databaseConfig.getPassword());
+                Files.writeString(pwdFile.toPath(), databaseConfig.getPassword(), Charset.defaultCharset());
             } catch (IOException e) {
                 log.error(e);
             }
