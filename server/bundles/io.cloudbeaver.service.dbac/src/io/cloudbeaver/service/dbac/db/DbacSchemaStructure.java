@@ -47,7 +47,7 @@ public final class DbacSchemaStructure {
      */
     public record Column(
         @NotNull String name,
-        int jdbcType,
+        @NotNull Set<Integer> jdbcTypes,
         @NotNull String canonicalType,
         int size,
         boolean nullable
@@ -80,6 +80,16 @@ public final class DbacSchemaStructure {
     public static final String TYPE_TIMESTAMP = "TIMESTAMP";
 
     /**
+     * Canonical family of the zoned timestamp every DBAC time column uses
+     * <p>
+     * Schema version 2 moved them all off naive { TIMESTAMP}. A naive column stores a wall clock
+     * rendered in whatever time zone the writing session happened to use, so two application nodes in
+     * different zones would disagree about when the same grant expires. A zoned column stores an
+     * absolute instant, which no session setting can reinterpret.
+     */
+    public static final String TYPE_TIMESTAMP_TZ = "TIMESTAMP WITH TIME ZONE";
+
+    /**
      * Vendor spellings of {@code TYPE_NAME} that are known to be exactly the declared type, mapped to the
      * canonical family.
      * <p>
@@ -110,9 +120,15 @@ public final class DbacSchemaStructure {
         Map.entry("INT4", TYPE_INTEGER),
         Map.entry("BIGINT", TYPE_BIGINT),
         Map.entry("INT8", TYPE_BIGINT),
+        // Naive spellings are still listed, and still map to the naive family. They are not accepted
+        // anywhere in this schema any more - every time column expects TYPE_TIMESTAMP_TZ - but keeping
+        // them recognised turns a database left on schema version 1 into a clear "has type timestamp but
+        // must be TIMESTAMP WITH TIME ZONE" instead of the vaguer "unrecognised type name".
         Map.entry("TIMESTAMP", TYPE_TIMESTAMP),
-        // SQL standard spelling of a naive timestamp. Explicitly NOT "timestamptz".
-        Map.entry("TIMESTAMP WITHOUT TIME ZONE", TYPE_TIMESTAMP)
+        Map.entry("TIMESTAMP WITHOUT TIME ZONE", TYPE_TIMESTAMP),
+        // The zoned spellings, measured on H2 2.4.240 and PostgreSQL 16.15 respectively.
+        Map.entry("TIMESTAMP WITH TIME ZONE", TYPE_TIMESTAMP_TZ),
+        Map.entry("TIMESTAMPTZ", TYPE_TIMESTAMP_TZ)
     );
 
     private static final List<Table> TABLES = List.of(
@@ -238,22 +254,33 @@ public final class DbacSchemaStructure {
 
     @NotNull
     private static Column varchar(@NotNull String name, int size, boolean nullable) {
-        return new Column(name, Types.VARCHAR, TYPE_VARCHAR, size, nullable);
+        return new Column(name, Set.of(Types.VARCHAR), TYPE_VARCHAR, size, nullable);
     }
 
     @NotNull
     private static Column integer(@NotNull String name, boolean nullable) {
-        return new Column(name, Types.INTEGER, TYPE_INTEGER, SIZE_NOT_CHECKED, nullable);
+        return new Column(name, Set.of(Types.INTEGER), TYPE_INTEGER, SIZE_NOT_CHECKED, nullable);
     }
 
     @NotNull
     private static Column bigint(@NotNull String name, boolean nullable) {
-        return new Column(name, Types.BIGINT, TYPE_BIGINT, SIZE_NOT_CHECKED, nullable);
+        return new Column(name, Set.of(Types.BIGINT), TYPE_BIGINT, SIZE_NOT_CHECKED, nullable);
     }
 
+    /**
+     * A zoned timestamp column
+     * <p>
+     * Two JDBC type codes are accepted because the two engines disagree, measured rather than assumed:
+     * H2 2.4.240 reports {@code 2014} ({@code TIMESTAMP_WITH_TIMEZONE}) while PostgreSQL 16.15 reports
+     * {@code 93} ({@code TIMESTAMP}) for {@code timestamptz}. The type code therefore cannot separate a
+     * zoned column from a naive one on PostgreSQL - only {@code TYPE_NAME} can, which is why an
+     * unrecognised spelling stays a failure.
+     */
     @NotNull
     private static Column timestamp(@NotNull String name, boolean nullable) {
-        return new Column(name, Types.TIMESTAMP, TYPE_TIMESTAMP, SIZE_NOT_CHECKED, nullable);
+        return new Column(
+            name, Set.of(Types.TIMESTAMP, Types.TIMESTAMP_WITH_TIMEZONE), TYPE_TIMESTAMP_TZ,
+            SIZE_NOT_CHECKED, nullable);
     }
 
     private DbacSchemaStructure() {

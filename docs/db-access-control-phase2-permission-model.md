@@ -17,8 +17,8 @@
 검사가 통째로 건너뛰어진다는 사실을 직접 확인해(`WebServiceBindingBase.java:321`) 관리 API에 독립 guard를 의무화했고(§7.2),
 transaction 상태를 4-상태 machine으로 교체해 `originalGrantId` provenance를 도입했으며(§9), current-state/history 분리 + PK +
 optimistic CAS로 동시성 문제를 제거했고(§5.3), ALLOW audit을 대상 DB 실행 **이전**에 기록하도록 확정했으며(§11), 시간 권위를
-**metadata DB clock 단일 domain**으로 바꿔 다중 노드 skew를 구조적으로 제거했다(§8.1). Phase 3 구현자가 추가로 내려야 할
-보안 정책 결정은 남기지 않았다.
+**metadata DB clock 단일 domain**으로 바꿨다(§8.1 — 단, Slice 2에서 이 규칙이 아직 완전히 성립하지 않음을
+확인했다. §8.1의 정정 박스를 반드시 함께 읽을 것). Phase 3 구현자가 추가로 내려야 할 보안 정책 결정은 남기지 않았다.
 
 ## 2. 확정된 권한 모델
 
@@ -130,25 +130,83 @@ index `(USER_ID, CHANGE_TIME)`, `(PROJECT_ID, CONNECTION_ID, CHANGE_TIME)`. curr
 
 ### 5.3 동시 grant/revoke — current-state + PK + optimistic CAS — DECIDED
 
-초판의 "각각 revoke 후 INSERT, 마지막 commit이 승자"는 **오류였다.** READ COMMITTED에서 두 transaction은 서로의 uncommitted
-INSERT를 볼 수 없어 active row가 2개 생길 수 있고, "유효 row 하나라도 있으면 ALLOW" 규칙과 결합하면 짧은 새 grant 뒤에 더 긴
-과거 concurrent grant가 권한을 계속 유지시킨다. 다음으로 교체한다.
+> **정정 이력**
+>
+> - **1판** "각각 revoke 후 INSERT, 마지막 commit이 승자" — 폐기. READ COMMITTED에서 두 transaction은 서로의
+>   uncommitted INSERT를 볼 수 없어 active row가 2개 생길 수 있고, "유효 row 하나라도 있으면 ALLOW"와 결합하면
+>   짧은 새 grant 뒤에 더 긴 과거 grant가 권한을 계속 유지시켰다.
+> - **2판** 아래 절차의 초기 형태. **2단계(불변 start revision → 즉시 conflict)와 4단계(영향 0건이면 1로 돌아가
+>   재시도)가 서로 모순이었다.** 다른 transaction이 선행하면 revision이 반드시 바뀌므로 2단계에서 이미 conflict가
+>   확정되고, 4단계의 재시도는 도달 불가능하다. 도달시키려면 재시도 때 start revision을 갱신해야 하는데, 그러면
+>   **I12(revoke commit 이후 지연된 grant 차단)가 깨진다** — 지연된 grant가 새 revision을 관측해 되살아난다.
+> - **3판** 재시도 범위를 "revision이 start 값과 **여전히 같은** transient 충돌"로 좁히고, 거부된 요청은
+>   history에 남기지 않는다. I10 기대값도 이에 맞춰 정정했다(§13).
+> - **4판** 3판까지의 절차는 **실패 경로가 fail-open이었다.**
+>   `JDBCTransaction`으로 감싼 뒤 실패 시 rollback을 시도하고 로그만 남겼는데, rollback이 실패하면 그 사실이
+>   호출자에게 전달되지 않고 `close()`의 `setAutoCommit(true)`가 **대기 중인 변경을 커밋했다.** H2와 PostgreSQL
+>   양쪽에서 재현 결과 `rollbacks=2 / setAutoCommit(true)=1 / aborts=0`으로 **1 row가 실제로 커밋되었다.**
+>   4판은 `MetadataTransaction`(§12.2)을 도입해 rollback 실패를 poisoned 상태로 만들고, 원인 예외에
+>   `addSuppressed`로 붙여 전달하며, auto-commit을 복원하지 않고 커넥션을 폐기시킨다. **poisoned는 transient로
+>   분류하지 않으므로 재시도 대상이 아니다.**
+> - **5판** 4판은 poisoned 판정을 `catch (SQLException)` 안에서 내렸다. 그러면
+>   **보안 불변식이 driver가 고른 예외 클래스에 의존한다** — `connection.rollback()`이 unchecked 예외나
+>   `Error`를 던지면 poisoned가 되지 않고, `close()`의 `setAutoCommit(true)`가 부분 상태를 커밋한다. 독립 QA가
+>   H2와 PostgreSQL 양쪽에서 **history 0건·audit 미실행 상태의 `DBAC_TW_CURRENT` row 1건이 커밋되는 것을
+>   재현했다.** 5판은 **rollback 시도 이전에 poisoned를 설정하고 성공 시에만 해제한다.** 판정이 예외 클래스가
+>   아니라 실행 순서로 결정되므로 모든 실패 경로가 같은 종단 상태에 도달한다.
+> - **6판(현행, 2차 독립 QA 반려 후 확정)** 5판까지 `close()`는 **commit도 rollback도 되지 않은 transaction에**
+>   auto-commit을 복원했다. 실패가 없었어도 JDBC 규약상 그 복원이 대기 중 작업을 **커밋한다** — 2차 QA가 H2에서
+>   row 1건 커밋을 실측했다. coordinator의 두 경로는 모든 분기에서 결정을 내리므로 현재 도달 경로는 없으나,
+>   `MetadataTransaction`은 이후 Slice가 재사용할 primitive이고 스스로 "부분 상태를 커밋할 수 없다"고 선언한다.
+>   현행은 `close()`가 **결정되지 않은 transaction을 먼저 rollback하고**, 그 rollback마저 실패하면 poisoned 경로로
+>   넘어간다. 보장이 호출자의 규율이 아니라 클래스에 있다.
 
 **구조:** current row는 PK로 key당 최대 1개(§5.1), 이력은 §5.2에 append하며 두 갱신은 한 transaction이다.
-**갱신 절차(grant·revoke 공통, 한 transaction):**
-1. `SELECT REVISION, GRANT_ID FROM DBAC_TW_CURRENT WHERE key` — 없으면 `observedRevision = 0`.
-2. 요청 접수 시 기록해 둔 `observedRevisionAtRequestStart`와 1의 값이 다르면 **요청을 폐기**하고 `CONFLICT_SUPERSEDED`를
-   반환한다(재시도하지 않는다). 이것이 "revoke commit 이후 지연된 grant가 뒤늦게 살아나는" 경로를 차단한다.
-3. row가 없으면 `INSERT ... (REVISION=1)`, 있으면 `UPDATE ... SET ..., REVISION=REVISION+1 WHERE key AND REVISION=?`.
-4. INSERT가 PK 위반이거나 UPDATE 영향 건수가 0이면 **다른 transaction이 선행한 것**이므로 1로 돌아가 재시도한다.
-   재시도 한도 **3회**, 초과 시 요청을 실패시킨다(**fail-closed** — 부분 반영 금지, current row 불변).
-5. history INSERT와 audit(§11)을 같은 transaction에서 수행한다.
 
-**dialect 호환성:** `PRIMARY KEY`, `UPDATE ... WHERE REVISION=?`, PK 위반 감지만 쓰므로 H2·PostgreSQL에서 동일하게 동작한다
-(`ON CONFLICT`, partial index, `MERGE`, `SELECT ... FOR UPDATE`, `SERIALIZABLE` 미사용). **단일 JVM lock을 쓰지 않아 다중
-노드에서도 안전하다** — 직렬화는 DB의 PK와 row 수준 write 충돌이 담당한다. "코드베이스에 잠금 관행이 없다"는 초판의 근거는
-폐기하며, 보안 invariant가 기존 관행보다 우선한다. **최종 상태 결정론:** 동시 grant 2건 중 하나만 성공하고 다른 하나는
-2단계에서 폐기되거나 4단계 재시도 후 나중 값으로 수렴하며, current row는 **정확히 0개 또는 1개**이고 history에 전 과정이 남는다.
+**불변식 — `observedRevisionAtRequestStart`**
+
+요청 접수 시점에 관측한 revision은 **요청 수명 동안 변경하지 않는다.** row가 없었으면 0이다. 재시도해도 이 값은
+갱신하지 않는다. 이 불변식이 I12의 유일한 근거다: 지연된 grant transaction은 자신이 시작할 때 본 세계에서만
+유효하며, 그 사이 누군가 상태를 바꿨다면 되살아날 자격이 없다.
+
+**갱신 절차(grant·revoke 공통, 한 transaction)**
+
+1. `SELECT REVISION, GRANT_ID FROM {table_prefix}DBAC_TW_CURRENT WHERE key` — 없으면 `observedRevision = 0`.
+2. 1의 값이 `observedRevisionAtRequestStart`와 **다르면 즉시 `CONFLICT_SUPERSEDED`.** 재시도하지 않는다.
+   current row와 history 어느 것도 변경하지 않는다.
+3. row가 없으면 `INSERT ... (REVISION=1)`, 있으면 `UPDATE ... SET ..., REVISION=REVISION+1 WHERE key AND REVISION=?`.
+4. history INSERT를 같은 transaction에서 수행하고 함께 commit한다. history는 **실제로 commit된 state transition만**
+   기록한다. 거부된 시도는 history 대상이 아니며 audit(§11) 대상이다.
+
+**충돌 처리 — 재시도 범위**
+
+INSERT가 PK 위반이거나 UPDATE 영향 건수가 0이면 다른 writer가 선행한 것이다. 이때:
+
+- **깨진 transaction 안에서 재시도하지 않는다.** PostgreSQL은 실패한 statement 이후 transaction을 `25P02`로
+  두므로 이어지는 statement가 모두 실패한다. 명시적 `rollback()` 후 **새 transaction에서** 상태를 재조회한다.
+- 재조회한 revision이 `observedRevisionAtRequestStart`와 **다르면 즉시 conflict.** 재시도하지 않는다.
+- 재조회한 revision이 **여전히 start 값과 같은 경우에만** transient 충돌로 보고 재시도한다. 이 경우는 선행 writer가
+  rollback했거나 lock timeout/deadlock으로 실패한 상황이다. 최대 **3회**.
+- 3회를 초과하면 **fail-closed** — 요청 실패, current row와 history 모두 불변, 부분 반영 없음.
+
+**기존 grant의 정상 교체**
+
+conflict가 아닌 정상 교체(같은 key에 유효한 grant가 있는데 새 grant가 CAS를 통과)에서는 history에 두 건을 남긴다.
+
+- 이전 grant에 대한 `SUPERSEDED`
+- 새 grant에 대한 `GRANTED`
+
+두 history INSERT와 current row UPDATE는 **하나의 transaction**이다. history INSERT가 실패하면 current 변경도
+rollback되고, current 변경이 실패하면 history도 남지 않는다.
+
+**dialect 호환성:** `PRIMARY KEY`, `UPDATE ... WHERE REVISION=?`, PK 위반 감지만 쓰므로 H2·PostgreSQL에서 동일하게
+동작한다(`ON CONFLICT`, partial index, `MERGE`, `SELECT ... FOR UPDATE`, `SERIALIZABLE` 미사용). **단일 JVM lock을
+쓰지 않아 다중 노드에서도 안전하다** — 직렬화는 DB의 PK와 row 수준 write 충돌이 담당한다. "코드베이스에 잠금
+관행이 없다"는 1판의 근거는 폐기하며, 보안 invariant가 기존 관행보다 우선한다.
+
+**최종 상태 결정론:** 동일 start revision으로 동시 grant 2건이면 정확히 1건이 성공하고 1건은 2단계에서
+`CONFLICT_SUPERSEDED`로 폐기된다. current row는 정확히 1개, `GRANTED` history는 정확히 1건이며, 거부된 요청의
+history는 0건이다.
 
 ### 5.4 Migration version 충돌 회피 — DECIDED
 
@@ -297,6 +355,44 @@ if (skew > dbacMaxClockSkewSeconds)  →  write authorization DENY (CLOCK_SKEW_E
 **테스트 가능성:** `MetadataDbClock`을 인터페이스로 두어 `dbNow`를 제어하고, 서로 다른 노드에서 grant와 authorization을
 수행하는 시나리오(§13 I13)를 검증한다.
 
+
+> **[Slice 2 재검토 확정] session time zone 의존성 — schema version 2로 해소**
+>
+> 최초 Slice 2 구현의 clock primitive는 `SELECT LOCALTIMESTAMP`를 읽어 `TIMESTAMP` (without time zone)
+> 컬럼에 저장했다. `LOCALTIMESTAMP`는 **DB session의 time zone**으로 렌더링되고 PostgreSQL JDBC driver는
+> session time zone을 **클라이언트 JVM의 기본 시간대**로 설정하므로, 서로 다른 기본 시간대를 가진 두 노드는
+> 같은 절대 시각에 대해 서로 다른 wall-clock 값을 쓰고 읽는다. UTC+9 노드가 grant하고 UTC 노드가
+> `EXPIRES_AT > LOCALTIMESTAMP`로 판정하면 TEMP_WRITE가 offset 차이만큼 **연장된다.** 노드가 하나여도
+> 안전하지 않다 — DST fall-back에서는 wall clock이 되돌아가므로 `2026-11-01 05:30Z`와 `06:30Z`가 둘 다
+> `01:30`으로 저장되고, 그 구간에 걸친 grant가 최대 1시간 연장된다.
+>
+> **결정: 두 선택지 중 2번(zoned 타입)을 택했다.** 1번(metadata connection 획득 시 session time zone을 UTC로
+> 고정)은 더 작은 변경이지만 **우회 가능하다.** 고정 지점을 지나지 않고 connection을 얻는 경로 — 다른 repository,
+> 운영자의 직접 접속, 향후 추가되는 호출자 — 는 모두 자기 session zone으로 naive 컬럼을 해석하며, 그 사실이
+> 컬럼 타입에 남지 않으므로 review로도 드러나지 않는다. 반면 `TIMESTAMP WITH TIME ZONE` 컬럼은 값 자체가
+> 절대 시각이므로 **어떤 session zone에서 접근하든 같은 instant를 돌려준다.** 안전성이 호출 규약이 아니라
+> 스키마에 들어 있는 쪽을 택한다.
+>
+> 구현: `dbac_schema_update_2.sql`(8개 시간 컬럼 `SET DATA TYPE TIMESTAMP WITH TIME ZONE`),
+> `CURRENT_SCHEMA_VERSION = 2`, `MetadataDbClock`은 `SELECT CURRENT_TIMESTAMP`를 `OffsetDateTime`으로 읽고
+> **JVM clock fallback을 두지 않는다**(clock 조회 실패는 fail-closed). `MetadataDbTime`은 `Instant`를 보유한다.
+> `DbacSchemaStructure`의 컬럼 타입 검증은 `DATA_TYPE`이 엔진별로 다르므로(H2 2014, PostgreSQL 93) 집합
+> 비교로 완화했으나 `TYPE_NAME`은 여전히 정확히 일치해야 한다 — naive 스펠링도 allowlist에 남겨 version 1
+> 데이터베이스가 명확한 메시지를 받게 한다.
+>
+> 검증: 서로 다른 session zone에서 쓰고 읽어도 같은 instant가 나오는 것, 만료 비교가 zone에 무관한 것,
+> DST fall-back의 두 instant가 구분되는 것, clock 조회 실패가 fail-closed인 것을 PostgreSQL 테스트에서 확인했다
+> (`TempWriteRepositoryPostgresTest`). 기존 값 변환은 migrating session의 zone을 따르므로, 실제 마이그레이션
+> 대상이 되는 선존 컬럼은 `DBAC_SCHEMA_INFO.UPDATE_TIME` 하나뿐임을 script 주석에 남겼다.
+
+> **[Slice 2 정정 추가] 만료 데이터 정리는 `DBAC_TW_CURRENT` 행을 삭제하지 않는다**
+>
+> §9의 scheduler 허용 용도("만료된 데이터 정리")를 `DBAC_TW_CURRENT`에 적용하면 안 된다. current 행을 삭제하면
+> 그 key의 `REVISION` 카운터가 다음 grant에서 1로 되돌아가고, 그러면 **오래된 start revision을 들고 있는 지연된
+> grant가 다시 유효해진다** — I12(revoke 이후 지연된 grant 부활 차단)의 근거가 무너진다.
+>
+> 정리 대상은 `DBAC_TW_HISTORY`와 `DBAC_AUDIT_EVENT`로 한정한다. revoke·만료된 current 행은 `REVOKED_AT`을
+> 채운 상태로 **남겨 둔다**(§5.1의 설계 의도와 동일).
 ### 8.2 Linearization 및 "즉시 revoke"의 의미 — DECIDED
 
 metadata DB의 권한 변경과 대상 DB의 write는 **하나의 transaction으로 묶을 수 없다.** grant/revoke의 linearization point는
@@ -448,10 +544,35 @@ upstream `WebSQLConstants`를 수정하지 않는다).
 ### 12.2 저장소 구현 관행 (STATIC VERIFIED 기반)
 
 커넥션은 반드시 `CBDatabase.openConnection()`으로 얻는다 — `dataSource.getConnection()`을 직접 쓰면 `{table_prefix}` 치환이
-사라진다. 쓰기는 `JDBCTransaction`으로 감싸되 `close()`가 rollback을 하지 않으므로
-`catch (Exception e) { txn.rollback(); throw e; }`를 명시한다. 조회 실패 시 **null을 반환하지 않고** 예외를 올려 §10에서 DENY로
+사라진다. 쓰기는 **`JDBCTransaction`으로 감싸지 않는다** — 그 `close()`는 `setAutoCommit(true)`를 복원하고, JDBC
+규약상 `setAutoCommit(true)`는 **대기 중인 transaction을 commit한다.** rollback이 실패한 뒤 close가 이어지면
+막으려던 변경이 그대로 커밋된다(fail-open). 대신 `MetadataTransaction`을 쓴다: rollback 실패 시 transaction을
+`poisoned`로 표시하고, 실패를 원인 예외에 `addSuppressed`로 붙여 **호출자에게 반드시 보이게** 하며,
+`close()`에서 **auto-commit을 복원하지 않고** `abort()`로 커넥션을 끊는다. auto-commit을 off로 남기는 것이
+DBCP의 `rollbackOnReturn`(기본 true) → `passivateObject` 재시도 → 실패 시 `destroy` 경로를 유도해
+**커넥션이 폐기되도록 만드는 장치**이므로, 복원은 편의가 아니라 결함이다. poisoned transaction은
+transient로 분류하지 않으며 **재시도하지 않는다.** poisoned 표시는 **rollback 시도 이전에 설정하고 성공 시에만
+해제한다** — catch 절에서 판정하면 driver가 던지는 예외 클래스가 보안 불변식을 결정하게 되고, unchecked 예외나
+`Error`가 그 판정을 통째로 우회한다(§5.3 5판). `close()`는 **결정되지 않은 transaction을 rollback한다** — 실패가
+없었더라도 auto-commit 복원은 곧 commit이므로, 호출자가 commit/rollback을 잊은 경로도 같은 보장을 받아야
+한다(§5.3 6판). 이 보장을 테스트에서 직접 구동할 수 있도록 `MetadataTransaction`과 그 생성자만 public이고
+`commit`/`rollback`은 package-private으로 남는다 — 패키지가 `x-friends`로 테스트 bundle에만 열려 있으므로
+production bundle은 접근할 수 없다.
+
+조회 실패 시 **null을 반환하지 않고** 예외를 올려 §10에서 DENY로
 변환한다. SQL에 `{table_prefix}`를 직접 기입하고 LIMIT/OFFSET은 `getDialect().getOffsetLimitQueryPart(...)`, IN 절은
 `SQLUtils.generateParamList(n)`을 쓰며 H2와 PostgreSQL **공통 문법만** 사용한다.
+
+**admin API Slice로 이관하는 요구사항 하나:** `connection.commit()`이 서버에서 성공한 뒤 응답이 유실되면
+coordinator는 예외를 올리지만 grant row는 커밋되어 있다. 단일 DB transaction에 내재된 모호성이므로 이 계층에서
+해소할 수 없다. 따라서 **admin API는 mutation 예외를 최종 결과로 신뢰하지 말고 current row를 재조회해야 한다.**
+그렇지 않으면 "부여 실패"를 보고한 뒤 실제로는 TEMP_WRITE가 살아 있는 상태가 된다.
+
+audit sink에는 그 transaction의 **DB clock 값과 커밋될 row**를 넘긴다. 시각을 넘기지 않으면 구현자가 clock을 다시
+읽거나 JVM clock을 쓰게 되는데, 후자는 §8.1이 제거한 결함을 되살린다. revoke는 교체 대상이 아니라 `asRevoked(...)`로
+만든 **커밋될 형태**를 넘겨, 관찰자가 전이를 스스로 재구성하지 않게 한다. 감사 없는 coordinator는
+`withoutAuditing(...)`이라는 이름으로만 만들 수 있다 — 무음 기본값을 두면 감사 계층 도입 후 가장 짧은 생성자를
+집은 호출자가 기록 없는 권한 부여를 하게 된다.
 
 ### 12.3 `authorize()`가 호출되어야 하는 operation category
 
@@ -480,7 +601,7 @@ permission cache는 Phase 3 초기 구현에서 도입 금지, `DataSourceDescri
   **U9** `GRANT_ID` 교체 후 COMMIT → `GRANT_SUPERSEDED` DENY. **U10** reconnect·재부여가 TAINTED/BLOCKED를 해제하지 않음.
 - **U11** audit 직렬화에 SQL 원문·credential 부재. **U12** `TEMP_WRITE_EXPIRED`가 반복 판정에도 grant당 1건.
   **U13** 스냅샷 불일치 시 `GRANT_STALE`. **U14** `userId==null`·`PROJECT_ID='anonymous'` 모두 DENY.
-  **U15** CAS 재시도 한도(3회) 초과 시 요청 실패 + current row 불변. **U16** skew 계산식(§8.1)이 임계값 경계에서 정확.
+  **U15 [정정]** CAS 재시도는 revision이 start 값과 여전히 같은 transient 충돌에만 적용된다. revision이 바뀌면 재시도 없이 즉시 conflict. 3회 초과 시 요청 실패 + current/history 불변. **U16** skew 계산식(§8.1)이 임계값 경계에서 정확.
 
 **I — 통합(metadata DB + throwaway 대상 DB)**
 - **I1** userA+dbA ALLOW. **I2** userA+dbB DENY(connection 격리). **I3** userB+dbA DENY(user 격리).
@@ -488,7 +609,11 @@ permission cache는 Phase 3 초기 구현에서 도입 금지, `DataSourceDescri
 - **I5** revoke 후 기존 세션 DENY. **I6** revoke 후 두 번째 tab DENY. **I7** metadata DB 장애: write DENY, **read는 정상**.
   **I8** project 이동/삭제 시 자동 DENY. **I9** schema migration: fork module이 `DBAC_SCHEMA_INFO`에만 기록하고
   **`CB_SCHEMA_INFO`의 CE version 29 불변**.
-- **I10** 두 ADMIN이 같은 key에 **서로 다른 기간으로 동시 grant** → current row 정확히 1개, history 2건, 결정론적.
+- **I10 [정정]** 두 ADMIN이 같은 key에 **동일 `observedRevisionAtRequestStart`로 서로 다른 기간을 동시 grant** →
+  성공 정확히 1건, `CONFLICT_SUPERSEDED` 정확히 1건, current row 정확히 1개, `GRANTED` history 정확히 1건,
+  **거부된 요청의 history 0건**. (1판의 "history 2건"은 오류였다. 거부된 시도는 state transition이 아니므로
+  history가 아니라 audit 대상이다 — §5.3 정정 이력 참조. history 2건은 conflict가 아닌 *정상 교체*에서만
+  발생하며 그때는 `SUPERSEDED` + `GRANTED`다.)
   **I11** grant와 revoke 동시 실행 → current row 0 또는 1개, 이력·audit이 current state와 모순 없음.
 - **I12** **revoke commit 이후 지연된 grant transaction commit** → `CONFLICT_SUPERSEDED`로 폐기, 과거 grant가 살아나지 않음.
   **I13** 서로 다른 application 노드에서 grant와 authorization 수행(노드 로컬 시계를 인위적으로 어긋나게) → 판정이 DB clock

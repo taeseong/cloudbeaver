@@ -28,8 +28,15 @@ public final class DbacSchemaConstants {
     /** Module id of this schema. Deliberately different from the CE module id {@code CB_CE}. */
     public static final String SCHEMA_ID = "CB_DBAC";
 
-    /** Version of the schema shipped with this build. */
-    public static final int CURRENT_SCHEMA_VERSION = 1;
+    /**
+     * Version of the schema shipped with this build
+     * <p>
+     * Version 2 moved every time column from naive {@code TIMESTAMP} to {@code TIMESTAMP WITH TIME
+     * ZONE}. A naive column stores whatever wall clock the writing session rendered, so the same
+     * instant is stored differently by nodes in different time zones and a grant expires at a
+     * different moment depending on which node looks. See {@code db/dbac_schema_update_2.sql}.
+     */
+    public static final int CURRENT_SCHEMA_VERSION = 2;
 
     /**
      * No version is considered obsolete: drop+recreate of this schema is never allowed.

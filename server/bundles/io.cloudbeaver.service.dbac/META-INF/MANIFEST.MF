@@ -12,5 +12,6 @@ Require-Bundle: io.cloudbeaver.model,
  org.jkiss.dbeaver.model,
  org.jkiss.dbeaver.model.sql.jdbc
 Export-Package: io.cloudbeaver.service.dbac,
+ io.cloudbeaver.service.dbac.tempwrite;x-friends:="io.cloudbeaver.test.platform",
  io.cloudbeaver.service.dbac.db
 Automatic-Module-Name: io.cloudbeaver.service.dbac

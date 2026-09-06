@@ -44,23 +44,38 @@ DEFAULT_REPORT = (
 REQUIRED_PROPERTY = "dbac.test.postgres.required"
 REQUIRED_VALUE = "true"
 
-POSTGRES_CLASS = "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest"
+# Every class that must reach a real PostgreSQL. Both abort through Assumptions when the database is
+# unusable and the required property is absent, so both have to be counted - checking only one would
+# leave the other free to skip while the summary still printed a PostgreSQL number.
+POSTGRES_CLASSES = (
+    "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
+    "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
+)
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
 # make this check agree with whatever ran, including a run that lost half its test cases. Adding or
 # removing a DBAC scenario is expected to fail here once, and to be updated by hand.
 #
-# All five DBAC classes are listed, not just the PostgreSQL one: dropping a class from
-# CEServerTestSuite's @SelectClasses removes its test cases from the report entirely, and a check that
-# only looked at PostgreSQL would stay green while the rest of the regression net quietly disappeared.
+# Every DBAC class is listed, not just the PostgreSQL ones: dropping a class from CEServerTestSuite's
+# @SelectClasses removes its test cases from the report entirely, and a check that only looked at
+# PostgreSQL would stay green while the rest of the regression net quietly disappeared.
 EXPECTED_DBAC_TESTS = {
-    "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest": 21,
-    "io.cloudbeaver.test.platform.dbac.DbacSchemaRecoveryTest": 17,
+    "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest": 23,
+    "io.cloudbeaver.test.platform.dbac.DbacSchemaRecoveryTest": 19,
     "io.cloudbeaver.test.platform.dbac.DbacScriptTranslationTest": 9,
     "io.cloudbeaver.test.platform.dbac.DbacSchemaTest": 7,
     "io.cloudbeaver.test.platform.dbac.DbacScriptStatementsTest": 6,
+    "io.cloudbeaver.test.platform.dbac.TempWriteModelTest": 18,
+    "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest": 32,
+    "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest": 18,
 }
-EXPECTED_POSTGRES_TESTS = EXPECTED_DBAC_TESTS[POSTGRES_CLASS]
+
+for _postgres_class in POSTGRES_CLASSES:
+    if _postgres_class not in EXPECTED_DBAC_TESTS:
+        raise SystemExit(
+            "verify_dbac_surefire.py is inconsistent: " + _postgres_class
+            + " is listed as a PostgreSQL class but has no pinned count"
+        )
 
 # A test case is only accepted as having passed if it carries none of these. skipped/failure/error are
 # the ordinary outcomes; flakyFailure and rerunFailure appear when Surefire is configured to retry, and
@@ -100,7 +115,7 @@ def main(argv):
     if actual is None:
         fail(
             "{0} is absent from the Surefire properties. The property never reached the forked test "
-            "JVM, so DbacSchemaPostgresTest was free to skip instead of fail. Check that the workflow "
+            "JVM, so the PostgreSQL classes were free to skip instead of fail. Check that the workflow "
             "still appends -DdebugArgs=-D{0}=true and that server/test/pom.xml still appends "
             "${{debugArgs}} to the tycho-surefire argLine.".format(REQUIRED_PROPERTY)
         )
@@ -138,11 +153,11 @@ def main(argv):
                     "is not evidence either.".format(len(offenders), classname, element, offenders)
                 )
 
-    postgres_cases = by_class[POSTGRES_CLASS]
+    postgres_count = sum(len(by_class[name]) for name in POSTGRES_CLASSES)
     total = sum(len(cases) for cases in by_class.values())
     print(
         "DBAC scenarios verified: postgres_testcases={0} dbac_testcases={1} "
-        "skipped=0 failures=0 errors=0".format(len(postgres_cases), total)
+        "skipped=0 failures=0 errors=0".format(postgres_count, total)
     )
     return 0
 

@@ -242,6 +242,15 @@ public class DbacSchemaRecoveryTest {
     @Test
     public void validatorRejectsStructuralDamage() throws Exception {
         List<String[]> mutations = new ArrayList<>();
+        // Schema version 2 moved every time column to TIMESTAMP WITH TIME ZONE, and the validator's
+        // type check had to be widened to a set of JDBC type codes because the two engines report
+        // different ones for a zoned column. These two mutations are what keeps that widening honest:
+        // a naive column must still be refused, or the session-timezone defect version 2 removed
+        // would come back silently on any database that was altered by hand.
+        mutations.add(new String[]{"expiry silently made naive",
+            "ALTER TABLE %s.DBAC_TW_CURRENT ALTER COLUMN EXPIRES_AT SET DATA TYPE TIMESTAMP"});
+        mutations.add(new String[]{"history time silently made naive",
+            "ALTER TABLE %s.DBAC_TW_HISTORY ALTER COLUMN CHANGE_TIME SET DATA TYPE TIMESTAMP"});
         mutations.add(new String[]{"wrong column type",
             "ALTER TABLE %s.DBAC_AUDIT_EVENT DROP COLUMN DENIAL_REASON",
             "ALTER TABLE %s.DBAC_AUDIT_EVENT ADD COLUMN DENIAL_REASON INTEGER"});
@@ -447,12 +456,16 @@ public class DbacSchemaRecoveryTest {
             Connection connection = new InternalProxyConnection(rawConnection, config);
             schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
 
+            // Stated relative to the shipped version so the bound keeps being a bound as the schema
+            // grows: a build one version behind must refuse to record the newer one it cannot create.
+            int older = DbacSchemaConstants.CURRENT_SCHEMA_VERSION - 1;
             Assertions.assertThrows(
                 DBException.class,
-                () -> versionManager(1).updateCurrentSchemaVersion(MONITOR, connection, schema, 2),
-                "A build shipping version 1 must not record version 2");
+                () -> versionManager(older).updateCurrentSchemaVersion(
+                    MONITOR, connection, schema, DbacSchemaConstants.CURRENT_SCHEMA_VERSION),
+                "A build shipping version " + older + " must not record a newer version");
             Assertions.assertEquals(
-                1, DbacTestSupport.readVersion(connection).intValue(),
+                DbacSchemaConstants.CURRENT_SCHEMA_VERSION, DbacTestSupport.readVersion(connection).intValue(),
                 "The existing row must be left exactly as it was");
             Assertions.assertEquals(1, DbacTestSupport.countVersionRows(connection));
 
@@ -460,7 +473,8 @@ public class DbacSchemaRecoveryTest {
             DbacTestSupport.deleteVersionRow(connection);
             Assertions.assertThrows(
                 DBException.class,
-                () -> versionManager(1).updateCurrentSchemaVersion(MONITOR, connection, schema, 2));
+                () -> versionManager(older).updateCurrentSchemaVersion(
+                    MONITOR, connection, schema, DbacSchemaConstants.CURRENT_SCHEMA_VERSION));
             Assertions.assertEquals(0, DbacTestSupport.countVersionRows(connection));
 
             // Break the structure, then ask again. Both the version bound and the structure check would
@@ -470,7 +484,7 @@ public class DbacSchemaRecoveryTest {
                 "ALTER TABLE " + schema + ".DBAC_TW_CURRENT DROP COLUMN HOST_SNAPSHOT");
             DBException error = Assertions.assertThrows(
                 DBException.class,
-                () -> versionManager(1).updateCurrentSchemaVersion(MONITOR, connection, schema, 99));
+                () -> versionManager(older).updateCurrentSchemaVersion(MONITOR, connection, schema, 99));
             Assertions.assertTrue(
                 error.getMessage().contains("Refusing to record DBAC schema version 99"),
                 "The version bound must reject before the structure is examined, got: " + error.getMessage());
@@ -478,6 +492,73 @@ public class DbacSchemaRecoveryTest {
                 error.getMessage().contains("HOST_SNAPSHOT"),
                 "A structure problem must not be what rejected this, got: " + error.getMessage());
             Assertions.assertEquals(0, DbacTestSupport.countVersionRows(connection));
+        }
+    }
+
+    /**
+     * A live version 1 schema is really upgraded to version 2, not merely declared upgraded
+     * <p>
+     * The other tests all install through the shipped create script, which now produces version 2
+     * directly, so none of them ever runs {@code dbac_schema_update_2.sql} against the naive shape it
+     * exists to fix. This one reconstructs that shape and drives the real upgrade path. What it
+     * proves matters twice over: that the migration executes, and that a half-migrated database is
+     * refused rather than used - the validator is the same one the upgrade must satisfy.
+     */
+    @Test
+    public void versionOneSchemaIsMigratedToZonedColumns() throws Exception {
+        String schema = freshSchema("DBAC_REC_MIGRATE");
+        try (Connection rawConnection = database.openConnection()) {
+            InternalDatabaseConfig config = withSchema(schema);
+            Connection connection = new InternalProxyConnection(rawConnection, config);
+            schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
+
+            DbacTestSupport.downgradeToVersionOne(rawConnection, schema);
+            Assertions.assertEquals(
+                1, DbacTestSupport.readVersion(connection).intValue(),
+                "Precondition: the schema must look like version 1");
+            Assertions.assertFalse(
+                DbacSchemaValidator.inspect(rawConnection, schema).isComplete(),
+                "A naive schema must not satisfy the version 2 structure");
+
+            schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
+
+            Assertions.assertEquals(
+                DbacSchemaConstants.CURRENT_SCHEMA_VERSION,
+                DbacTestSupport.readVersion(connection).intValue(),
+                "The upgrade must record the version it migrated to");
+            Assertions.assertTrue(
+                DbacSchemaValidator.inspect(rawConnection, schema).isComplete(),
+                "Every time column must be zoned after the migration");
+            Assertions.assertEquals(1, DbacTestSupport.countVersionRows(connection));
+        }
+    }
+
+    /**
+     * A migration that stops halfway leaves a database that is refused, not one that is trusted
+     */
+    @Test
+    public void halfAppliedMigrationFailsClosed() throws Exception {
+        String schema = freshSchema("DBAC_REC_HALFMIG");
+        try (Connection rawConnection = database.openConnection()) {
+            InternalDatabaseConfig config = withSchema(schema);
+            Connection connection = new InternalProxyConnection(rawConnection, config);
+            schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
+
+            DbacTestSupport.downgradeToVersionOne(rawConnection, schema);
+            // Apply the migration to all but one column, which is what an interrupted run looks like
+            // on an engine that does not roll DDL back.
+            for (String column : DbacTestSupport.ZONED_TIME_COLUMNS.subList(
+                0, DbacTestSupport.ZONED_TIME_COLUMNS.size() - 1)
+            ) {
+                int dot = column.indexOf('.');
+                DbacTestSupport.execute(rawConnection, "ALTER TABLE " + schema + "."
+                    + column.substring(0, dot) + " ALTER COLUMN " + column.substring(dot + 1)
+                    + " SET DATA TYPE TIMESTAMP WITH TIME ZONE");
+            }
+
+            Assertions.assertFalse(
+                DbacSchemaValidator.inspect(rawConnection, schema).isComplete(),
+                "One naive column left behind must still fail the structure check");
         }
     }
 
@@ -497,24 +578,30 @@ public class DbacSchemaRecoveryTest {
             Connection connection = new InternalProxyConnection(rawConnection, config);
             schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
 
-            // A build shipping version 3 against an installation at version 1 needs scripts 2 and 3.
+            // The chain under test has to start above whatever version is actually installed, so it is
+            // stated relative to it: a build two versions ahead needs both intermediate scripts, and
+            // removing either the middle one or the last one must refuse the start.
+            int installed = DbacSchemaConstants.CURRENT_SCHEMA_VERSION;
+            int middle = installed + 1;
+            int target = installed + 2;
             Assertions.assertEquals(
-                1,
-                managerWithScripts(3, DbacTestSupport.updateScriptsExcept(-1))
+                installed,
+                managerWithScripts(target, DbacTestSupport.updateScriptsExcept(-1))
                     .getCurrentSchemaVersion(MONITOR, connection, schema),
                 "A complete chain must let the upgrade start");
             Assertions.assertThrows(
                 DBException.class,
-                () -> managerWithScripts(3, DbacTestSupport.updateScriptsExcept(2))
+                () -> managerWithScripts(target, DbacTestSupport.updateScriptsExcept(middle))
                     .getCurrentSchemaVersion(MONITOR, connection, schema),
                 "A gap in the middle of the chain must refuse the start");
             Assertions.assertThrows(
                 DBException.class,
-                () -> managerWithScripts(3, DbacTestSupport.updateScriptsExcept(3))
+                () -> managerWithScripts(target, DbacTestSupport.updateScriptsExcept(target))
                     .getCurrentSchemaVersion(MONITOR, connection, schema),
                 "A missing last step must refuse the start");
 
-            // The shipped source really does resolve version 1, so real installations are unaffected.
+            // The shipped source really does resolve every version it claims, so real installations are
+            // unaffected by the synthetic gaps above.
             Assertions.assertEquals(
                 DbacSchemaConstants.CURRENT_SCHEMA_VERSION,
                 versionManager().getCurrentSchemaVersion(MONITOR, connection, schema));

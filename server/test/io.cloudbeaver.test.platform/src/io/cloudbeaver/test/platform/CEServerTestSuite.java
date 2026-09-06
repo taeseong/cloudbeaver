@@ -30,6 +30,9 @@ import io.cloudbeaver.test.platform.dbac.DbacSchemaRecoveryTest;
 import io.cloudbeaver.test.platform.dbac.DbacSchemaTest;
 import io.cloudbeaver.test.platform.dbac.DbacScriptStatementsTest;
 import io.cloudbeaver.test.platform.dbac.DbacScriptTranslationTest;
+import io.cloudbeaver.test.platform.dbac.TempWriteModelTest;
+import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest;
+import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest;
 import io.cloudbeaver.test.platform.sql.*;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -60,7 +63,10 @@ import org.junit.platform.suite.api.Suite;
         DbacScriptTranslationTest.class,
         DbacSchemaTest.class,
         DbacSchemaRecoveryTest.class,
-        DbacSchemaPostgresTest.class
+        DbacSchemaPostgresTest.class,
+        TempWriteModelTest.class,
+        TempWriteRepositoryTest.class,
+        TempWriteRepositoryPostgresTest.class
     }
 )
 public class CEServerTestSuite {

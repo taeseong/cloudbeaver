@@ -184,8 +184,7 @@ public class DbacScriptTranslationTest {
     @Test
     public void updateScriptForVersionOneIsResolvableAndTranslates() throws Exception {
         for (SQLDialect dialect : new SQLDialect[]{new H2SQLDialect(), new PostgreDialect()}) {
-            Reader reader = scriptSource().openSchemaUpdateScript(
-                MONITOR, DbacSchemaConstants.CURRENT_SCHEMA_VERSION, dialect.getDialectId());
+            Reader reader = scriptSource().openSchemaUpdateScript(MONITOR, 1, dialect.getDialectId());
             Assertions.assertNotNull(
                 reader,
                 "dbac_schema_update_1.sql must be resolvable for " + dialect.getDialectId()
@@ -208,6 +207,31 @@ public class DbacScriptTranslationTest {
             Assertions.assertNull(
                 DbacScriptStatements.forbiddenFamilyOf(statements.get(0)),
                 "The version 1 update script must not belong to any state changing family");
+
+            // Version 2 is the opposite kind of script and is checked as such: it is real DDL, one
+            // statement per column, and it must survive translation with its zoned type intact.
+            // Pinned at eight because that is how many time columns the schema has - a lost statement
+            // would leave one column naive, which is exactly the defect version 2 removes.
+            Reader migrationReader = scriptSource().openSchemaUpdateScript(MONITOR, 2, dialect.getDialectId());
+            Assertions.assertNotNull(
+                migrationReader,
+                "dbac_schema_update_2.sql must be resolvable for " + dialect.getDialectId());
+            List<String> migration = executableStatements(SQLQueryTranslator.translateScript(
+                SOURCE_DIALECT, dialect, SQLQueryTranslator.getDefaultPreferenceStore(),
+                normalizedScript(migrationReader)));
+            Assertions.assertEquals(
+                8, migration.size(),
+                "The version 2 migration must alter every time column for " + dialect.getDialectId()
+                    + ", got: " + migration);
+            for (String statement : migration) {
+                // Either spelling is accepted because the invariant is that the column ends up zoned,
+                // not how a dialect renders the type name. Losing the zone entirely is the defect.
+                String upper = statement.toUpperCase(java.util.Locale.ROOT);
+                Assertions.assertTrue(
+                    upper.contains("TIME ZONE") || upper.contains("TIMESTAMPTZ"),
+                    "Translation must keep the zoned type for " + dialect.getDialectId()
+                        + ", got: " + statement);
+            }
         }
     }
 

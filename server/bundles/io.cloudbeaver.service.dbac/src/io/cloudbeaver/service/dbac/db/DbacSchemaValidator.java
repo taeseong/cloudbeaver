@@ -206,10 +206,14 @@ public final class DbacSchemaValidator {
                 problems.add("column " + table.name() + "." + column.name() + " is missing");
                 continue;
             }
-            if (found.jdbcType() != column.jdbcType()) {
+            // A set rather than one code, because the engines disagree on zoned timestamps: H2 reports
+            // 2014 and PostgreSQL reports 93 for the same declared type. Widening the code check is safe
+            // only because TYPE_NAME below still has to match exactly, which is what separates a zoned
+            // column from a naive one on PostgreSQL.
+            if (!column.jdbcTypes().contains(found.jdbcType())) {
                 problems.add("column " + table.name() + "." + column.name()
                     + " has JDBC type " + found.jdbcType() + " (" + found.typeName() + ")"
-                    + " but must have " + column.jdbcType() + " (" + column.canonicalType() + ")");
+                    + " but must have one of " + column.jdbcTypes() + " (" + column.canonicalType() + ")");
                 continue;
             }
             // An unrecognised spelling is a failure, not a pass. The JDBC type code alone does not

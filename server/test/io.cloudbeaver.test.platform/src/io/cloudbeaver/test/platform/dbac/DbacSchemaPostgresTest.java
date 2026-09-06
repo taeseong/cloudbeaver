@@ -285,6 +285,15 @@ public class DbacSchemaPostgresTest {
     @Test
     public void validatorRejectsStructuralDamage() throws Exception {
         List<String[]> mutations = new ArrayList<>();
+        // Schema version 2 moved every time column to TIMESTAMP WITH TIME ZONE, and the validator's
+        // type check had to be widened to a set of JDBC type codes because the two engines report
+        // different ones for a zoned column. These two mutations are what keeps that widening honest:
+        // a naive column must still be refused, or the session-timezone defect version 2 removed
+        // would come back silently on any database that was altered by hand.
+        mutations.add(new String[]{"expiry silently made naive",
+            "ALTER TABLE %s.DBAC_TW_CURRENT ALTER COLUMN EXPIRES_AT SET DATA TYPE TIMESTAMP"});
+        mutations.add(new String[]{"history time silently made naive",
+            "ALTER TABLE %s.DBAC_TW_HISTORY ALTER COLUMN CHANGE_TIME SET DATA TYPE TIMESTAMP"});
         mutations.add(new String[]{"wrong column type",
             "ALTER TABLE %s.DBAC_AUDIT_EVENT DROP COLUMN DENIAL_REASON",
             "ALTER TABLE %s.DBAC_AUDIT_EVENT ADD COLUMN DENIAL_REASON INTEGER"});
@@ -504,12 +513,16 @@ public class DbacSchemaPostgresTest {
     @Test
     public void versionAboveTheShippedOneIsRefused() throws Exception {
         withInstalledSchema("dbac_pg_upper", (raw, connection, schema) -> {
+            // Stated relative to the shipped version so the bound keeps being a bound as the schema
+            // grows: a build one version behind must refuse to record the newer one it cannot create.
+            int older = DbacSchemaConstants.CURRENT_SCHEMA_VERSION - 1;
             Assertions.assertThrows(
                 DBException.class,
-                () -> versionManager(1).updateCurrentSchemaVersion(MONITOR, connection, schema, 2),
-                "A build shipping version 1 must not record version 2");
+                () -> versionManager(older).updateCurrentSchemaVersion(
+                    MONITOR, connection, schema, DbacSchemaConstants.CURRENT_SCHEMA_VERSION),
+                "A build shipping version " + older + " must not record a newer version");
             Assertions.assertEquals(
-                1, DbacTestSupport.readVersion(connection).intValue(),
+                DbacSchemaConstants.CURRENT_SCHEMA_VERSION, DbacTestSupport.readVersion(connection).intValue(),
                 "The existing row must be left exactly as it was");
             Assertions.assertEquals(1, DbacTestSupport.countVersionRows(connection));
 
@@ -517,7 +530,8 @@ public class DbacSchemaPostgresTest {
             DbacTestSupport.deleteVersionRow(connection);
             Assertions.assertThrows(
                 DBException.class,
-                () -> versionManager(1).updateCurrentSchemaVersion(MONITOR, connection, schema, 2));
+                () -> versionManager(older).updateCurrentSchemaVersion(
+                    MONITOR, connection, schema, DbacSchemaConstants.CURRENT_SCHEMA_VERSION));
             Assertions.assertEquals(
                 0, DbacTestSupport.countVersionRows(connection), "No row may be created");
 
@@ -528,7 +542,7 @@ public class DbacSchemaPostgresTest {
                 "ALTER TABLE " + schema + ".DBAC_TW_CURRENT DROP COLUMN HOST_SNAPSHOT");
             DBException error = Assertions.assertThrows(
                 DBException.class,
-                () -> versionManager(1).updateCurrentSchemaVersion(MONITOR, connection, schema, 99));
+                () -> versionManager(older).updateCurrentSchemaVersion(MONITOR, connection, schema, 99));
             Assertions.assertTrue(
                 error.getMessage().contains("Refusing to record DBAC schema version 99"),
                 "The version bound must reject before the structure is examined, got: " + error.getMessage());
@@ -549,24 +563,30 @@ public class DbacSchemaPostgresTest {
     @Test
     public void upgradeIsRefusedWhenAnUpdateScriptIsMissing() throws Exception {
         withInstalledSchema("dbac_pg_chain", (raw, connection, schema) -> {
-            // A build shipping version 3 against an installation at version 1 needs scripts 2 and 3.
+            // The chain under test has to start above whatever version is actually installed, so it is
+            // stated relative to it: a build two versions ahead needs both intermediate scripts, and
+            // removing either the middle one or the last one must refuse the start.
+            int installed = DbacSchemaConstants.CURRENT_SCHEMA_VERSION;
+            int middle = installed + 1;
+            int target = installed + 2;
             Assertions.assertEquals(
-                1,
-                managerWithScripts(3, updateScriptsExcept(-1))
+                installed,
+                managerWithScripts(target, updateScriptsExcept(-1))
                     .getCurrentSchemaVersion(MONITOR, connection, schema),
                 "A complete chain must let the upgrade start");
             Assertions.assertThrows(
                 DBException.class,
-                () -> managerWithScripts(3, updateScriptsExcept(2))
+                () -> managerWithScripts(target, updateScriptsExcept(middle))
                     .getCurrentSchemaVersion(MONITOR, connection, schema),
                 "A gap in the middle of the chain must refuse the start");
             Assertions.assertThrows(
                 DBException.class,
-                () -> managerWithScripts(3, updateScriptsExcept(3))
+                () -> managerWithScripts(target, updateScriptsExcept(target))
                     .getCurrentSchemaVersion(MONITOR, connection, schema),
                 "A missing last step must refuse the start");
 
-            // The shipped source really does resolve version 1, so real installations are unaffected.
+            // The shipped source really does resolve every version it claims, so real installations are
+            // unaffected by the synthetic gaps above.
             Assertions.assertEquals(
                 DbacSchemaConstants.CURRENT_SCHEMA_VERSION,
                 versionManager().getCurrentSchemaVersion(MONITOR, connection, schema));
@@ -931,6 +951,94 @@ public class DbacSchemaPostgresTest {
     @NotNull
     private static SQLSchemaScriptSource updateScriptsExcept(int missingVersion) {
         return DbacTestSupport.updateScriptsExcept(missingVersion);
+    }
+
+    /**
+     * A live version 1 schema is really upgraded to version 2 on the engine that matters most
+     * <p>
+     * PostgreSQL is where the naive columns were actually dangerous: pgjdbc sets the session zone
+     * from the client JVM, so two nodes read different wall clocks out of the same column. Every
+     * other test here installs through the shipped create script, which now produces version 2
+     * directly, and therefore never runs the migration. This one reconstructs the version 1 shape
+     * and drives the real upgrade path, then checks the result with the same validator the upgrade
+     * has to satisfy.
+     */
+    @Test
+    public void versionOneSchemaIsMigratedToZonedColumns() throws Exception {
+        withInstalledSchema("dbac_pg_migrate", (raw, connection, schema) -> {
+            DbacTestSupport.downgradeToVersionOne(raw, schema);
+            Assertions.assertEquals(
+                1, DbacTestSupport.readVersion(connection).intValue(),
+                "Precondition: the schema must look like version 1");
+            Assertions.assertFalse(
+                DbacSchemaValidator.inspect(raw, schema).isComplete(),
+                "A naive schema must not satisfy the version 2 structure");
+
+            InternalDatabaseConfig config = configFor(schema);
+            schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
+
+            Assertions.assertEquals(
+                DbacSchemaConstants.CURRENT_SCHEMA_VERSION,
+                DbacTestSupport.readVersion(connection).intValue(),
+                "The upgrade must record the version it migrated to");
+            Assertions.assertTrue(
+                DbacSchemaValidator.inspect(raw, schema).isComplete(),
+                "Every time column must be zoned after the migration");
+            Assertions.assertEquals(1, DbacTestSupport.countVersionRows(connection));
+        });
+    }
+
+    /**
+     * A migrated column really holds an instant, checked from a session in another zone
+     * <p>
+     * Type names alone would not prove this. After the migration a value written in one session zone
+     * has to read back as the same instant in another, which is the whole point of the change.
+     */
+    @Test
+    public void migratedColumnsHoldInstantsAcrossSessionZones() throws Exception {
+        withInstalledSchema("dbac_pg_migrate_tz", (raw, connection, schema) -> {
+            DbacTestSupport.downgradeToVersionOne(raw, schema);
+            InternalDatabaseConfig config = configFor(schema);
+            schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
+
+            DbacTestSupport.execute(raw, "SET TIME ZONE 'Asia/Seoul'");
+            java.time.OffsetDateTime written;
+            try (PreparedStatement dbStat = raw.prepareStatement(
+                "UPDATE " + schema + "." + DbacSchemaConstants.VERSION_TABLE_NAME
+                    + " SET UPDATE_TIME=CURRENT_TIMESTAMP WHERE MODULE_ID=?")
+            ) {
+                dbStat.setString(1, DbacSchemaConstants.SCHEMA_ID);
+                Assertions.assertEquals(1, dbStat.executeUpdate());
+            }
+            written = readUpdateTime(raw, schema);
+
+            DbacTestSupport.execute(raw, "SET TIME ZONE 'UTC'");
+            java.time.OffsetDateTime readBack = readUpdateTime(raw, schema);
+
+            Assertions.assertEquals(
+                written.toInstant(), readBack.toInstant(),
+                "A migrated column must return the same instant whatever zone the session is in");
+        });
+    }
+
+    @NotNull
+    private static java.time.OffsetDateTime readUpdateTime(
+        @NotNull Connection raw,
+        @NotNull String schema
+    ) throws SQLException {
+        try (PreparedStatement dbStat = raw.prepareStatement(
+            "SELECT UPDATE_TIME FROM " + schema + "." + DbacSchemaConstants.VERSION_TABLE_NAME
+                + " WHERE MODULE_ID=?")
+        ) {
+            dbStat.setString(1, DbacSchemaConstants.SCHEMA_ID);
+            try (ResultSet dbResult = dbStat.executeQuery()) {
+                Assertions.assertTrue(dbResult.next(), "The version row must exist");
+                java.time.OffsetDateTime value =
+                    dbResult.getObject(1, java.time.OffsetDateTime.class);
+                Assertions.assertNotNull(value, "UPDATE_TIME must not be null");
+                return value;
+            }
+        }
     }
 
     private interface SchemaBody {

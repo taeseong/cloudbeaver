@@ -421,6 +421,51 @@ final class DbacTestSupport {
         }
     }
 
+    /**
+     * The eight columns schema version 2 moves, as {@code table.column}
+     * <p>
+     * Listed here rather than derived so that a column added to the schema without a matching
+     * migration statement shows up as a difference in a test, not as a naive column in production.
+     */
+    static final List<String> ZONED_TIME_COLUMNS = List.of(
+        "DBAC_SCHEMA_INFO.UPDATE_TIME",
+        "DBAC_TW_CURRENT.GRANTED_AT",
+        "DBAC_TW_CURRENT.EXPIRES_AT",
+        "DBAC_TW_CURRENT.REVOKED_AT",
+        "DBAC_TW_HISTORY.CHANGE_TIME",
+        "DBAC_TW_HISTORY.EXPIRES_AT",
+        "DBAC_AUDIT_EVENT.EVENT_TIME",
+        "DBAC_AUDIT_EVENT.EXPIRES_AT");
+
+    /**
+     * Turns an installed schema back into what version 1 shipped
+     * <p>
+     * There is no version 1 create script any more - the shipped one produces version 2 directly - so
+     * a real upgrade cannot be exercised without reconstructing the old shape. This does exactly what
+     * {@code dbac_schema_update_2.sql} undoes: every time column becomes naive and the recorded
+     * version drops to 1. It deliberately does not touch anything else, so a test using it is
+     * measuring the migration and nothing more.
+     */
+    static void downgradeToVersionOne(
+        @NotNull Connection rawConnection,
+        @NotNull String schema
+    ) throws SQLException {
+        for (String column : ZONED_TIME_COLUMNS) {
+            int dot = column.indexOf('.');
+            execute(rawConnection, "ALTER TABLE " + schema + "." + column.substring(0, dot)
+                + " ALTER COLUMN " + column.substring(dot + 1) + " SET DATA TYPE TIMESTAMP");
+        }
+        try (PreparedStatement dbStat = rawConnection.prepareStatement(
+            "UPDATE " + schema + "." + DbacSchemaConstants.VERSION_TABLE_NAME
+                + " SET VERSION=1 WHERE MODULE_ID=?")
+        ) {
+            dbStat.setString(1, DbacSchemaConstants.SCHEMA_ID);
+            if (dbStat.executeUpdate() != 1) {
+                throw new SQLException("Expected exactly one DBAC version row to downgrade");
+            }
+        }
+    }
+
     static void deleteVersionRow(@NotNull Connection connection) throws SQLException {
         try (PreparedStatement dbStat = connection.prepareStatement(
             "DELETE FROM {table_prefix}" + DbacSchemaConstants.VERSION_TABLE_NAME + " WHERE MODULE_ID=?")
