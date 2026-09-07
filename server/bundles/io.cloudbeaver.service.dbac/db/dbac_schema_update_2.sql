@@ -24,11 +24,30 @@
 --     form both H2 2.4.240 and PostgreSQL 16.15 accept. H2 also accepts a bare type, PostgreSQL also
 --     accepts TYPE, and neither of those is common to both.
 --   * The migration runner splits on ';', so no statement may contain an inner ';'.
---   * These statements are NOT idempotent - re-running them on an already zoned column is a no-op on
---     both engines, because the target type already matches - but they are also not guarded by
---     IF NOT EXISTS, which has no equivalent for a column type. Recovery therefore relies on the
---     version row and on DbacSchemaValidator, which now expects TIMESTAMP WITH TIME ZONE and reports
---     a column left on version 1 explicitly.
+--   * Re-running this script is safe on both supported engines. There is no IF NOT EXISTS for a
+--     column type, but none is needed: ALTER COLUMN ... SET DATA TYPE names the target type rather
+--     than a change to apply, so a column that is already TIMESTAMP WITH TIME ZONE ends in the same
+--     state. The script is therefore idempotent in effect, which is what recovery depends on.
+--     Pinned by a test on H2 only, where recovery actually depends on it (see below). The same was
+--     measured by hand on PostgreSQL 16.15 but nothing in the suite holds it there, so treat that
+--     half as an observation rather than a guarantee. Note also that "same state" is about the
+--     column, not the work: on PostgreSQL a re-run still takes an ACCESS EXCLUSIVE lock and
+--     rewrites the indexes over those columns.
+--   * How an interrupted run recovers differs by engine, and both routes end fail-closed:
+--       - On PostgreSQL the whole script rolls back on a failure part-way. That is not PostgreSQL
+--         being transactional on its own: SQLSchemaManager.updateSchema wraps the run in a
+--         JDBCTransaction, which turns auto-commit off, and PostgreSQL puts ALTER TABLE inside that
+--         transaction. Both halves are needed, so a change to either invalidates this. On the normal path no permanent half-migrated schema exists, because the database
+--         is still at version 1 and the next start runs the script again from the beginning.
+--       - H2 does not roll DDL back, so some columns can be left converted. That is recoverable
+--         rather than broken: the version row is only written after the whole script succeeds, so it
+--         still reads 1, and the next start runs this script again. The statements that already ran
+--         are no-ops by the point above, and the remaining columns are converted.
+--       - If the version row already reads 2 while the structure does not match - a partial run
+--         whose version write somehow landed, a column altered by hand, or a re-run that itself
+--         fails - DbacSchemaValidator refuses to start. It expects TIMESTAMP WITH TIME ZONE and
+--         names the column that is not. Startup stops rather than proceeding on a schema nobody
+--         can describe.
 --   * Converting an existing naive value interprets it in the migrating session's zone. That is
 --     unavoidable and is the reason to migrate before anything writes rows that matter: at version 1
 --     no production code writes DBAC_TW_CURRENT, DBAC_TW_HISTORY or DBAC_AUDIT_EVENT at all, so the

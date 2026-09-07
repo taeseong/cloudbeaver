@@ -534,10 +534,22 @@ public class DbacSchemaRecoveryTest {
     }
 
     /**
-     * A migration that stops halfway leaves a database that is refused, not one that is trusted
+     * A migration interrupted on H2 is finished by the next start, not left half-done
+     * <p>
+     * H2 does not roll DDL back, so an interrupted version 2 migration really can leave some columns
+     * converted and others naive. What makes that recoverable rather than broken is two facts
+     * together: the version row is written only after the whole script succeeds, so it still reads 1
+     * and the next start runs the script again; and {@code ALTER COLUMN ... SET DATA TYPE} names a
+     * target type rather than a change, so the statements that already ran are no-ops the second
+     * time. Asserting only that the half-state is refused would have left both of those untested -
+     * and a database that is refused forever is not recovery, it is an outage.
+     * <p>
+     * PostgreSQL has no counterpart to this test on purpose: it runs DDL inside the transaction, so
+     * a failed migration rolls back whole and this state cannot arise on the normal path. Its
+     * version 1 to 2 migration is covered by {@code DbacSchemaPostgresTest} instead.
      */
     @Test
-    public void halfAppliedMigrationFailsClosed() throws Exception {
+    public void interruptedMigrationIsFinishedByTheNextStart() throws Exception {
         String schema = freshSchema("DBAC_REC_HALFMIG");
         try (Connection rawConnection = database.openConnection()) {
             InternalDatabaseConfig config = withSchema(schema);
@@ -545,20 +557,39 @@ public class DbacSchemaRecoveryTest {
             schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
 
             DbacTestSupport.downgradeToVersionOne(rawConnection, schema);
-            // Apply the migration to all but one column, which is what an interrupted run looks like
-            // on an engine that does not roll DDL back.
-            for (String column : DbacTestSupport.ZONED_TIME_COLUMNS.subList(
-                0, DbacTestSupport.ZONED_TIME_COLUMNS.size() - 1)
-            ) {
+            // Apply the migration to all but the last column, which is what an interrupted run looks
+            // like on an engine that does not roll DDL back.
+            List<String> applied = DbacTestSupport.ZONED_TIME_COLUMNS.subList(
+                0, DbacTestSupport.ZONED_TIME_COLUMNS.size() - 1);
+            for (String column : applied) {
                 int dot = column.indexOf('.');
                 DbacTestSupport.execute(rawConnection, "ALTER TABLE " + schema + "."
                     + column.substring(0, dot) + " ALTER COLUMN " + column.substring(dot + 1)
                     + " SET DATA TYPE TIMESTAMP WITH TIME ZONE");
             }
-
             Assertions.assertFalse(
                 DbacSchemaValidator.inspect(rawConnection, schema).isComplete(),
-                "One naive column left behind must still fail the structure check");
+                "One naive column left behind must fail the structure check");
+            Assertions.assertEquals(
+                1, DbacTestSupport.readVersion(connection).intValue(),
+                "An interrupted migration must not have recorded version 2");
+
+            // The next start. This is the real upgrade path, not a hand-applied script.
+            schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
+
+            Assertions.assertTrue(
+                DbacSchemaValidator.inspect(rawConnection, schema).isComplete(),
+                "Re-running the migration must convert the column the interrupted run missed");
+            Assertions.assertEquals(
+                DbacSchemaConstants.CURRENT_SCHEMA_VERSION,
+                DbacTestSupport.readVersion(connection).intValue(),
+                "The completed upgrade must record the version it migrated to");
+            Assertions.assertEquals(
+                1, DbacTestSupport.countVersionRows(connection),
+                "Recovery must not leave a second version row behind");
+            // validate() rather than inspect(): the startup path throws on a bad structure, and that
+            // is the call a real start makes.
+            DbacSchemaValidator.validate(rawConnection, schema);
         }
     }
 
