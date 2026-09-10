@@ -70,7 +70,7 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest": 32,
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest": 18,
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest": 47,
-    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest": 62,
+    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest": 67,
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest": 13,
 }
 

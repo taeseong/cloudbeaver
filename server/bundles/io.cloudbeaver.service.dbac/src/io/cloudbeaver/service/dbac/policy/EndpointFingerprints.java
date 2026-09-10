@@ -51,14 +51,26 @@ import java.util.Set;
  * handlers appear only on the resolved side - so reading both cannot introduce the instability
  * it warned about. Both fingerprints must match the grant.
  * <p>
- * <b>Credentials are not read.</b> Besides the six values that make up the identity, this class
- * reads only {@code getConfigurationType()}, {@code getConfigProfileName()},
- * {@code getConfigProfileSource()} and {@code getAuthModelId()} - the last being the id of an
- * authentication model, never its credentials. It never calls {@code getUserName},
- * {@code getUserPassword}, {@code getAuthProperties}, {@code getAuthModel()}, {@code getUrl},
+ * <b>No credential is read, stored or logged.</b> Besides the six values that make up the
+ * identity, this class reads {@code getConfigurationType()}, {@code getConfigProfileName()},
+ * {@code getConfigProfileSource()}, {@code getAuthModelId()} - the id of an authentication model,
+ * never its credentials - and, for the url gate, {@code getUrl()} together with
+ * {@code DBPDriver.getSampleURL()} and {@code DBPDriver.getConnectionURL(configuration)}. It never
+ * calls {@code getUserName}, {@code getUserPassword}, {@code getAuthProperties},
  * {@code getRuntimeAttribute}, {@code toString()}, or any handler accessor beyond
  * {@code isEnabled()}. The two property maps are consulted for their <em>key sets</em> only - see
  * {@link ConnectionPropertyAllowlist} - and no value is ever read out of either.
+ * <p>
+ * The three url accessors need saying out loud, because an earlier version of this paragraph listed
+ * {@code getUrl} and {@code getAuthModel()} among the calls this class never makes - and the url
+ * gate made both of those false. A url can embed {@code {user}:{password}@}, and
+ * {@code getConnectionURL} reaches {@code getAuthModel()} inside the PostgreSQL provider. What the
+ * guarantee rests on is not that the values are unread but that <b>none of them leaves this
+ * method</b>: they are compared in local variables, no url or template is placed in an
+ * {@link EndpointSnapshot}, a decision, an audit payload, an exception message or a log line, and
+ * this class holds no logger at all. {@code DbAccessPolicyTest.urlGateRefusalsCarryNoCredential}
+ * plants a sentinel in both the stored url and the template and asserts the rendered decision
+ * carries neither.
  * <p>
  * The rationale for each refusal, with the platform code it is based on, is written down in
  * {@code docs/db-access-control-endpoint-identity.md} section 3.
@@ -262,6 +274,30 @@ final class EndpointFingerprints {
         // refusing a non-empty url would refuse every connection. What is refused is a url the
         // configuration would not generate. The url itself is never stored or hashed - a generic
         // driver template can carry {user}:{password}@, which must not reach the permission store.
+        //
+        // The comparison is only worth anything if the driver has a URL template to generate from,
+        // so that is checked first. A blank template is not a missing detail - it is the endpoint
+        // rule itself being absent. The platform decides between several generation paths on
+        // per-driver predicates (isSampleURLForced, isSampleURLApplicable,
+        // supportsCustomConnectionURL), and one of the routines they reach,
+        // DatabaseURL.generateUrlByTemplate(String, ...), returns connectionInfo.getUrl() unchanged
+        // when the template is blank. Where that route is taken the comparison below becomes
+        // storedUrl.equals(storedUrl) - true for any url at all - and the six fields stop proving
+        // anything. Which route today's four allowlisted drivers take was not the basis for this
+        // check: an endpoint whose generation rule cannot be established is refused, so the answer
+        // does not depend on platform predicates this fork does not own and cannot pin.
+        String sampleUrl;
+        try {
+            sampleUrl = driver.getSampleURL();
+        } catch (RuntimeException e) {
+            // An Error is deliberately not caught. The service's outer handler turns one into a
+            // keyed denial, which is the existing contract for a failure this class cannot describe.
+            return null;
+        }
+        if (isBlank(sampleUrl)) {
+            return null;
+        }
+
         String storedUrl = configuration.getUrl();
         if (!isBlank(storedUrl)) {
             String generated;
@@ -269,10 +305,11 @@ final class EndpointFingerprints {
                 generated = driver.getConnectionURL(configuration);
             } catch (Exception e) {
                 // Cannot establish what this configuration would generate, so cannot establish that
-                // the stored url matches it.
+                // the stored url matches it. Covers the checked DBException the platform declares
+                // and any RuntimeException a provider raises; an Error again reaches the service.
                 return null;
             }
-            if (!storedUrl.equals(generated)) {
+            if (generated == null || !storedUrl.equals(generated)) {
                 return null;
             }
         }

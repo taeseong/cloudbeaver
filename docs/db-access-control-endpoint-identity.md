@@ -133,20 +133,34 @@ setter로 바뀔 수 있다(`DriverDescriptor.java:738-740`).
 
 ### 2.2 credential은 fingerprint·저장·로그에 들어가지 않는다
 
-읽는 것은 위 6개뿐이다. 다음은 **어느 경로에서도 호출하지 않는다.**
+fingerprint에 **들어가는** 것은 위 6개뿐이다. 다음은 **어느 경로에서도 호출하지 않는다.**
 
 ```
 getUserName / getUserPassword / getAuthProperty / getAuthProperties
 getProperty / getProperties / getProviderProperty / getProviderProperties  (값 읽기)
-getRuntimeAttribute / getUrl / toString()
+getRuntimeAttribute / toString()
 getBootstrap().getInitQueries() / getEvent() / getDeclaredEvents()
-getAuthModel() / getAuthModelDescriptor()
+getAuthModelDescriptor()
 DBWHandlerConfiguration.getPassword / getSecureProperty / getSecureProperties / saveToMap / saveToSecret
 ```
 
+> **[정정] `getUrl`과 `getAuthModel()`은 이 목록에서 빠졌다.** 초판은 둘을 "호출하지 않는다"에
+> 넣었는데, §3.4의 url 게이트가 그것을 거짓으로 만들었다 — 게이트는 `getUrl()`을 읽고,
+> `driver.getConnectionURL(configuration)`은 PostgreSQL provider 안에서 `getAuthModel()`을 간접
+> 호출한다(`PostgreDataSourceProvider.java:89`). 독립 QA가 이 불일치를 지적했다.
+>
+> **보증의 근거가 "읽지 않는다"에서 "밖으로 내보내지 않는다"로 바뀐 것이다.** url·sample URL·생성
+> URL은 지역 변수에서 비교되고, `EndpointSnapshot`·decision·audit payload·exception message·로그
+> 어디에도 들어가지 않으며, `EndpointFingerprints`는 logger 자체를 갖지 않는다. url을 저장하거나
+> 해시하지 않는 이유(아래 문단)는 그대로 유효하고, 그 보증은
+> `DbAccessPolicyTest.urlGateRefusalsCarryNoCredential`이 저장 url과 template 양쪽에 sentinel을 심어
+> 고정한다.
+
 `getActualConnectionConfiguration()`은 §2.0에 따라 읽지만, **그 사본에서도 위 6개와 아래 게이트 항목만** 읽는다.
-게이트에서 추가로 읽는 것은 `getConfigurationType()` / `getConfigProfileName()` / `getConfigProfileSource()` /
-`getAuthModelId()`이며, 마지막 것은 auth model의 **id 문자열**이고 credential이 아니다.
+게이트에서 추가로 읽는 것은 `getConfigurationType()` / `getConfigProfileName()` /
+`getConfigProfileSource()` / `getAuthModelId()` / `getUrl()`, 그리고 driver 쪽의 `getSampleURL()` /
+`getConnectionURL(configuration)`이다. `getAuthModelId()`는 auth model의 **id 문자열**이고 credential이
+아니다. 뒤의 세 개는 §3.4의 url 게이트가 쓰며, 값은 어느 것도 게이트 밖으로 나가지 않는다.
 
 `DBPConnectionConfiguration.toString()`(`:615`)은 그 자체가 유출이므로 금지한다.
 `url`은 저장하지도, 해시하지도 않는다 — DBeaver 자신의 generic 템플릿이
@@ -225,6 +239,18 @@ fingerprint     : declared·inUse 양쪽 모두 grant와 완전히 일치 -> ALL
 저장된 `url`이 비어 있지 않으면, **그 설정이 생성했을 url과 정확히 같을 때만** 통과한다.
 
 ```java
+// 1) 생성 규칙 자체가 있어야 비교가 의미를 갖는다. 저장 url 유무와 무관하게 먼저 검사한다.
+String sampleUrl;
+try {
+    sampleUrl = driver.getSampleURL();
+} catch (RuntimeException e) {
+    return null;                           // Error는 잡지 않는다 - service 외곽이 keyed DENY로 만든다
+}
+if (isBlank(sampleUrl)) {
+    return null;                           // 생성 규칙 없음 -> endpoint 입증 불가
+}
+
+// 2) 그 다음에야 저장 url을 생성값과 비교한다.
 String storedUrl = configuration.getUrl();
 if (!isBlank(storedUrl)) {
     String generated;
@@ -233,11 +259,70 @@ if (!isBlank(storedUrl)) {
     } catch (Exception e) {
         return null;                       // 생성값을 알 수 없으면 비교할 수 없다
     }
-    if (!storedUrl.equals(generated)) {
+    if (generated == null || !storedUrl.equals(generated)) {
         return null;                       // 필드가 설명하지 않는 url
     }
 }
 ```
+
+#### sample URL이 비면 `ENDPOINT_UNSUPPORTED` (거부 조건, 전제 아님)
+
+**초판은 이것을 "게이트가 기대는 전제"로만 적었고 그것이 틀렸다.** 독립 재검토가 Medium으로 재분류했다.
+
+플랫폼은 driver별 술어(`isSampleURLForced`, `isSampleURLApplicable`,
+`supportsCustomConnectionURL`)로 여러 URL 생성 경로 중 하나를 고르는데, 그중
+`DatabaseURL.generateUrlByTemplate(String, …)`은 **template이 blank면 `connectionInfo.getUrl()`을
+그대로 돌려준다**(`dbeaver` `DatabaseURL.java:119-121`). 그 경로를 타면 위 2)의 비교가
+`storedUrl.equals(storedUrl)` — **어떤 url이든 참** — 이 되어 tautology가 되고, 여섯 필드가 실제
+endpoint를 입증하지 못한다. 즉 이전 URL 우회가 다시 열린다.
+
+**그래서 blank sample URL은 거부 조건이다.** null·빈 문자열·공백 전부 `ENDPOINT_UNSUPPORTED`이며,
+**저장 url이 없어도 거부한다** — 생성 규칙을 입증할 수 없는 driver는 지원 가능한 endpoint를 갖지
+않는다고 본다.
+
+| 상태 | 결과 |
+|---|---|
+| `getSampleURL()`이 null / `""` / 공백 | `ENDPOINT_UNSUPPORTED` (저장 url 유무 무관) |
+| `getSampleURL()`이 `RuntimeException` | `ENDPOINT_UNSUPPORTED` |
+| `getSampleURL()`이 `Error` | 게이트가 잡지 않고 service 외곽 handler가 **key를 유지한 DENY**로 만든다. 기존 fail-closed 계약과 동일하며 `Error`가 policy service 밖으로 나가지 않는다 |
+| `getConnectionURL()`이 checked/unchecked 예외 | `ENDPOINT_UNSUPPORTED` |
+| `getConnectionURL()`이 null | `ENDPOINT_UNSUPPORTED` |
+| 정상 template + 저장 url == 생성값 | 통과 (기존 ALLOW 유지) |
+| 저장 url != 생성값 | `ENDPOINT_UNSUPPORTED` |
+
+**관리자 권한이라는 이유로 허용하지 않는다.** driver 정의 편집이 `driverManagement` 권한이라는 사실은
+이 검사를 생략할 근거가 되지 못한다 — upstream의 driver 정의 변경이나 잘못된 배포 설정으로도 같은
+상태가 될 수 있고, 그때 endpoint를 입증할 수 없다는 사실은 달라지지 않는다. **입증할 수 없으면
+거부한다.**
+
+**template이 정상이어도 저장 url을 그대로 돌려주는 두 번째 분기가 있다 (독립 QA 지적).**
+`DatabaseURL.java:111-117`은 저장 `url`이 있고 `hostPort`·`hostName`·`serverName`·`databaseName`이
+**모두 비어 있으면** template과 무관하게 `connectionInfo.getUrl()`을 반환한다. 이 분기는 sample URL
+게이트가 막지 못한다 — template이 non-blank여도 도달하기 때문이다.
+
+**그런데도 우회가 되지 않는 이유는 게이트가 아니라 그 뒤의 blank 필드 거부다.** 이 분기에 도달하려면
+host·database·port가 전부 비어 있어야 하고, `EndpointFingerprints`는 `isBlank(host) || isBlank(database)`와
+`isBlank(port)`로 그런 설정을 곧바로 거부한다. 즉 **url 비교의 신뢰 근거는 sample URL 게이트 하나가
+아니라 그것과 blank 필드 거부의 결합**이다. 이것을 적어 두는 이유는, 예컨대 "port가 비면 driver
+default로 대체하자"는 완화를 나중에 넣으면 이 tautology가 되살아나기 때문이다 — §2.1이 port default
+대체를 거부하는 이유가 하나 더 늘었다.
+
+**허용 driver 4종에서 `:119-121` tautology 경로가 실제로 도달함은 재현하지 못했다** — PostgreSQL의
+`customURL` 경로는 2-arg 오버로드를 써서 blank template에 `DBException`을 던지고
+(`DatabaseURL.java:90-92`), MySQL은 `isSampleURLApplicable()`이 false면 host/port/database로 URL을
+직접 조립한다. 그러나 **어느 분기가 도는지에 게이트의 정당성이 걸려 있는 것 자체가 결함**이므로,
+분기와 무관하게 거부하도록 고쳤다. 이 fork는 그 술어들을 소유하지 않고 고정할 수도 없다.
+
+**의도된 false-deny는 남는다.** 관리자나 upstream이 driver descriptor를 바꿔 sample URL이 비거나
+template이 달라지면, 기존 grant를 가진 연결이 `ENDPOINT_UNSUPPORTED`로 거부될 수 있다. fail-closed
+방향이며 조회에는 영향이 없다. 연결을 다시 저장하거나 driver 정의를 되돌리면 해소된다.
+
+**전용 테스트.** `DbAccessPolicyTest`의
+`driverWithNoUrlTemplateCannotDescribeAnEndpoint`(null/빈/공백 × 저장 url 유무),
+`failingUrlTemplateAccessorIsRefused`, `errorFromUrlTemplateAccessorStillDenies`,
+`unusableGeneratedUrlIsRefused`(null·예외), `urlGateRefusalsCarryNoCredential`. 각 negative 테스트는
+**그 편차만 제거한 동일 컨테이너가 ALLOW됨**을 함께 단언한다 — 이 거부들은 모두
+`ENDPOINT_UNSUPPORTED`라서 reason만으로는 어느 검사가 걸렸는지 구분되지 않기 때문이다.
 
 **"비어 있지 않으면 거부"가 아닌 이유.** 옛 주석의 앞 문장이 사실이기 때문이다 — 데스크톱 UI와
 CloudBeaver 모두 MANUAL connection을 저장할 때 생성된 url을 함께 저장하므로, 비어 있지 않다는 이유로
@@ -252,13 +337,9 @@ CloudBeaver 모두 MANUAL connection을 저장할 때 생성된 url을 함께 �
 연결을 다시 저장하면 해소된다. 데스크톱에서 이관했거나 API로 url을 명시해 만든 MANUAL 연결도 같은
 이유로 거부된다 — TEMP_WRITE 대상에서 빠질 뿐 조회에는 영향이 없다.
 
-**이 게이트가 기대는 전제 (명시).** 비교의 의미는 `driver.getSampleURL()`이 비어 있지 않다는 데 달려
-있다. `DatabaseURL.generateUrlByTemplate`(`dbeaver` `DatabaseURL.java:119-121`)은 템플릿이 비면
-**저장된 `url`을 그대로 돌려주므로**, sampleURL이 지워진 driver에서는 `generated == storedUrl`이 항상
-성립해 이 게이트가 무효가 된다. driver 정의 편집은 admin(`driverManagement`) 권한이고 §3.1이 driver
-descriptor 변조를 시야 밖으로 이미 선언했지만, **이 게이트의 근거가 거기에 걸려 있다는 사실은 암묵으로
-두지 않고 여기에 적는다.** 위협 모델에 driver 정의 변조를 넣는다면 `getSampleURL()` blank도 거부
-조건에 추가해야 한다.
+**sample URL blank는 이제 전제가 아니라 거부 조건이다** — 위 표와 그 앞 문단 참조. 이 문단의
+초판은 그것을 "위협 모델에 넣는다면 추가해야 한다"고 미뤄 두었고, 독립 재검토가 그 미룸을 Medium으로
+재분류했다.
 
 **DNS는 이 게이트의 범위 밖이다.** host 문자열이 같은 채 이름 해석 대상이 바뀌면 fingerprint는
 동일하다. 서버 OS·네트워크 수준 통제의 몫이며, 여기서 다루지 않는다.

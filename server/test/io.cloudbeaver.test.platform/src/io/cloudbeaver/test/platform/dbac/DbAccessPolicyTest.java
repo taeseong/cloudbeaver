@@ -78,6 +78,14 @@ public class DbAccessPolicyTest {
     private static final String DRIVER = "postgres-jdbc";
 
     /**
+     * The url the default fixture's own fields generate, so a test can leave the gate satisfied
+     * <p>
+     * Named rather than repeated because several tests need "a stored url that is not the variable
+     * under test", and a typo in one of them would silently turn that test into a url-mismatch test.
+     */
+    private static final String MATCHING_URL = "jdbc:postgresql://db.internal.example:5432/customer_prod";
+
+    /**
      * Schemas whose {@code DBAC_TW_CURRENT} is a view pinning {@code EXPIRES_AT} to the clock of
      * whatever statement reads it - see {@link #grantExpiringExactlyNowIsDenied}
      */
@@ -1168,6 +1176,163 @@ public class DbAccessPolicyTest {
         }
         assertDenied(service.authorize(request("someone", null)), DenialReason.CONNECTION_UNKNOWN);
         Assertions.assertEquals(0, source.opened.get());
+    }
+
+    // ------------------------------------------------------------- the URL gate
+    //
+    // The gate compares the stored url against the one the driver would generate. Independent
+    // review then asked what happens when the driver has nothing to generate from: the platform
+    // picks between several generation routines on per-driver predicates, and one of them
+    // (DatabaseURL.generateUrlByTemplate(String, ...)) hands back connectionInfo.getUrl() unchanged
+    // when the template is blank. On that route the comparison is storedUrl.equals(storedUrl),
+    // which is true for any url, and the six fingerprinted fields stop proving anything.
+    //
+    // Each negative test below also asserts that the same container without that one deviation is
+    // allowed. Every one of these refusals reports ENDPOINT_UNSUPPORTED, so the reason alone cannot
+    // say which check fired - the allowed control is what shows the deviation is the cause rather
+    // than some earlier gate.
+
+    /**
+     * A driver with no URL template cannot describe an endpoint, with or without a stored url
+     * <p>
+     * A blank template is not a missing detail, it is the endpoint generation rule being absent. So
+     * the refusal does not depend on there being a stored url to compare: a connection whose driver
+     * cannot say how it builds a URL is refused either way, because the six fields are only
+     * meaningful as the inputs to a rule that exists.
+     */
+    @Test
+    public void driverWithNoUrlTemplateCannotDescribeAnEndpoint() throws Exception {
+        String user = activeUser("policy-no-template");
+        grant(user, Duration.ofMinutes(30));
+
+        // Control: the same connection with a template is allowed, so the template is the variable.
+        Assertions.assertTrue(
+            service().authorize(request(user, PolicyTestSupport.builder(PROJECT, CONNECTION)
+                .generatedUrl(MATCHING_URL).build())).isAllowed(),
+            "a driver that has a template must still be allowed");
+
+        for (String blank : new String[]{null, "", "   ", "\t\n"}) {
+            assertDenied(
+                service().authorize(request(user, PolicyTestSupport.builder(PROJECT, CONNECTION)
+                    .sampleUrl(blank).generatedUrl(MATCHING_URL).build())),
+                DenialReason.ENDPOINT_UNSUPPORTED);
+            // And with no stored url at all - nothing to compare, still refused.
+            assertDenied(
+                service().authorize(request(user, PolicyTestSupport.builder(PROJECT, CONNECTION)
+                    .sampleUrl(blank).build())),
+                DenialReason.ENDPOINT_UNSUPPORTED);
+        }
+    }
+
+    /**
+     * A URL template accessor that throws is refused rather than skipped
+     */
+    @Test
+    public void failingUrlTemplateAccessorIsRefused() throws Exception {
+        String user = activeUser("policy-template-throws");
+        grant(user, Duration.ofMinutes(30));
+
+        Assertions.assertTrue(
+            service().authorize(request(user, PolicyTestSupport.builder(PROJECT, CONNECTION)
+                .generatedUrl(MATCHING_URL).build())).isAllowed(),
+            "the same connection with a working accessor must be allowed");
+
+        assertDenied(
+            service().authorize(request(user, PolicyTestSupport.builder(PROJECT, CONNECTION)
+                .sampleUrlFails().generatedUrl(MATCHING_URL).build())),
+            DenialReason.ENDPOINT_UNSUPPORTED);
+    }
+
+    /**
+     * An {@code Error} from the template accessor is still a denial, by a different route
+     * <p>
+     * The gate catches {@code RuntimeException} and not {@code Error}, so an {@code Error} travels
+     * to the service's outer handler - which keeps the key and denies with the reason a store
+     * failure gives. Both outcomes are denials and neither lets the {@code Error} out of the policy
+     * service, which is the contract worth pinning; the assertion names the route so a later change
+     * that swallowed the {@code Error} into the endpoint gate would show up here rather than pass
+     * silently.
+     */
+    @Test
+    public void errorFromUrlTemplateAccessorStillDenies() throws Exception {
+        String user = activeUser("policy-template-errors");
+        grant(user, Duration.ofMinutes(30));
+
+        AuthorizationDecision decision = service().authorize(
+            request(user, PolicyTestSupport.builder(PROJECT, CONNECTION)
+                .sampleUrlErrors().generatedUrl(MATCHING_URL).build()));
+
+        Assertions.assertFalse(decision.isAllowed(), "an Error must never become an allow");
+        assertDenied(decision, DenialReason.PERMISSION_STORE_UNAVAILABLE);
+        Assertions.assertNotNull(
+            decision.key(), "the key was established before the driver was asked, so it is kept");
+        Assertions.assertNotNull(decision.auditPayload(), "a keyed denial carries its audit payload");
+    }
+
+    /**
+     * A generated url that cannot be produced leaves nothing to compare against
+     */
+    @Test
+    public void unusableGeneratedUrlIsRefused() throws Exception {
+        String user = activeUser("policy-generated-unusable");
+        grant(user, Duration.ofMinutes(30));
+
+        Assertions.assertTrue(
+            service().authorize(request(user, PolicyTestSupport.builder(PROJECT, CONNECTION)
+                .generatedUrl(MATCHING_URL).build())).isAllowed(),
+            "the same connection with a usable generator must be allowed");
+
+        // null answer, and a thrown one - the platform declares a checked DBException here, and a
+        // provider can raise an unchecked failure of its own.
+        assertDenied(
+            service().authorize(request(user, PolicyTestSupport.builder(PROJECT, CONNECTION)
+                .generatedUrlIsNull().generatedUrl(MATCHING_URL).build())),
+            DenialReason.ENDPOINT_UNSUPPORTED);
+        assertDenied(
+            service().authorize(request(user, PolicyTestSupport.builder(PROJECT, CONNECTION)
+                .generatedUrlFails().generatedUrl(MATCHING_URL).build())),
+            DenialReason.ENDPOINT_UNSUPPORTED);
+    }
+
+    /**
+     * A refusal from the URL gate carries no trace of either url
+     * <p>
+     * The gate reads two urls and a template, any of which can embed userinfo - a generic driver
+     * template carries {@code {user}:{password}@} literally. None of the three may reach a decision,
+     * an audit payload, a message or a failure string, so the sentinel is planted in the stored url
+     * and in the template and the whole rendered decision is checked.
+     */
+    @Test
+    public void urlGateRefusalsCarryNoCredential() throws Exception {
+        String user = activeUser("policy-url-gate-secrets");
+        grant(user, Duration.ofMinutes(30));
+
+        String secretUrl = "jdbc:postgresql://someone:" + PolicyTestSupport.SECRET_SENTINEL
+            + "@other-prod.internal.example:5432/other_db";
+        String secretTemplate = "jdbc:postgresql://{user}:" + PolicyTestSupport.SECRET_SENTINEL
+            + "@{host}[:{port}]/[{database}]";
+
+        for (DBPDataSourceContainer container : new DBPDataSourceContainer[]{
+            // stored url disagrees with the fields, and carries a credential
+            PolicyTestSupport.builder(PROJECT, CONNECTION).generatedUrl(secretUrl).build(),
+            // the template itself carries one, and the stored url disagrees
+            PolicyTestSupport.builder(PROJECT, CONNECTION)
+                .sampleUrl(secretTemplate).generatedUrl(secretUrl).build(),
+            // no template, so the refusal happens before any comparison
+            PolicyTestSupport.builder(PROJECT, CONNECTION)
+                .sampleUrl(null).generatedUrl(secretUrl).build(),
+            // the generator fails while a credential-bearing url is stored
+            PolicyTestSupport.builder(PROJECT, CONNECTION)
+                .generatedUrlFails().generatedUrl(secretUrl).build()}
+        ) {
+            AuthorizationDecision decision = service().authorize(request(user, container));
+            Assertions.assertFalse(decision.isAllowed(), "each of these must be refused");
+            String rendered = decision + " " + decision.auditPayload()
+                + " " + decision.userMessage() + " " + decision.messageCode();
+            Assertions.assertFalse(
+                rendered.contains(PolicyTestSupport.SECRET_SENTINEL),
+                "the URL gate must not render a credential; reason was " + decision.denialReason());
+        }
     }
 
     // ------------------------------------------------- found by the tier-2 clause sweep

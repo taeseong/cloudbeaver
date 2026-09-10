@@ -137,6 +137,11 @@ final class PolicyTestSupport {
         private boolean registryThrows;
         private boolean identityThrows;
         private boolean driverThrows;
+        private String sampleUrl = "jdbc:{provider}://{host}[:{port}]/[{database}]";
+        private boolean sampleUrlThrows;
+        private boolean sampleUrlErrors;
+        private boolean generatedUrlIsNull;
+        private boolean generatedUrlThrows;
         private boolean configurationThrows;
 
         private ContainerBuilder(@NotNull String projectId, @NotNull String connectionId) {
@@ -370,6 +375,53 @@ final class PolicyTestSupport {
             return this;
         }
 
+        /**
+         * The driver's URL template, which the endpoint gate requires before comparing anything
+         * <p>
+         * Pass null, "" or whitespace to reach the refusal; pass a real template to leave the gate
+         * satisfied so a test can refuse somewhere else.
+         */
+        @NotNull
+        ContainerBuilder sampleUrl(@Nullable String sampleUrl) {
+            this.sampleUrl = sampleUrl;
+            return this;
+        }
+
+        /** The sample URL accessor throws a RuntimeException. */
+        @NotNull
+        ContainerBuilder sampleUrlFails() {
+            this.sampleUrlThrows = true;
+            return this;
+        }
+
+        /**
+         * The sample URL accessor throws an Error
+         * <p>
+         * Separate from {@link #sampleUrlFails()} because the two are handled in different places:
+         * a RuntimeException is refused by the endpoint gate as ENDPOINT_UNSUPPORTED, while an Error
+         * is left to the service's outer handler, which keeps the key and denies. Both are denials
+         * and neither escapes, which is the contract worth pinning.
+         */
+        @NotNull
+        ContainerBuilder sampleUrlErrors() {
+            this.sampleUrlErrors = true;
+            return this;
+        }
+
+        /** {@code getConnectionURL} answers null, so nothing can be compared against. */
+        @NotNull
+        ContainerBuilder generatedUrlIsNull() {
+            this.generatedUrlIsNull = true;
+            return this;
+        }
+
+        /** {@code getConnectionURL} throws, so nothing can be compared against. */
+        @NotNull
+        ContainerBuilder generatedUrlFails() {
+            this.generatedUrlThrows = true;
+            return this;
+        }
+
         @NotNull
         ContainerBuilder withoutDriver() {
             this.driverPresent = false;
@@ -471,12 +523,32 @@ final class PolicyTestSupport {
                     case "getProviderId" -> providerId;
                     case "isCustom" -> customDriver;
                     case "getDefaultPort" -> "5432";
+                    // The endpoint gate refuses a driver with no URL template before it compares
+                    // anything, so the template has to be a fixture state of its own. The default is
+                    // a non-blank stand-in for the template both supported providers declare, which
+                    // keeps every other negative test refusing at the point it is named after
+                    // rather than here.
+                    case "getSampleURL" -> {
+                        if (sampleUrlErrors) {
+                            throw new AssertionError("driver sample URL accessor failed");
+                        }
+                        if (sampleUrlThrows) {
+                            throw new IllegalStateException("driver sample URL accessor failed");
+                        }
+                        yield sampleUrl;
+                    }
                     // Mirrors the sample-URL template both supported drivers declare,
                     // jdbc:<provider>://{host}[:{port}]/[{database}], because the gate now compares
                     // the stored url against what the driver would generate. A proxy that threw
                     // here instead would make every connection carrying a url unfingerprintable,
                     // which would hide the very difference the comparison exists to catch.
                     case "getConnectionURL" -> {
+                        if (generatedUrlThrows) {
+                            throw new IllegalStateException("driver URL generation failed");
+                        }
+                        if (generatedUrlIsNull) {
+                            yield null;
+                        }
                         DBPConnectionConfiguration asked = (DBPConnectionConfiguration) a[0];
                         StringBuilder built = new StringBuilder("jdbc:").append(providerId)
                             .append("://").append(CommonUtils.notEmpty(asked.getHostName()));
