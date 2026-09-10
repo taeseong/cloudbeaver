@@ -232,6 +232,37 @@ public class DbacScriptTranslationTest {
                     "Translation must keep the zoned type for " + dialect.getDialectId()
                         + ", got: " + statement);
             }
+
+            // Version 3 adds the endpoint columns. Pinned at three, and the guard clause has to
+            // survive translation: without IF NOT EXISTS a replay - PostgreSQL version-only recovery
+            // walks 0 to 3, and the version-1 downgrade fixture leaves a version-3 structure behind a
+            // version-1 row - would fail on a column that is already there instead of being a no-op.
+            Reader endpointReader = scriptSource().openSchemaUpdateScript(MONITOR, 3, dialect.getDialectId());
+            Assertions.assertNotNull(
+                endpointReader,
+                "dbac_schema_update_3.sql must be resolvable for " + dialect.getDialectId());
+            List<String> endpointMigration = executableStatements(SQLQueryTranslator.translateScript(
+                SOURCE_DIALECT, dialect, SQLQueryTranslator.getDefaultPreferenceStore(),
+                normalizedScript(endpointReader)));
+            Assertions.assertEquals(
+                3, endpointMigration.size(),
+                "The version 3 migration must add every endpoint column for " + dialect.getDialectId()
+                    + ", got: " + endpointMigration);
+            for (String statement : endpointMigration) {
+                String upper = statement.toUpperCase(java.util.Locale.ROOT);
+                Assertions.assertTrue(
+                    upper.contains("ADD COLUMN IF NOT EXISTS"),
+                    "Translation must keep the replay guard for " + dialect.getDialectId()
+                        + ", got: " + statement);
+                Assertions.assertTrue(
+                    upper.contains("DBAC_TW_CURRENT"),
+                    "Only the current-state table gains endpoint columns, got: " + statement);
+            }
+            Assertions.assertTrue(
+                endpointMigration.stream().anyMatch(one -> one.toUpperCase(java.util.Locale.ROOT)
+                    .contains("PORT_SNAPSHOT")),
+                "the port column is the one whose absence allowed the succession, got: "
+                    + endpointMigration);
         }
     }
 

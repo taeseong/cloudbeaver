@@ -94,7 +94,10 @@ public class DbacSchemaPostgresTest {
         "dbac_pg_objects", "dbac_pg_other_a", "dbac_pg_other_b", "dbac_pg_race", "dbac_pg_race2",
         "dbac_pg_damaged", "dbac_pg_replay", "dbac_pg_cas", "dbac_pg_cas_zero",
         "dbac_pg_savepoint", "dbac_pg_savepoint2", "dbac_pg_savepoint3", "dbac_pg_sqlstate",
-        "dbac_pg_upper", "dbac_pg_chain"
+        "dbac_pg_upper", "dbac_pg_chain",
+        // dbac_pg_migrate and dbac_pg_migrate_tz were used by tests but never listed here, so a
+        // reused container accumulated them. Listed now along with the version 3 schemas.
+        "dbac_pg_migrate", "dbac_pg_migrate_tz", "dbac_pg_v3", "dbac_pg_v3_part"
     };
 
     private static Driver driver;
@@ -302,6 +305,10 @@ public class DbacSchemaPostgresTest {
             "ALTER TABLE %s.DBAC_AUDIT_EVENT ADD COLUMN DENIAL_REASON VARCHAR(63)"});
         mutations.add(new String[]{"wrong nullability",
             "ALTER TABLE %s.DBAC_AUDIT_EVENT ALTER COLUMN USER_ID SET NOT NULL"});
+        // Schema version 3 added the endpoint columns. Dropping one must refuse startup rather than
+        // leaving a schema on which every grant silently compares a subset of the endpoint.
+        mutations.add(new String[]{"endpoint port column removed",
+            "ALTER TABLE %s.DBAC_TW_CURRENT DROP COLUMN PORT_SNAPSHOT"});
         mutations.add(new String[]{"missing column",
             "ALTER TABLE %s.DBAC_TW_CURRENT DROP COLUMN HOST_SNAPSHOT"});
         mutations.add(new String[]{"unexpected column",
@@ -987,6 +994,86 @@ public class DbacSchemaPostgresTest {
             Assertions.assertEquals(1, DbacTestSupport.countVersionRows(connection));
         });
     }
+
+    /**
+     * A version 2 schema gains the endpoint columns on PostgreSQL, and no existing grant is filled in
+     * <p>
+     * The H2 half of this pair proves the statements are accepted and that recovery works; this half
+     * proves PostgreSQL accepts the same script, and that the row carried across keeps its empty
+     * endpoint. A migration that guessed the columns from the connection's current configuration
+     * would make a grant that was never checked against a port look as though it had been.
+     */
+    @Test
+    public void versionTwoSchemaGainsTheEndpointColumns() throws Exception {
+        withInstalledSchema("dbac_pg_v3", (raw, connection, schema) -> {
+            DbacTestSupport.downgradeToVersionTwo(raw, schema);
+            Assertions.assertEquals(
+                2, DbacTestSupport.readVersion(connection).intValue(),
+                "Precondition: the schema must look like version 2");
+            Assertions.assertFalse(
+                DbacSchemaValidator.inspect(raw, schema).isComplete(),
+                "a schema without the endpoint columns must not satisfy the version 3 structure");
+            DbacTestSupport.execute(raw,
+                "INSERT INTO " + schema + ".DBAC_TW_CURRENT"
+                    + " (USER_ID, PROJECT_ID, CONNECTION_ID, GRANT_ID, REVISION, GRANTED_BY,"
+                    + "  GRANTED_AT, EXPIRES_AT, REASON, DRIVER_ID, HOST_SNAPSHOT, DATABASE_SNAPSHOT)"
+                    + " VALUES ('legacy-user', 'legacy-project', 'legacy-connection', 'legacy-grant',"
+                    + "  1, 'admin', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'written under version 2',"
+                    + "  'postgres-jdbc', 'db.internal.example', 'customer_prod')");
+
+            InternalDatabaseConfig config = configFor(schema);
+            schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
+
+            Assertions.assertEquals(
+                DbacSchemaConstants.CURRENT_SCHEMA_VERSION,
+                DbacTestSupport.readVersion(connection).intValue());
+            Assertions.assertTrue(
+                DbacSchemaValidator.inspect(raw, schema).isComplete(),
+                "the endpoint columns must exist after the migration");
+
+            try (java.sql.Statement dbStat = raw.createStatement();
+                 java.sql.ResultSet dbResult = dbStat.executeQuery(
+                     "SELECT PROVIDER_ID, CONFIGURATION_TYPE, PORT_SNAPSHOT FROM "
+                         + schema + ".DBAC_TW_CURRENT WHERE GRANT_ID='legacy-grant'")
+            ) {
+                Assertions.assertTrue(dbResult.next(), "the version 2 row must survive");
+                for (String column : new String[]{"PROVIDER_ID", "CONFIGURATION_TYPE", "PORT_SNAPSHOT"}) {
+                    Assertions.assertNull(
+                        dbResult.getString(column),
+                        column + " must stay empty after the migration");
+                }
+            }
+        });
+    }
+
+    /**
+     * A partly applied 2 to 3 migration completes on the next start
+     * <p>
+     * On PostgreSQL the runner wraps the script in a transaction, so a real interruption rolls the
+     * whole thing back and this state does not arise that way. It can still arise from a column
+     * added by hand, and the script has to cope: {@code ADD COLUMN IF NOT EXISTS} names the target
+     * state, so the statement that already ran is a no-op rather than an error.
+     */
+    @Test
+    public void partiallyAppliedEndpointMigrationCompletes() throws Exception {
+        withInstalledSchema("dbac_pg_v3_part", (raw, connection, schema) -> {
+            DbacTestSupport.downgradeToVersionTwo(raw, schema);
+            DbacTestSupport.execute(raw,
+                "ALTER TABLE " + schema + ".DBAC_TW_CURRENT ADD COLUMN CONFIGURATION_TYPE VARCHAR(32)");
+            Assertions.assertFalse(
+                DbacSchemaValidator.inspect(raw, schema).isComplete(),
+                "Precondition: a half-migrated schema must not validate");
+
+            InternalDatabaseConfig config = configFor(schema);
+            schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
+
+            Assertions.assertEquals(
+                DbacSchemaConstants.CURRENT_SCHEMA_VERSION,
+                DbacTestSupport.readVersion(connection).intValue());
+            Assertions.assertTrue(DbacSchemaValidator.inspect(raw, schema).isComplete());
+        });
+    }
+
 
     /**
      * A migrated column really holds an instant, checked from a session in another zone

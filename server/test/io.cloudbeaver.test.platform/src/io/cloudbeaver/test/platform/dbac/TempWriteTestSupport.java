@@ -17,6 +17,7 @@
 package io.cloudbeaver.test.platform.dbac;
 
 import io.cloudbeaver.service.dbac.db.DbacSchemaConstants;
+import io.cloudbeaver.service.dbac.tempwrite.EndpointSnapshot;
 import io.cloudbeaver.service.dbac.tempwrite.MetadataConnectionSource;
 import io.cloudbeaver.service.dbac.tempwrite.MetadataDbTime;
 import io.cloudbeaver.service.dbac.tempwrite.TempWriteGrant;
@@ -77,6 +78,16 @@ final class TempWriteTestSupport {
     }
 
     /**
+     * The endpoint every fixture grant is issued for
+     * <p>
+     * Matches the container {@code PolicyTestSupport} builds by default, so a policy test that uses
+     * both fixtures is comparing an endpoint against itself unless it deliberately varies one field.
+     */
+    @NotNull
+    static final EndpointSnapshot ENDPOINT = new EndpointSnapshot(
+        "postgresql", "postgres-jdbc", "MANUAL", "db.internal.example", "5432", "customer_prod");
+
+    /**
      * Builds a grant request whose start revision is fixed by the caller
      * <p>
      * The start revision is a test parameter on purpose: passing a stale one is how the refusal path
@@ -89,15 +100,31 @@ final class TempWriteTestSupport {
         @NotNull Duration duration,
         @NotNull String reason
     ) {
+        return grantRequest(key, observedRevisionAtRequestStart, duration, reason, ENDPOINT);
+    }
+
+    /**
+     * A grant request for an endpoint other than the default fixture's
+     * <p>
+     * Needed by any test whose connection is not the default PostgreSQL one: the grant records the
+     * endpoint it was issued for, so granting with the default endpoint and then authorizing a
+     * MySQL connection is a mismatch, not a permission.
+     */
+    @NotNull
+    static TempWriteGrantRequest grantRequest(
+        @NotNull TempWritePermissionKey key,
+        long observedRevisionAtRequestStart,
+        @NotNull Duration duration,
+        @NotNull String reason,
+        @NotNull EndpointSnapshot endpoint
+    ) {
         return new TempWriteGrantRequest(
             key,
             "grant-" + UUID.randomUUID(),
             "admin-1",
             duration,
             reason,
-            "postgres-jdbc",
-            "db.internal.example",
-            "customer_prod",
+            endpoint,
             observedRevisionAtRequestStart);
     }
 
@@ -116,7 +143,7 @@ final class TempWriteTestSupport {
         return new TempWriteGrant(
             key, "grant-" + UUID.randomUUID(), revision, "admin-1",
             dbNow, dbNow.plus(DEFAULT_DURATION), "abandoned transaction probe",
-            null, null, null, "postgres-jdbc", null, null);
+            null, null, null, ENDPOINT);
     }
 
     @NotNull

@@ -12,6 +12,19 @@
 --     DDL, so a migration that fails half-way leaves the already created objects behind; the next
 --     start must be able to finish the job without manual cleanup. IF NOT EXISTS alone is not
 --     sufficient - DbacSchemaValidator additionally verifies the resulting structure.
+--   * Where a comment may go, and why it matters. SQLSchemaManager translates the whole file and then
+--     splits the result on ';'. The translator drops a comment block that is separated from the next
+--     statement by a blank line, and keeps one that sits directly above it as part of that statement.
+--     So a comment adjacent to a statement, or inside a column list, is handed to the database - H2
+--     rejects a comment between two column definitions outright - and any ';' in such a comment
+--     splits the statement in half. Keep explanations in this header block, which is dropped, and
+--     keep them free of ';' regardless.
+--   * DBAC_TW_CURRENT records which physical database a grant was issued for, in PROVIDER_ID,
+--     DRIVER_ID, CONFIGURATION_TYPE, HOST_SNAPSHOT, PORT_SNAPSHOT and DATABASE_SNAPSHOT. All six are
+--     compared on every authorization and a difference is GRANT_STALE. All are nullable except
+--     DRIVER_ID, because a row written by schema version 2 has no provider, configuration type or
+--     port and version 3 does not invent them. Such a row matches no connection and is denied until
+--     the grant is issued again.
 
 CREATE TABLE IF NOT EXISTS {table_prefix}DBAC_SCHEMA_INFO
 (
@@ -41,9 +54,12 @@ CREATE TABLE IF NOT EXISTS {table_prefix}DBAC_TW_CURRENT
     REVOKED_BY        VARCHAR(128),
     REVOKE_REASON     VARCHAR(1000),
 
-    DRIVER_ID         VARCHAR(128)  NOT NULL,
-    HOST_SNAPSHOT     VARCHAR(255),
-    DATABASE_SNAPSHOT VARCHAR(255),
+    PROVIDER_ID        VARCHAR(128),
+    DRIVER_ID          VARCHAR(128) NOT NULL,
+    CONFIGURATION_TYPE VARCHAR(32),
+    HOST_SNAPSHOT      VARCHAR(255),
+    PORT_SNAPSHOT      VARCHAR(16),
+    DATABASE_SNAPSHOT  VARCHAR(255),
 
     PRIMARY KEY (USER_ID, PROJECT_ID, CONNECTION_ID)
 );

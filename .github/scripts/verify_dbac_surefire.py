@@ -50,6 +50,7 @@ REQUIRED_VALUE = "true"
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
+    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -60,14 +61,17 @@ POSTGRES_CLASSES = (
 # @SelectClasses removes its test cases from the report entirely, and a check that only looked at
 # PostgreSQL would stay green while the rest of the regression net quietly disappeared.
 EXPECTED_DBAC_TESTS = {
-    "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest": 23,
-    "io.cloudbeaver.test.platform.dbac.DbacSchemaRecoveryTest": 19,
+    "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest": 25,
+    "io.cloudbeaver.test.platform.dbac.DbacSchemaRecoveryTest": 21,
     "io.cloudbeaver.test.platform.dbac.DbacScriptTranslationTest": 9,
     "io.cloudbeaver.test.platform.dbac.DbacSchemaTest": 7,
     "io.cloudbeaver.test.platform.dbac.DbacScriptStatementsTest": 6,
-    "io.cloudbeaver.test.platform.dbac.TempWriteModelTest": 18,
+    "io.cloudbeaver.test.platform.dbac.TempWriteModelTest": 24,
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest": 32,
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest": 18,
+    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest": 47,
+    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest": 62,
+    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest": 13,
 }
 
 for _postgres_class in POSTGRES_CLASSES:

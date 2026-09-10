@@ -25,6 +25,9 @@ import io.cloudbeaver.model.session.WebSessionProjectTest;
 import io.cloudbeaver.model.session.WebSessionTest;
 import io.cloudbeaver.test.platform.admin.AdminCreateUserTest;
 import io.cloudbeaver.test.platform.admin.AdminLastLoginTimeTest;
+import io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest;
+import io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest;
+import io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest;
 import io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest;
 import io.cloudbeaver.test.platform.dbac.DbacSchemaRecoveryTest;
 import io.cloudbeaver.test.platform.dbac.DbacSchemaTest;
@@ -66,6 +69,9 @@ import org.junit.platform.suite.api.Suite;
         DbacSchemaPostgresTest.class,
         TempWriteModelTest.class,
         TempWriteRepositoryTest.class,
+        DbAccessPolicyModelTest.class,
+        DbAccessPolicyTest.class,
+        DbAccessPolicyPostgresTest.class,
         TempWriteRepositoryPostgresTest.class
     }
 )

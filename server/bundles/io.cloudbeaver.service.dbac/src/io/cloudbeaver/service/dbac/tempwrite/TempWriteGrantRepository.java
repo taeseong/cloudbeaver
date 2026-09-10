@@ -57,7 +57,8 @@ public class TempWriteGrantRepository {
 
     private static final String CURRENT_COLUMNS =
         "USER_ID, PROJECT_ID, CONNECTION_ID, GRANT_ID, REVISION, GRANTED_BY, GRANTED_AT, EXPIRES_AT, REASON,"
-            + " REVOKED_AT, REVOKED_BY, REVOKE_REASON, DRIVER_ID, HOST_SNAPSHOT, DATABASE_SNAPSHOT";
+            + " REVOKED_AT, REVOKED_BY, REVOKE_REASON,"
+            + " PROVIDER_ID, DRIVER_ID, CONFIGURATION_TYPE, HOST_SNAPSHOT, PORT_SNAPSHOT, DATABASE_SNAPSHOT";
 
     private static final String SELECT_CURRENT =
         "SELECT " + CURRENT_COLUMNS + " FROM " + CURRENT_TABLE
@@ -73,13 +74,14 @@ public class TempWriteGrantRepository {
 
     private static final String INSERT_CURRENT =
         "INSERT INTO " + CURRENT_TABLE + " (" + CURRENT_COLUMNS + ")"
-            + " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+            + " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
     private static final String UPDATE_CURRENT =
         "UPDATE " + CURRENT_TABLE
             + " SET GRANT_ID=?, REVISION=?, GRANTED_BY=?, GRANTED_AT=?, EXPIRES_AT=?, REASON=?,"
             + " REVOKED_AT=NULL, REVOKED_BY=NULL, REVOKE_REASON=NULL,"
-            + " DRIVER_ID=?, HOST_SNAPSHOT=?, DATABASE_SNAPSHOT=?"
+            + " PROVIDER_ID=?, DRIVER_ID=?, CONFIGURATION_TYPE=?,"
+            + " HOST_SNAPSHOT=?, PORT_SNAPSHOT=?, DATABASE_SNAPSHOT=?"
             + " WHERE USER_ID=? AND PROJECT_ID=? AND CONNECTION_ID=? AND REVISION=?";
 
     private static final String REVOKE_CURRENT =
@@ -136,9 +138,7 @@ public class TempWriteGrantRepository {
             setTime(dbStat, index++, grant.revokedAt());
             setString(dbStat, index++, grant.revokedBy());
             setString(dbStat, index++, grant.revokeReason());
-            dbStat.setString(index++, grant.driverId());
-            setString(dbStat, index++, grant.hostSnapshot());
-            setString(dbStat, index, grant.databaseSnapshot());
+            bindEndpoint(dbStat, index, requireEndpoint(grant));
             return dbStat.executeUpdate();
         }
     }
@@ -167,9 +167,7 @@ public class TempWriteGrantRepository {
             setTime(dbStat, index++, grant.grantedAt());
             setTime(dbStat, index++, grant.expiresAt());
             dbStat.setString(index++, grant.reason());
-            dbStat.setString(index++, grant.driverId());
-            setString(dbStat, index++, grant.hostSnapshot());
-            setString(dbStat, index++, grant.databaseSnapshot());
+            index = bindEndpoint(dbStat, index, requireEndpoint(grant));
             index = bindKey(dbStat, index, grant.key());
             dbStat.setLong(index, expectedRevision);
             return dbStat.executeUpdate();
@@ -298,9 +296,47 @@ public class TempWriteGrantRepository {
             readTime(dbResult, "REVOKED_AT"),
             dbResult.getString("REVOKED_BY"),
             dbResult.getString("REVOKE_REASON"),
-            requireString(dbResult, "DRIVER_ID"),
-            dbResult.getString("HOST_SNAPSHOT"),
-            dbResult.getString("DATABASE_SNAPSHOT"));
+            EndpointSnapshot.ofStored(
+                dbResult.getString("PROVIDER_ID"),
+                dbResult.getString("DRIVER_ID"),
+                dbResult.getString("CONFIGURATION_TYPE"),
+                dbResult.getString("HOST_SNAPSHOT"),
+                dbResult.getString("PORT_SNAPSHOT"),
+                dbResult.getString("DATABASE_SNAPSHOT")));
+    }
+
+    /**
+     * The endpoint a row is about to be written with
+     * <p>
+     * Throws rather than writing nulls. A grant is only ever stored from a request, and a request
+     * cannot carry an absent endpoint, so reaching this with null means a caller assembled a
+     * {@link TempWriteGrant} by hand from a row it had read - which would write a grant that
+     * authorises nothing identifiable. Failing loudly here beats a constraint violation from three
+     * frames deeper, and beats silently storing a row that can never match.
+     */
+    @NotNull
+    private static EndpointSnapshot requireEndpoint(@NotNull TempWriteGrant grant) {
+        EndpointSnapshot endpoint = grant.endpoint();
+        if (endpoint == null) {
+            throw new IllegalStateException(
+                "A TEMP_WRITE grant cannot be stored without an endpoint; grant " + grant.grantId());
+        }
+        return endpoint;
+    }
+
+    private static int bindEndpoint(
+        @NotNull PreparedStatement dbStat,
+        int firstIndex,
+        @NotNull EndpointSnapshot endpoint
+    ) throws SQLException {
+        int index = firstIndex;
+        dbStat.setString(index++, endpoint.providerId());
+        dbStat.setString(index++, endpoint.driverId());
+        dbStat.setString(index++, endpoint.configurationType());
+        dbStat.setString(index++, endpoint.host());
+        dbStat.setString(index++, endpoint.port());
+        dbStat.setString(index++, endpoint.database());
+        return index;
     }
 
     private static int bindKey(

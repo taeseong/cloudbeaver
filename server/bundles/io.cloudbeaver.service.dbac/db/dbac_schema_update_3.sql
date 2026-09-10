@@ -1,0 +1,72 @@
+-- DBAC schema version 3: a grant records which physical database it was issued for.
+--
+-- Why this is a migration and not a note for later.
+--
+-- Version 2 recorded three values for that: DRIVER_ID, HOST_SNAPSHOT and DATABASE_SNAPSHOT. That set
+-- is not an endpoint. Measured against the current code: a connection edited so that only its port
+-- changes - 5432 to 5433, same host, same database, same driver, same connection id, the very same
+-- container object still held by the registry - was ALLOWED under an existing grant, because all
+-- three recorded values still matched. A different port on the same host is a different server
+-- instance, so the grant had followed the connection to a database nobody authorised.
+--
+-- The same gap covered two more cases. Switching a connection to a custom JDBC URL was allowed,
+-- although in URL mode the platform hands the stored url to the driver verbatim and the host and
+-- database fields stop describing the target - CloudBeaver never even populates the port in that
+-- mode, and it does not clear the stale values left from before the switch. Enabling an SSH tunnel
+-- was allowed too, although a tunnel rewrites host and port at connect time and its own remoteHost
+-- and remotePort decide which database is reached.
+--
+-- So version 3 adds the three columns the identity was missing:
+--   PROVIDER_ID        - a driver id is not unique across providers
+--   CONFIGURATION_TYPE - MANUAL and URL are different trust properties, not different spellings
+--   PORT_SNAPSHOT      - the value whose absence made the succession above possible
+--
+-- Configurations whose physical target cannot be read off stored state at all - URL mode, an enabled
+-- network handler, a config profile, a driver substitution, a routing property, a variable
+-- expression, a missing host, port or database - are not represented here. They are refused at
+-- decision time with ENDPOINT_UNSUPPORTED rather than stored as a guess. See
+-- docs/db-access-control-endpoint-identity.md for the full list and the platform code behind it.
+--
+-- Why the new columns are nullable, and why the migration leaves them empty.
+--
+-- A version 2 row cannot supply them. Filling them in from the connection's current configuration
+-- was considered and rejected: it would take the port a connection happens to have right now and
+-- write it in as though it had been checked when the grant was issued, which is precisely the
+-- succession these columns exist to catch - the migration would bless it. So the columns are added
+-- empty, EndpointSnapshot.ofStored returns null for such a row, and the write gate denies with
+-- GRANT_STALE until an administrator grants again. A grant issued before this check existed does not
+-- become trustworthy because the check now exists.
+--
+-- Notes for maintainers:
+--   * The migration runner splits this file on ';', so no statement may contain an inner ';'.
+--   * {table_prefix} is a schema qualifier ("<schema>." or ""), substituted before execution.
+--   * ALTER TABLE ... ADD COLUMN IF NOT EXISTS is accepted by both H2 2.4.240 and PostgreSQL 16.15.
+--     Re-running this script is therefore safe on both: IF NOT EXISTS names the target state rather
+--     than a change to apply, so a table that already has the column ends in the same state. That
+--     matters because two paths do replay it - PostgreSQL version-only recovery reports version 0
+--     and the runner walks 0 to 3, and the test helper that downgrades a schema to version 1 leaves
+--     a version-3 structure behind a version-1 row.
+--   * Only DBAC_TW_CURRENT changes. DBAC_TW_HISTORY has no endpoint columns to extend - it never
+--     carried the version 2 three either - and DBAC_AUDIT_EVENT records decisions, not grants.
+--   * No column is NOT NULL and none has a default, so no existing row is rewritten and no table is
+--     scanned. On PostgreSQL each statement takes a brief ACCESS EXCLUSIVE lock on the table.
+--   * How an interrupted run recovers differs by engine, and both routes end fail-closed:
+--       - On PostgreSQL the run rolls back as a whole, because SQLSchemaManager.updateSchema wraps it
+--         in a JDBCTransaction and PostgreSQL puts ALTER TABLE inside that transaction. The version
+--         row still reads 2 and the next start runs this script again from the beginning.
+--       - H2 does not roll DDL back, so one or two of the three columns can be left added. The
+--         version row is only written after the whole script succeeds, so it still reads 2, the next
+--         start runs this script again, and the statements that already ran are no-ops by the point
+--         above.
+--       - If the version row reads 3 while the structure does not match, DbacSchemaValidator refuses
+--         to start and names the column that is missing. Startup stops rather than proceeding on a
+--         schema nobody can describe.
+--   * VARCHAR(16) for the port is deliberate. The value stored is the port string exactly as the
+--     connection carries it. The decision layer refuses anything that is not one to five digits, so
+--     16 is room to spare rather than a limit anyone can reach.
+
+ALTER TABLE {table_prefix}DBAC_TW_CURRENT ADD COLUMN IF NOT EXISTS PROVIDER_ID VARCHAR(128);
+
+ALTER TABLE {table_prefix}DBAC_TW_CURRENT ADD COLUMN IF NOT EXISTS CONFIGURATION_TYPE VARCHAR(32);
+
+ALTER TABLE {table_prefix}DBAC_TW_CURRENT ADD COLUMN IF NOT EXISTS PORT_SNAPSHOT VARCHAR(16);

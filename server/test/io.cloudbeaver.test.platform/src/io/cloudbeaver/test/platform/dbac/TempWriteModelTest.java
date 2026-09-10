@@ -99,7 +99,7 @@ public class TempWriteModelTest {
         assertRejected(
             () -> new TempWriteGrantRequest(
                 new TempWritePermissionKey("user", "proj", "conn"), "g", "admin",
-                Duration.ofMinutes(30), "   ", "postgres-jdbc", null, null, 0L),
+                Duration.ofMinutes(30), "   ", TempWriteTestSupport.ENDPOINT, 0L),
             "reason");
     }
 
@@ -117,6 +117,101 @@ public class TempWriteModelTest {
             () -> new TempWriteRevokeRequest(
                 new TempWritePermissionKey("user", "proj", "conn"), "admin", "reason", -1L),
             "revision");
+    }
+
+    // ----------------------------------------------------------------- found by the clause sweep
+    //
+    // Each of the six tests below refuses on exactly one check that had nothing holding it. They
+    // were not written from reading the constructors - the first sweep did that and reported every
+    // check pinned. They come from deleting each check in turn and seeing which deletions no test
+    // noticed, which is a different question and gave a different answer.
+
+    /**
+     * A stored grant with a blank grant id cannot be built
+     * <p>
+     * The id is what an audit row and a revocation refer to, so a blank one produces a grant nothing
+     * can name afterwards.
+     */
+    @Test
+    public void storedGrantRejectsBlankGrantId() {
+        assertRejected(
+            () -> new TempWriteGrant(
+                new TempWritePermissionKey("user", "proj", "conn"), "   ",
+                TempWriteGrant.FIRST_REVISION, "admin", NOW, NOW.plus(Duration.ofMinutes(30)),
+                "reason", null, null, null, TempWriteTestSupport.ENDPOINT),
+            "grant id");
+    }
+
+    /**
+     * A stored grant with no granting actor cannot be built
+     * <p>
+     * Phase 2 section 20 requires {@code granted_by} on every audit event. A grant that cannot say
+     * who issued it defeats the record before it is written.
+     */
+    @Test
+    public void storedGrantRejectsBlankGrantedBy() {
+        assertRejected(
+            () -> new TempWriteGrant(
+                new TempWritePermissionKey("user", "proj", "conn"), "grant-1",
+                TempWriteGrant.FIRST_REVISION, "  ", NOW, NOW.plus(Duration.ofMinutes(30)),
+                "reason", null, null, null, TempWriteTestSupport.ENDPOINT),
+            "granting actor");
+    }
+
+    /**
+     * A grant request with a blank grant id is refused
+     */
+    @Test
+    public void grantRequestRejectsBlankGrantId() {
+        assertRejected(
+            () -> new TempWriteGrantRequest(
+                new TempWritePermissionKey("user", "proj", "conn"), " ", "admin",
+                Duration.ofMinutes(30), "reason", TempWriteTestSupport.ENDPOINT, 0L),
+            "grant id");
+    }
+
+    /**
+     * A grant request with no granting actor is refused
+     */
+    @Test
+    public void grantRequestRejectsBlankGrantedBy() {
+        assertRejected(
+            () -> new TempWriteGrantRequest(
+                new TempWritePermissionKey("user", "proj", "conn"), "g", "   ",
+                Duration.ofMinutes(30), "reason", TempWriteTestSupport.ENDPOINT, 0L),
+            "granting actor");
+    }
+
+    /**
+     * A grant request cannot claim to have observed a revision below "no row at all"
+     * <p>
+     * The observed revision is the compare-and-set precondition. A negative value is not a state the
+     * store can ever have been in, so a request carrying one is malformed rather than merely stale.
+     * The revoke path had this test; the grant path did not.
+     */
+    @Test
+    public void grantRequestRejectsNegativeObservedRevision() {
+        assertRejected(
+            () -> new TempWriteGrantRequest(
+                new TempWritePermissionKey("user", "proj", "conn"), "g", "admin",
+                Duration.ofMinutes(30), "reason", TempWriteTestSupport.ENDPOINT, -1L),
+            "revision");
+    }
+
+    /**
+     * An absent key component is refused as malformed input, not as a null dereference
+     * <p>
+     * The distinction is the whole test. {@code requirePresent} checks {@code value == null} before
+     * {@code value.isBlank()}; without the null check the same input throws
+     * {@code NullPointerException} instead, and a caller that catches
+     * {@code IllegalArgumentException} to reject a bad request would let it through. Asserting the
+     * exception type is what tells the two apart, and no test did.
+     */
+    @Test
+    public void keyRejectsAnAbsentComponent() {
+        assertRejected(() -> new TempWritePermissionKey(null, "proj", "conn"), "non-blank");
+        assertRejected(() -> new TempWritePermissionKey("user", null, "conn"), "non-blank");
+        assertRejected(() -> new TempWritePermissionKey("user", "proj", null), "non-blank");
     }
 
     /**
@@ -242,9 +337,7 @@ public class TempWriteModelTest {
             null,
             null,
             null,
-            "postgres-jdbc",
-            null,
-            null);
+            TempWriteTestSupport.ENDPOINT);
     }
 
     private static void assertRejected(

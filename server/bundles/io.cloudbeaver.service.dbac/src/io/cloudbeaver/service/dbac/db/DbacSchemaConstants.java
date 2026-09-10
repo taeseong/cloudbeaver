@@ -35,8 +35,17 @@ public final class DbacSchemaConstants {
      * ZONE}. A naive column stores whatever wall clock the writing session rendered, so the same
      * instant is stored differently by nodes in different time zones and a grant expires at a
      * different moment depending on which node looks. See {@code db/dbac_schema_update_2.sql}.
+     * <p>
+     * Version 3 added {@code PROVIDER_ID}, {@code CONFIGURATION_TYPE} and {@code PORT_SNAPSHOT} to
+     * {@code DBAC_TW_CURRENT}. Version 2 recorded only driver, host and database, which let a grant
+     * survive a port change - the same host and database on a different server instance - and let a
+     * connection be switched to a custom JDBC URL, after which the host and database columns stop
+     * describing the target at all. The three columns are nullable and the migration leaves them
+     * empty on purpose: a version 2 grant was issued without these checks, so it is denied until it
+     * is granted again rather than being blessed by a migration. See
+     * {@code db/dbac_schema_update_3.sql} and {@code docs/db-access-control-endpoint-identity.md}.
      */
-    public static final int CURRENT_SCHEMA_VERSION = 2;
+    public static final int CURRENT_SCHEMA_VERSION = 3;
 
     /**
      * No version is considered obsolete: drop+recreate of this schema is never allowed.

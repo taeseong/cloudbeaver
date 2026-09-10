@@ -438,6 +438,57 @@ final class DbacTestSupport {
         "DBAC_AUDIT_EVENT.EXPIRES_AT");
 
     /**
+     * Makes a current schema look exactly like schema version 2
+     * <p>
+     * Drops the three columns version 3 added and rewinds the version row. Nothing else is touched:
+     * version 2 differs from version 3 in these columns alone, so a fixture that changed anything
+     * else would be testing a schema that never shipped.
+     */
+    static void downgradeToVersionTwo(
+        @NotNull Connection rawConnection,
+        @NotNull String schema
+    ) throws SQLException {
+        for (String column : VERSION_THREE_COLUMNS) {
+            int dot = column.indexOf('.');
+            execute(rawConnection, "ALTER TABLE " + schema + "." + column.substring(0, dot)
+                + " DROP COLUMN " + column.substring(dot + 1));
+        }
+        setVersion(rawConnection, schema, 2);
+    }
+
+    /**
+     * Writes the version row directly, for a fixture that needs a schema to claim a given version
+     */
+    static void setVersion(
+        @NotNull Connection rawConnection,
+        @NotNull String schema,
+        int version
+    ) throws SQLException {
+        try (PreparedStatement dbStat = rawConnection.prepareStatement(
+            "UPDATE " + schema + "." + DbacSchemaConstants.VERSION_TABLE_NAME
+                + " SET VERSION=? WHERE MODULE_ID=?")
+        ) {
+            dbStat.setInt(1, version);
+            dbStat.setString(2, DbacSchemaConstants.SCHEMA_ID);
+            if (dbStat.executeUpdate() != 1) {
+                throw new SQLException("Expected exactly one DBAC version row to set");
+            }
+        }
+    }
+
+    /**
+     * Columns that schema version 3 added, in the order the update script adds them
+     * <p>
+     * Named here so that a column added to the script without being added to the downgrade helper
+     * leaves a version-1 fixture that is not actually shaped like version 1, which shows up as a
+     * migration test failure rather than as a silent pass.
+     */
+    static final List<String> VERSION_THREE_COLUMNS = List.of(
+        "DBAC_TW_CURRENT.PROVIDER_ID",
+        "DBAC_TW_CURRENT.CONFIGURATION_TYPE",
+        "DBAC_TW_CURRENT.PORT_SNAPSHOT");
+
+    /**
      * Turns an installed schema back into what version 1 shipped
      * <p>
      * There is no version 1 create script any more - the shipped one produces version 2 directly - so
@@ -450,6 +501,13 @@ final class DbacTestSupport {
         @NotNull Connection rawConnection,
         @NotNull String schema
     ) throws SQLException {
+        // Version 1 had none of these columns, so a fixture that keeps them is not version 1 and a
+        // 1-to-3 migration test running against it would prove nothing about the ADD COLUMN half.
+        for (String column : VERSION_THREE_COLUMNS) {
+            int dot = column.indexOf('.');
+            execute(rawConnection, "ALTER TABLE " + schema + "." + column.substring(0, dot)
+                + " DROP COLUMN " + column.substring(dot + 1));
+        }
         for (String column : ZONED_TIME_COLUMNS) {
             int dot = column.indexOf('.');
             execute(rawConnection, "ALTER TABLE " + schema + "." + column.substring(0, dot)
