@@ -17,12 +17,24 @@
 server/product/aggregate/pom.xml
   modules:
     ../../../../dbeaver-common     <- 형제 저장소
+    ../../../../datadam-api/apis   <- 형제 저장소
     ../../../../dbeaver            <- 형제 저장소
     ../..                          <- cloudbeaver
 ```
 
-이 aggregate가 **세 소스 트리를 하나의 Maven session으로 빌드**합니다. `org.jkiss.dbeaver.*` 플랫폼 번들은
+이 aggregate가 **네 소스 트리를 하나의 Maven session으로 빌드**합니다. `org.jkiss.dbeaver.*` 플랫폼 번들은
 로컬 소스에서 만들어지며, p2에서 내려오지 않습니다.
+
+`datadam-api`는 upstream `dbeaver/cloudbeaver` commit `9c7742e59e10`이 추가한 것으로, 이 fork도 같은
+배선을 이식했습니다(8절). `project.deps`에도 같은 이름으로 들어 있어야 CI의
+`dbeaver/github-actions/clone-repositories`가 형제 위치에 clone합니다.
+
+> **`datadam-api`는 build-time dependency이며 runtime product bundle이 아닙니다.** reactor에 들어가는
+> 이유는 최신 `org.jkiss.dbeaver.model.datadam`의 MANIFEST가 `com.dbeaver.datadam.share.api`를
+> `Require-Bundle`로 요구해 **target platform 해석 단계에서 필요하기 때문**입니다. 산출물 확인 결과
+> `server/product/web-server/target/products/io.cloudbeaver.product/all/all/all/plugins/`의 204개 jar 중
+> `*datadam*`은 0건이고 `artifacts.xml`·`config.ini`에도 등장하지 않습니다. `server/features/*/feature.xml`
+> 어디에도 datadam 참조가 없습니다. **제품에 포함된다고 적지 마십시오.**
 
 ## 2. `server/pom.xml`을 전체 검증에 쓰지 말 것
 
@@ -53,11 +65,24 @@ cd server/product/aggregate
 mvn -B clean verify -Dheadless-platform
 ```
 
-`JAVA_HOME`은 JDK 21이어야 합니다. 형제 저장소 `../../../../dbeaver`와 `../../../../dbeaver-common`이
-체크아웃되어 있어야 합니다(`build-backend.sh:19-20`이 `--depth 1`로 clone합니다).
+`JAVA_HOME`은 JDK 21이어야 합니다. 형제 저장소 `../../../../dbeaver`, `../../../../dbeaver-common`,
+`../../../../datadam-api`가 체크아웃되어 있어야 합니다(`build-backend.sh:19-21`이 `--depth 1`로
+clone합니다).
 
-실측: 138 modules, 단일 Reactor Summary. `[n/138]`이 권위 있는 숫자입니다 —
-`grep -c '^\[INFO\] Building '`로 세면 tycho 하위 단계까지 잡혀 244가 나오므로 그렇게 세지 마십시오.
+**검증 snapshot (2026-09-14): 143 modules, 326 tests, 단일 Reactor Summary.**
+
+| 항목 | 값 |
+|---|---|
+| reactor modules | 143 (SUCCESS 143 / FAILURE 0 / SKIPPED 0) |
+| tests | 326 (failures 0 / errors 0 / skipped 0) |
+| dependency | cloudbeaver `4e2e17937`, dbeaver `8fe918f5`, dbeaver-common `ff69b563`, datadam-api `c8645a8a` |
+
+> **모듈 수와 reactor 순번은 snapshot 한정값입니다.** 세 형제 저장소는 CI에서
+> `clone-repositories`가 **SHA 고정 없이 devel HEAD로** clone하므로, 그쪽에 모듈이 추가·삭제되면
+> 이 숫자는 예고 없이 바뀝니다(실제로 138 → 140 → 143으로 두 번 바뀌었습니다). **`[n/143]` 같은
+> 순번을 고정 사실로 인용하지 말고, 인용할 때는 어느 dependency 조합에서 나온 값인지 함께 적으십시오.**
+> 개수를 셀 때 `grep -c '^\[INFO\] Building '`를 쓰면 tycho 하위 단계까지 잡히므로 그렇게 세지 말고,
+> Reactor Summary 또는 `[n/N]` 표기를 읽으십시오.
 
 ## 4. PostgreSQL required-mode command
 
@@ -137,13 +162,27 @@ step은 Surefire XML을 읽어 다음을 확인하고, 하나라도 어긋나면
 - 리포트 파일이 존재하고 파싱 가능한 XML인가
 - `<properties>`에 `dbac.test.postgres.required=true`가 기록되었는가
   (즉 property가 forked test JVM에 실제로 도달했는가)
-- DBAC 5개 클래스의 testcase 수가 정확한가 —
-  `DbacSchemaPostgresTest` 21, `DbacSchemaRecoveryTest` 17, `DbacScriptTranslationTest` 9,
-  `DbacSchemaTest` 7, `DbacScriptStatementsTest` 6
+- DBAC **11개 클래스**의 testcase 수가 정확한가 — 합계 **269**
+
+  | 클래스 | 고정값 | PostgreSQL 필요 |
+  |---|---:|---|
+  | `DbAccessPolicyTest` | 67 | |
+  | `DbAccessPolicyModelTest` | 47 | |
+  | `TempWriteRepositoryTest` | 32 | |
+  | `DbacSchemaPostgresTest` | 25 | O |
+  | `TempWriteModelTest` | 24 | |
+  | `DbacSchemaRecoveryTest` | 21 | |
+  | `TempWriteRepositoryPostgresTest` | 18 | O |
+  | `DbAccessPolicyPostgresTest` | 13 | O |
+  | `DbacScriptTranslationTest` | 9 | |
+  | `DbacSchemaTest` | 7 | |
+  | `DbacScriptStatementsTest` | 6 | |
+  | **합계** | **269** | **PostgreSQL 3개 클래스 / 56** |
+
 - 그 testcase에 `skipped` / `failure` / `error` / `flakyFailure` / `rerunFailure`가 하나도 없는가
 
-`<testsuite tests="...">` 속성은 **신뢰하지 않습니다.** 이 스위트에서 그 값은 110인데 실제
-`<testcase>`는 117개입니다. 검증기는 항상 `<testcase>` 요소를 직접 셉니다.
+`<testsuite tests="...">` 속성은 **신뢰하지 않습니다.** 위 snapshot에서 그 값은 308인데 실제
+`<testcase>`는 326개입니다. 검증기는 항상 `<testcase>` 요소를 직접 셉니다.
 
 step에는 `if:`도 `continue-on-error:`도 없습니다. `if: always()`를 쓰지 않는 이유는, 빌드가
 실패한 뒤에도 실행되면 없거나 낡은 리포트 때문에 진짜 원인 위에 혼란스러운 두 번째 오류가
@@ -168,17 +207,24 @@ python .github/scripts/verify_dbac_surefire.py \
 Platform 저장소입니다. 따라서 PostgreSQL을 붙일 수 있는 유일한 방법이 이 fork 소유
 `backend-build.yml`을 호출하는 것입니다.
 
-**대가.** PR마다 백엔드 빌드가 한 번 더 돕니다(로컬 warm 실측 2:25~2:33). 그 대가를 치르지
+**대가.** PR마다 백엔드 빌드가 한 번 더 돕니다(로컬 warm 실측 2:25~2:33, CI 실측 3:42 —
+run `35705285132`). 그 대가를 치르지
 않으려면 `verify-dbac-postgres` job을 삭제하면 되지만, 그러면 `DbacSchemaPostgresTest`가 CI에서
 계속 skip되므로 **어떤 보고서에도 PostgreSQL이 CI에서 검증된다고 적을 수 없습니다.**
 
-### 남은 위험
+### 해소된 위험 — timeout
 
-**timeout이 실측되지 않았습니다.** `backend-build.yml`의 `timeout-minutes: 10`은 이 workflow가
-한 번도 실행되지 않은 상태에서 정해진 값입니다. cold runner에서는 postgres image pull,
-health 대기, `dbeaver`/`dbeaver-common` clone, Tycho p2 해석, 138 모듈 빌드, 117 테스트,
-드라이버 다운로드가 모두 이 안에 들어가야 합니다. 첫 CI 실행으로 실제 소요 시간을 확인하고
-근거를 갖고 조정하십시오. 초과하면 코드와 무관하게 PR이 red가 됩니다.
+초판은 "`timeout-minutes: 10`이 한 번도 실행되지 않은 상태에서 정해진 값"이라고 적었습니다.
+**CI run `35705285132`(head `2d3b42dab`, 2026-09-22)에서 실측됐습니다.**
+
+| job | timeout | 실측 | 여유 |
+|---|---|---|---|
+| `DBAC PostgreSQL / Build` | 10분 | **3분 42초** (`Run build script` 3:17, 자기검증 step 1초) | 넉넉함 |
+| `Check / Build Java` | 5분 | **1분 36초** (`Compile` 1:16) | 넉넉함 |
+
+postgres image pull, health 대기, 세 형제 저장소 clone, Tycho p2 해석, 143 모듈 빌드, 326 테스트,
+드라이버 다운로드가 모두 그 안에 들어갔습니다. **따라서 timeout 값을 조정할 근거는 현재 없습니다 —
+추정만으로 올리지 마십시오.** 다만 이 실측도 snapshot이며, 형제 저장소가 커지면 다시 봐야 합니다.
 
 ### 해소된 위험 — upstream이 property 전달 경로를 없애는 경우
 
@@ -189,7 +235,8 @@ health 대기, `dbeaver`/`dbeaver-common` clone, Tycho p2 해석, 138 모듈 빌
 green이 됩니다. 데이터베이스 자체는 정상이므로 service health gate가 이 조합을 잡지 못합니다.
 
 이 구멍은 위의 Surefire 자기검증 step이 막습니다. 리포트의 `<properties>`에
-`dbac.test.postgres.required=true`가 없거나 PostgreSQL testcase가 21개가 아니면 step이 실패하므로,
+`dbac.test.postgres.required=true`가 없거나 PostgreSQL 3개 클래스의 testcase 합이 56이 아니면
+step이 실패하므로,
 전달 경로가 사라지면 CI가 green이 될 수 없습니다. 따라서 **더 이상 로그를 손으로 확인할 필요는
 없습니다** — 다만 upstream 병합에서 `server/test/pom.xml`의 `${debugArgs}`가 사라졌다면, 그때는
 이 step이 실패로 알려 줄 것이므로 property 전달 경로를 다시 만들어야 합니다.
@@ -198,9 +245,10 @@ green이 됩니다. 데이터베이스 자체는 정상이므로 service health 
 
 `DbacSchemaPostgresTest.findDriverJar()`는 `user.dir`에서 위로 올라가며
 `deploy/drivers/postgresql/postgresql-*.jar`를 찾습니다. `build-backend.sh:7`이 `deploy/drivers`를
-지우지만, reactor의 `drivers.postgresql`(130/138)이 `io.cloudbeaver.test.platform`(137/138)보다
-먼저 실행되어 드라이버를 다시 받아 놓습니다. 이 순서에 의존하므로, 드라이버 모듈을 테스트 뒤로
-옮기면 테스트가 드라이버를 찾지 못합니다.
+지우지만, reactor의 `drivers.postgresql`이 `io.cloudbeaver.test.platform`보다 **먼저** 실행되어
+드라이버를 다시 받아 놓습니다(위 snapshot에서는 135/143과 142/143이었습니다 — 순번 자체는
+3절의 경고대로 dependency 조합에 따라 바뀌므로 **순서만이 의미 있는 사실입니다**). 이 순서에
+의존하므로, 드라이버 모듈을 테스트 뒤로 옮기면 테스트가 드라이버를 찾지 못합니다.
 
 ## 6. 사고 기록 — missing bundle 오류를 p2 장애로 단정하지 말 것
 
@@ -469,3 +517,88 @@ python sweep2_tier2.py 20                   # 20건만, 나머지는 NOT ESCALAT
 > 따라서 복원 확인은 `git status`가 아니라 **marker 파일의 부재**로 한다.
 > `.omx/scratchpad/dbac-slice3/sweep2/MUTATION-IN-PROGRESS`가 없으면 모든 변형이 원본 바이트로 복원된
 > 것이다.
+
+---
+
+## 8. baseline drift 대응 — 이 branch가 최신 플랫폼에서 빌드되기 위해 필요했던 것
+
+이 slice의 정책 코드는 **한 줄도 바꾸지 않은 채** 두 번 red가 났습니다. 원인은 둘 다 upstream
+플랫폼이 움직였는데 fork base(2026-08)가 따라가지 않은 것이었습니다. 두 대응 모두 upstream이 이미
+쓴 해법을 그대로 이식했고, 새 해법을 발명하지 않았습니다.
+
+### 8.1 datadam-api — build reactor dependency
+
+**증상.** `[17/140] org.jkiss.dbeaver.model.datadam`에서 Tycho p2 해석이 멈춥니다.
+
+```
+[ERROR] Cannot resolve project dependencies:
+[ERROR]   Software being installed: org.jkiss.dbeaver.model.datadam 1.0.0.qualifier
+[ERROR]   Missing requirement: org.jkiss.dbeaver.model.datadam 1.0.0.qualifier requires
+[ERROR]   'osgi.bundle; com.dbeaver.datadam.share.api 0.0.0' but it could not be found
+```
+
+**원인.** `dbeaver` commit `5ae26d7b65aa`(2026-09-09)가
+`plugins/org.jkiss.dbeaver.model.datadam/META-INF/MANIFEST.MF`의 `Require-Bundle`에
+`com.dbeaver.rest.client`와 `com.dbeaver.datadam.share.api`를 추가했습니다. 앞의 것은
+`dbeaver-common`이 제공하지만, 뒤의 것은 **별도 저장소 `dbeaver/datadam-api`**(public,
+default branch `devel`)의 `apis/com.dbeaver.datadam.share.api`에만 있습니다. CI는
+`project.deps`에 적힌 저장소만 clone하므로, 이름이 없으면 그 번들은 영영 오지 않습니다.
+
+**대응.** upstream `dbeaver/cloudbeaver` commit `9c7742e59e10`("Wire datadam-api as a build
+dependency")의 4파일을 그대로 이식했습니다 — `project.deps`, `server/product/aggregate/pom.xml`,
+`deploy/build-backend.sh`, `deploy/build.bat`. 네 파일 모두 upstream post-image blob과 **바이트
+단위로 동일**합니다.
+
+**이것은 runtime dependency가 아닙니다** — 1절의 경고 박스 참조.
+
+**진단이 base와 head를 구분한 방법.** 격리 사본에서 base `69f9a14f4`와 head `4e2e179371`을 **같은
+dependency 조합**으로 각각 1회 빌드해 첫 `[ERROR]` 4줄이 바이트 단위로 동일함을 확인했습니다.
+그래서 이 실패는 slice의 회귀가 아니라 baseline drift로 분류됐습니다. **"새 코드가 들어간 뒤 red가
+났다"만으로 회귀라고 적지 마십시오 — base를 같은 조합으로 한 번 돌려 보면 5분 안에 갈립니다.**
+
+### 8.2 RMController `Object` → `String` 호환성 적응
+
+**증상.** 위를 고치고 나면 `[97/143] io.cloudbeaver.model`에서 컴파일이 실패합니다.
+
+```
+[ERROR] LocalResourceController.java:[76,8] io.cloudbeaver.model.rm.local.LocalResourceController
+        is not abstract and does not override abstract method
+        setResourceProperties(String,String,Map<String,String>) in
+        org.jkiss.dbeaver.model.rm.RMController
+```
+
+**원인.** 플랫폼이 resource property 값 타입을 좁혔습니다.
+
+| | 이전 | 이후 |
+|---|---|---|
+| `RMController.setResourceProperty` | `@Nullable Object propertyValue` | `@Nullable String propertyValue` |
+| `RMController.setResourceProperties` | `Map<String, Object>` | `Map<String, String>` |
+| `RMResource.properties` | `Map<String, Object>` | `Map<String, String>` |
+
+**대응.** upstream commit `099e2896a4cf`("Refactor editor properties to always be strings")의 3파일
+hunk를 그대로 이식했습니다 — `LocalResourceController.java`, `DBWServiceRM.java`,
+`WebServiceRM.java`. 뒤의 두 개는 upstream blob과 동일하고, 앞의 하나는 fork base가 upstream과
+달라 blob은 다르되 **hunk 본문은 동일**합니다.
+
+**타입을 억지로 넓히지 않았습니다.** `String.valueOf`, JSON 직렬화, unchecked cast를 하나도
+추가하지 않았습니다. GraphQL 계약(`service.rm.graphqls`의
+`rmSetResourceProperty(… value: String)`)은 **원래부터 `String`이었고 nullable이었습니다** —
+Java 쪽 `Object`가 스키마보다 넓었을 뿐이므로 이 변경으로 와이어 계약이 좁아진 것은 없습니다.
+`value == null` → 속성 삭제 동작과 `@WebProjectAction(requireProjectPermissions =
+RMConstants.PERMISSION_PROJECT_RESOURCE_EDIT)` 권한 검사도 그대로입니다.
+
+### 8.3 이 계열의 위험은 구조적이며 사라지지 않습니다
+
+CI의 `clone-repositories`는 `dbeaver`, `dbeaver-common`, `datadam-api`를 **SHA 고정 없이** head ref →
+base ref → default branch 순으로 clone합니다. 즉 **이 저장소의 CI green 여부가 우리가 통제하지 않는
+세 개의 움직이는 브랜치에 종속**되어 있고, 이번 slice에서 그 수가 둘에서 셋으로 늘었습니다.
+
+`verify_dbac_surefire.py`는 "조용히 green"을 막아 주지만 "갑자기 red"는 막지 못합니다. 따라서:
+
+- **어떤 검증 수치도 dependency 조합과 함께 적으십시오.** 3절의 snapshot 표가 그 형식입니다.
+- **plain red를 보면 먼저 base를 같은 조합으로 돌려 보십시오**(8.1의 방법).
+- **drift 대응은 upstream이 이미 쓴 해법을 찾아 이식하십시오.** 이 두 건 모두 upstream에 대응 commit이
+  있었고, 직접 고안한 수정보다 병합 충돌이 적습니다.
+- fork 단독으로 SHA를 고정하는 방법은 검토했으나 채택하지 않았습니다. `Check / Build Java`는
+  `dbeaver-common`의 재사용 workflow라 이 fork가 바꿀 수 없고, DBAC job에만 고정을 넣으면 두 job이
+  서로 다른 플랫폼을 보게 되어 오히려 진단이 어려워집니다.
