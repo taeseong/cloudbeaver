@@ -259,6 +259,10 @@ public class DbacSchemaRecoveryTest {
             "ALTER TABLE %s.DBAC_AUDIT_EVENT ADD COLUMN DENIAL_REASON VARCHAR(63)"});
         mutations.add(new String[]{"wrong nullability",
             "ALTER TABLE %s.DBAC_AUDIT_EVENT ALTER COLUMN USER_ID SET NOT NULL"});
+        // Schema version 3 added the endpoint columns. Dropping one must refuse startup rather than
+        // leaving a schema on which every grant silently compares a subset of the endpoint.
+        mutations.add(new String[]{"endpoint port column removed",
+            "ALTER TABLE %s.DBAC_TW_CURRENT DROP COLUMN PORT_SNAPSHOT"});
         mutations.add(new String[]{"missing column",
             "ALTER TABLE %s.DBAC_TW_CURRENT DROP COLUMN HOST_SNAPSHOT"});
         mutations.add(new String[]{"unexpected column",
@@ -835,6 +839,113 @@ public class DbacSchemaRecoveryTest {
             dbStat.setString(1, DbacSchemaConstants.SCHEMA_ID);
             dbStat.setInt(2, version);
             dbStat.executeUpdate();
+        }
+    }
+
+    /**
+     * A version 2 schema gains the endpoint columns, and no existing grant is filled in
+     * <p>
+     * The second half is the security-relevant one. The migration must not populate the new columns
+     * from anywhere - there is nowhere honest to get them from - because a row whose port was never
+     * checked must not come out of the upgrade looking as though it had been.
+     */
+    @Test
+    public void versionTwoSchemaGainsTheEndpointColumns() throws Exception {
+        String schema = freshSchema("DBAC_REC_V3");
+        try (Connection rawConnection = database.openConnection()) {
+            InternalDatabaseConfig config = withSchema(schema);
+            Connection connection = new InternalProxyConnection(rawConnection, config);
+            schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
+
+            DbacTestSupport.downgradeToVersionTwo(rawConnection, schema);
+            Assertions.assertEquals(
+                2, DbacTestSupport.readVersion(connection).intValue(),
+                "Precondition: the schema must look like version 2");
+            Assertions.assertFalse(
+                DbacSchemaValidator.inspect(rawConnection, schema).isComplete(),
+                "a schema without the endpoint columns must not satisfy the version 3 structure");
+            insertVersionTwoGrant(rawConnection, schema);
+
+            schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
+
+            Assertions.assertEquals(
+                DbacSchemaConstants.CURRENT_SCHEMA_VERSION,
+                DbacTestSupport.readVersion(connection).intValue());
+            Assertions.assertTrue(
+                DbacSchemaValidator.inspect(rawConnection, schema).isComplete(),
+                "the endpoint columns must exist after the migration");
+            assertEndpointColumnsAreEmpty(rawConnection, schema);
+        }
+    }
+
+    /**
+     * An interrupted 2 to 3 migration is finished by the next start
+     * <p>
+     * H2 does not roll DDL back, so a run that dies between the ADD COLUMN statements leaves some of
+     * them applied. Simulated by adding one column by hand and leaving the version row at 2. The
+     * next start must complete the job rather than failing on the column that is already there,
+     * which is what {@code ADD COLUMN IF NOT EXISTS} buys and what recovery depends on.
+     */
+    @Test
+    public void interruptedEndpointMigrationIsFinishedByTheNextStart() throws Exception {
+        String schema = freshSchema("DBAC_REC_V3_PART");
+        try (Connection rawConnection = database.openConnection()) {
+            InternalDatabaseConfig config = withSchema(schema);
+            Connection connection = new InternalProxyConnection(rawConnection, config);
+            schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
+
+            DbacTestSupport.downgradeToVersionTwo(rawConnection, schema);
+            DbacTestSupport.execute(rawConnection,
+                "ALTER TABLE " + schema + ".DBAC_TW_CURRENT ADD COLUMN PROVIDER_ID VARCHAR(128)");
+            Assertions.assertFalse(
+                DbacSchemaValidator.inspect(rawConnection, schema).isComplete(),
+                "Precondition: a half-migrated schema must not validate");
+
+            schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
+
+            Assertions.assertEquals(
+                DbacSchemaConstants.CURRENT_SCHEMA_VERSION,
+                DbacTestSupport.readVersion(connection).intValue());
+            Assertions.assertTrue(
+                DbacSchemaValidator.inspect(rawConnection, schema).isComplete());
+        }
+    }
+
+    /**
+     * A grant row shaped the way schema version 2 wrote them
+     */
+    private static void insertVersionTwoGrant(
+        @NotNull Connection rawConnection,
+        @NotNull String schema
+    ) throws Exception {
+        DbacTestSupport.execute(rawConnection,
+            "INSERT INTO " + schema + ".DBAC_TW_CURRENT"
+                + " (USER_ID, PROJECT_ID, CONNECTION_ID, GRANT_ID, REVISION, GRANTED_BY,"
+                + "  GRANTED_AT, EXPIRES_AT, REASON, DRIVER_ID, HOST_SNAPSHOT, DATABASE_SNAPSHOT)"
+                + " VALUES ('legacy-user', 'legacy-project', 'legacy-connection', 'legacy-grant', 1,"
+                + "  'admin', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'written under version 2',"
+                + "  'postgres-jdbc', 'db.internal.example', 'customer_prod')");
+    }
+
+    /**
+     * Asserts the migration invented nothing for the row it carried across
+     */
+    private static void assertEndpointColumnsAreEmpty(
+        @NotNull Connection rawConnection,
+        @NotNull String schema
+    ) throws Exception {
+        try (java.sql.Statement dbStat = rawConnection.createStatement();
+             java.sql.ResultSet dbResult = dbStat.executeQuery(
+                 "SELECT PROVIDER_ID, CONFIGURATION_TYPE, PORT_SNAPSHOT FROM "
+                     + schema + ".DBAC_TW_CURRENT WHERE GRANT_ID='legacy-grant'")
+        ) {
+            Assertions.assertTrue(dbResult.next(), "the version 2 row must survive the migration");
+            for (String column : new String[]{"PROVIDER_ID", "CONFIGURATION_TYPE", "PORT_SNAPSHOT"}) {
+                Assertions.assertNull(
+                    dbResult.getString(column),
+                    column + " must stay empty: a migration may not decide which database a grant"
+                        + " that predates the check was for");
+            }
         }
     }
 

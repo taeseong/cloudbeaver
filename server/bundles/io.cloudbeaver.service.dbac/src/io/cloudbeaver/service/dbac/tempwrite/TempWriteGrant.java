@@ -42,9 +42,7 @@ public record TempWriteGrant(
     @Nullable MetadataDbTime revokedAt,
     @Nullable String revokedBy,
     @Nullable String revokeReason,
-    @NotNull String driverId,
-    @Nullable String hostSnapshot,
-    @Nullable String databaseSnapshot
+    @Nullable EndpointSnapshot endpoint
 ) {
 
     /** Lowest revision a stored row may carry. */
@@ -65,9 +63,19 @@ public record TempWriteGrant(
         if (grantedBy.isBlank()) {
             throw new IllegalArgumentException("A TEMP_WRITE grant requires the granting actor");
         }
-        if (driverId.isBlank()) {
-            throw new IllegalArgumentException("A TEMP_WRITE grant requires a driver id");
-        }
+    }
+
+    /**
+     * Whether this row records which physical database it was granted for
+     * <p>
+     * False for a row written under schema version 2, which had no provider, configuration type or
+     * port column. Version 3 added them as nullable and the migration deliberately leaves them
+     * empty, so such a row cannot be matched against any connection and must be denied until the
+     * grant is issued again. A write gate that treated an absent endpoint as "matches anything"
+     * would reinstate exactly the succession the endpoint columns exist to catch.
+     */
+    public boolean hasEndpoint() {
+        return endpoint != null;
     }
 
     /**
@@ -104,7 +112,6 @@ public record TempWriteGrant(
         }
         return new TempWriteGrant(
             key, grantId, newRevision, grantedBy, grantedAt, expiresAt, reason,
-            revokedAtValue, revokedByValue, revokeReasonValue,
-            driverId, hostSnapshot, databaseSnapshot);
+            revokedAtValue, revokedByValue, revokeReasonValue, endpoint);
     }
 }

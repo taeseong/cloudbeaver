@@ -39,9 +39,9 @@ public record TempWriteRevokeRequest(
         if (revokedBy.isBlank()) {
             throw new IllegalArgumentException("A TEMP_WRITE revoke request requires the revoking actor");
         }
-        if (revokeReason.isBlank()) {
-            throw new IllegalArgumentException("A TEMP_WRITE revoke request requires a reason");
-        }
+        // Same rule as a grant's reason, from the same place - a revoke is stored in the same
+        // VARCHAR(1000) column and deserves the same rejection rather than a truncation.
+        revokeReason = TempWriteRequestLimits.checkReason(revokeReason);
         if (observedRevisionAtRequestStart < TempWriteGrant.NO_ROW_REVISION) {
             throw new IllegalArgumentException(
                 "An observed revision cannot be negative, got " + observedRevisionAtRequestStart);

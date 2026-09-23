@@ -39,28 +39,35 @@ public record TempWriteGrantRequest(
     @NotNull String grantedBy,
     @NotNull Duration duration,
     @NotNull String reason,
-    @NotNull String driverId,
-    @Nullable String hostSnapshot,
-    @Nullable String databaseSnapshot,
+    @NotNull EndpointSnapshot endpoint,
     long observedRevisionAtRequestStart
 ) {
 
     public TempWriteGrantRequest {
+        // Checked, not merely annotated: nothing enforces org.jkiss.code.NotNull at runtime here, and
+        // a request with no endpoint would be stored as a grant that can never match a connection.
+        if (key == null) {
+            throw new IllegalArgumentException("A TEMP_WRITE grant request requires a permission key");
+        }
+        if (endpoint == null) {
+            throw new IllegalArgumentException(
+                "A TEMP_WRITE grant request requires the endpoint it is issued for");
+        }
+        if (grantId == null || grantedBy == null) {
+            throw new IllegalArgumentException(
+                "A TEMP_WRITE grant request requires a grant id and a granting actor");
+        }
         if (grantId.isBlank()) {
             throw new IllegalArgumentException("A TEMP_WRITE grant request requires a grant id");
         }
         if (grantedBy.isBlank()) {
             throw new IllegalArgumentException("A TEMP_WRITE grant request requires the granting actor");
         }
-        if (driverId.isBlank()) {
-            throw new IllegalArgumentException("A TEMP_WRITE grant request requires a driver id");
-        }
-        if (reason.isBlank()) {
-            throw new IllegalArgumentException("A TEMP_WRITE grant request requires a reason");
-        }
-        if (duration.isZero() || duration.isNegative()) {
-            throw new IllegalArgumentException("A TEMP_WRITE grant requires a positive duration, got " + duration);
-        }
+        // Delegated so the admin API of a later slice validates identically rather than growing its
+        // own copy of these rules. The reason is normalised here, at the edge, so what is stored is
+        // what was checked.
+        reason = TempWriteRequestLimits.checkReason(reason);
+        TempWriteRequestLimits.checkDuration(duration, null);
         if (observedRevisionAtRequestStart < TempWriteGrant.NO_ROW_REVISION) {
             throw new IllegalArgumentException(
                 "An observed revision cannot be negative, got " + observedRevisionAtRequestStart);

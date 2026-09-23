@@ -156,8 +156,11 @@ public final class DbacSchemaStructure {
                 timestamp("REVOKED_AT", true),
                 varchar("REVOKED_BY", 128, true),
                 varchar("REVOKE_REASON", 1000, true),
+                varchar("PROVIDER_ID", 128, true),
                 varchar("DRIVER_ID", 128, false),
+                varchar("CONFIGURATION_TYPE", 32, true),
                 varchar("HOST_SNAPSHOT", 255, true),
+                varchar("PORT_SNAPSHOT", 16, true),
                 varchar("DATABASE_SNAPSHOT", 255, true)
             ),
             List.of("USER_ID", "PROJECT_ID", "CONNECTION_ID")

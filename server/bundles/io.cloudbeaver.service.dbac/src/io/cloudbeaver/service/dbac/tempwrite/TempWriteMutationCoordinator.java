@@ -315,9 +315,7 @@ public class TempWriteMutationCoordinator {
             null,
             null,
             null,
-            request.driverId(),
-            request.hostSnapshot(),
-            request.databaseSnapshot());
+            request.endpoint());
     }
 
     /**

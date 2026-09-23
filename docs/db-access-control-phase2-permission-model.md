@@ -86,7 +86,12 @@ metadata DB에 connection/project 테이블이 **없어**(STATIC VERIFIED: `cb_s
 | 12 | connection 스냅샷 불일치 | **DENY** (`GRANT_STALE`) | id 재등장 방어(§5.1) |
 | 13 | node의 clock skew가 허용치 초과 | **DENY** (`CLOCK_SKEW_EXCEEDED`) | §8.1 |
 
-판정 SQL의 논리 형태(구현 코드 아님). 비교를 **DB clock**으로 수행하는 것이 핵심이다(§8.1):
+판정 SQL의 논리 형태(구현 코드 아님). 비교를 **DB clock**으로 수행하는 것이 핵심이다(§8.1).
+
+> **컬럼 목록은 SUPERSEDED.** 아래 스케치는 스냅샷 3개 시절의 것이다. schema version 3의 실제 select는
+> `PROVIDER_ID`·`CONFIGURATION_TYPE`·`PORT_SNAPSHOT`을 포함한 6개를 읽는다. 또한 이 스케치는 문자 그대로
+> 구현되지 않았다 — `WHERE`로 만료·회수를 걸러내면 `NO_GRANT`와 `GRANT_EXPIRED`·`GRANT_REVOKED`를 구분할
+> 수 없기 때문이다. 실제 구현은 `PolicySnapshotRepository`이며 그 javadoc이 같은 내용을 적고 있다.
 
 ```
 SELECT GRANT_ID, EXPIRES_AT, REVISION, DRIVER_ID, HOST_SNAPSHOT, DATABASE_SNAPSHOT
@@ -111,14 +116,23 @@ SELECT GRANT_ID, EXPIRES_AT, REVISION, DRIVER_ID, HOST_SNAPSHOT, DATABASE_SNAPSH
 | `GRANTED_AT` / `EXPIRES_AT` | `TIMESTAMP` | NOT NULL | **DB clock 기준**(§8.1). `EXPIRES_AT`이 판정 기준 |
 | `REASON` | `VARCHAR(1000)` | NOT NULL | 필수. 공백만 거부 |
 | `REVOKED_AT` / `REVOKED_BY` / `REVOKE_REASON` | `TIMESTAMP` / `VARCHAR(128)` / `VARCHAR(1000)` | NULL | 만료 자동표시는 `'SYSTEM'` / `'EXPIRED'` |
-| `DRIVER_ID`(NOT NULL,128) / `HOST_SNAPSHOT` / `DATABASE_SNAPSHOT` | `VARCHAR(255)` | NULL | 부여 시점 스냅샷 3개 |
+| ~~`DRIVER_ID`(NOT NULL,128) / `HOST_SNAPSHOT` / `DATABASE_SNAPSHOT`~~ | `VARCHAR(255)` | NULL | ~~부여 시점 스냅샷 3개~~ → **SUPERSEDED.** 3개로는 물리 endpoint를 식별할 수 없다(port·URL mode 변경으로 우회 가능). schema version 3에서 **6개**(`PROVIDER_ID` / `DRIVER_ID` / `CONFIGURATION_TYPE` / `HOST_SNAPSHOT` / `PORT_SNAPSHOT` / `DATABASE_SNAPSHOT`)로 확장됐다. `docs/db-access-control-endpoint-identity.md` 참조 |
 
 `PRIMARY KEY (USER_ID, PROJECT_ID, CONNECTION_ID)`. 추가 index `(PROJECT_ID, CONNECTION_ID)`(connection별 조회).
 FK 없음(§5.5).
 
-**스냅샷 3개의 목적(DECIDED).** connection id는 파일 key이므로 백업 복원이나 수동 편집으로 **같은 id가 다른 물리 DB에
-재등장**할 수 있다. 판정 시 현재 container의 driver/host/database가 스냅샷과 다르면 `GRANT_STALE`로 DENY한다(§4-12).
+**스냅샷의 목적(DECIDED).** connection id는 파일 key이므로 백업 복원이나 수동 편집으로 **같은 id가 다른 물리 DB에
+재등장**할 수 있다. 판정 시 현재 container의 endpoint가 스냅샷과 다르면 `GRANT_STALE`로 DENY한다(§4-12).
+
 비밀번호·사용자명은 저장하지 않는다.
+
+> **SUPERSEDED — 이 절의 "스냅샷 3개"는 폐기되었다.** driver/host/database 3개만으로는 **port만 바꾼 승계**를
+> 막지 못하고(같은 host의 다른 서버 인스턴스), custom JDBC URL·SSH tunnel 전환도 통과한다. Phase 3 Slice 3
+> 독립 검토에서 High로 확인되어 schema version 3에서 `PROVIDER_ID`·`CONFIGURATION_TYPE`·`PORT_SNAPSHOT`을
+> 추가하고 6개 정확 일치로 대체했다. 비교 대상도 저장된 설정(`declared`)과 실제 접속 설정(`inUse`)
+> **양쪽**으로 늘어났다 — 한쪽만 보면 실행 중 연결이 다른 endpoint를 향한 상태를 볼 수 없다.
+> fingerprint 불가 구성은 `ENDPOINT_UNSUPPORTED`로 거부한다.
+> 확정 규칙과 근거는 [db-access-control-endpoint-identity.md](db-access-control-endpoint-identity.md).
 
 ### 5.2 `{table_prefix}DBAC_TW_HISTORY` — append-only 이력
 
