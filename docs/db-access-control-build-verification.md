@@ -32,7 +32,7 @@ server/product/aggregate/pom.xml
 > **`datadam-api`는 build-time dependency이며 runtime product bundle이 아닙니다.** reactor에 들어가는
 > 이유는 최신 `org.jkiss.dbeaver.model.datadam`의 MANIFEST가 `com.dbeaver.datadam.share.api`를
 > `Require-Bundle`로 요구해 **target platform 해석 단계에서 필요하기 때문**입니다. 산출물 확인 결과
-> `server/product/web-server/target/products/io.cloudbeaver.product/all/all/all/plugins/`의 204개 jar 중
+> `server/product/web-server/target/products/io.cloudbeaver.product/all/all/all/plugins/`의 144개 jar 중
 > `*datadam*`은 0건이고 `artifacts.xml`·`config.ini`에도 등장하지 않습니다. `server/features/*/feature.xml`
 > 어디에도 datadam 참조가 없습니다. **제품에 포함된다고 적지 마십시오.**
 
@@ -222,8 +222,9 @@ run `35705285132`). 그 대가를 치르지
 | `DBAC PostgreSQL / Build` | 10분 | **3분 42초** (`Run build script` 3:17, 자기검증 step 1초) | 넉넉함 |
 | `Check / Build Java` | 5분 | **1분 36초** (`Compile` 1:16) | 넉넉함 |
 
-postgres image pull, health 대기, 세 형제 저장소 clone, Tycho p2 해석, 143 모듈 빌드, 326 테스트,
-드라이버 다운로드가 모두 그 안에 들어갔습니다. **따라서 timeout 값을 조정할 근거는 현재 없습니다 —
+postgres image pull, health 대기, 세 형제 저장소 clone, Tycho p2 해석, 전체 aggregate 빌드,
+DBAC required-mode 자기검증, 드라이버 다운로드가 모두 그 안에 들어갔습니다. **따라서 timeout 값을
+조정할 근거는 현재 없습니다 —
 추정만으로 올리지 마십시오.** 다만 이 실측도 snapshot이며, 형제 저장소가 커지면 다시 봐야 합니다.
 
 ### 해소된 위험 — upstream이 property 전달 경로를 없애는 경우
@@ -270,7 +271,7 @@ step이 실패하므로,
 다음에 missing bundle 오류를 보면 **이 순서로** 확인하십시오.
 
 1. 진입점이 `server/product/aggregate`인가? 아니면 그것이 원인입니다.
-2. 형제 저장소 `../../dbeaver`, `../../dbeaver-common`이 체크아웃되어 있는가?
+2. 형제 저장소 `../../dbeaver`, `../../dbeaver-common`, `../../datadam-api`가 체크아웃되어 있는가?
 3. 없어진 번들이 `org.jkiss.dbeaver.*` 또는 `com.dbeaver.*`인가?
    그렇다면 소스에서 빌드되어야 하는 것이며 p2 문제가 아닙니다.
 4. `org.jkiss.bundle.*`(서드파티 wrapper)인가? 그때만 p2를 의심하십시오.
