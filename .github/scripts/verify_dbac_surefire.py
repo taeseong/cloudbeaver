@@ -44,13 +44,18 @@ DEFAULT_REPORT = (
 REQUIRED_PROPERTY = "dbac.test.postgres.required"
 REQUIRED_VALUE = "true"
 
-# Every class that must reach a real PostgreSQL. Both abort through Assumptions when the database is
-# unusable and the required property is absent, so both have to be counted - checking only one would
-# leave the other free to skip while the summary still printed a PostgreSQL number.
+# Every class that must reach a real PostgreSQL. Each one aborts through Assumptions when the database
+# is unusable and the required property is absent, so every one has to be counted - checking only some
+# would leave the rest free to skip while the summary still printed a PostgreSQL number.
+#
+# The Slice 4a contract and regression-guard classes are here because they run scenarios against a real
+# PostgreSQL target; a skip there would silently drop platform guarantees that enforcement relies on.
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest",
+    "io.cloudbeaver.test.platform.dbac.DbacPlatformContractTest",
+    "io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -72,6 +77,8 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest": 47,
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest": 67,
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest": 13,
+    "io.cloudbeaver.test.platform.dbac.DbacPlatformContractTest": 17,
+    "io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest": 6,
 }
 
 for _postgres_class in POSTGRES_CLASSES:
