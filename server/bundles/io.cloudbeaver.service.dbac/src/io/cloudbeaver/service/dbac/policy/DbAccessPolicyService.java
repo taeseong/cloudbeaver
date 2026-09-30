@@ -19,13 +19,17 @@ package io.cloudbeaver.service.dbac.policy;
 import io.cloudbeaver.service.dbac.tempwrite.EndpointSnapshot;
 import io.cloudbeaver.service.dbac.tempwrite.MetadataConnectionSource;
 import org.jkiss.code.NotNull;
+import org.jkiss.code.Nullable;
 import org.jkiss.dbeaver.Log;
 import org.jkiss.dbeaver.model.DBPDataSourceContainer;
 
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.OffsetDateTime;
+import java.util.UUID;
 
 /**
  * Decides whether one write may proceed
@@ -51,6 +55,13 @@ import java.time.OffsetDateTime;
 public final class DbAccessPolicyService {
 
     private static final Log log = Log.getLog(DbAccessPolicyService.class);
+
+    /** Logged when the permission store could not be read; fixed, so it can be searched for */
+    private static final String EVENT_STORE_READ_FAILED = "DBAC_PERMISSION_STORE_READ_FAILED";
+    /** Logged when anything else failed while authorizing */
+    private static final String EVENT_AUTHORIZATION_FAILED = "DBAC_AUTHORIZATION_FAILED";
+    /** Stands in for the key when the failure came before identity was resolved */
+    private static final String KEY_UNRESOLVED = "<unresolved>";
 
     private final MetadataConnectionSource connectionSource;
     private final DbAccessPolicyConfig config;
@@ -175,7 +186,7 @@ public final class DbAccessPolicyService {
             } catch (Exception e) {
                 // Every failure to read is the same answer. An outage must never be mistaken for
                 // "this user has no grant", so it is not allowed to fall through to step 7.
-                log.error("DBAC could not read the permission store for " + key.describe(), e);
+                logFailure(EVENT_STORE_READ_FAILED, "DBAC could not read the permission store", key, e);
                 return AuthorizationDecision.deny(
                     DenialReason.PERMISSION_STORE_UNAVAILABLE, key, category, null, null);
             }
@@ -226,7 +237,7 @@ public final class DbAccessPolicyService {
             // denial keeps the key when one was already established, so the event is auditable
             // against a subject. A failure inside a driver accessor or a clock, after identity was
             // resolved, is exactly the event worth attributing.
-            log.error("DBAC authorization failed unexpectedly", e);
+            logFailure(EVENT_AUTHORIZATION_FAILED, "DBAC authorization failed unexpectedly", resolvedKey, e);
             return resolvedKey == null
                 ? AuthorizationDecision.denyBeforeKey(DenialReason.PERMISSION_STORE_UNAVAILABLE, category)
                 : AuthorizationDecision.deny(
@@ -246,6 +257,49 @@ public final class DbAccessPolicyService {
     private boolean skewExceeded(@NotNull OffsetDateTime dbNow) {
         Duration skew = Duration.between(dbNow.toInstant(), localClock.instant()).abs();
         return skew.compareTo(config.clockSkewThreshold()) > 0;
+    }
+
+    /**
+     * Records a failure without anything the failure itself carries
+     * <p>
+     * The exception's message and stack trace are exactly what must not be written: a metadata pool
+     * or driver message routinely names a JDBC URL, a host, a user or a property value. What is
+     * written instead is a fixed event code, a correlation id that is new for this one event, the
+     * exception's class name, and the key when one was already established - never anything read
+     * from the failing objects to build one.
+     * <p>
+     * The key's three ids come from the caller and from connection configuration, and nothing
+     * forbids a line break, a {@code ]} or an {@code EVENT_ID=} inside one. Each id is therefore
+     * URL-encoded on its own before the three are joined with {@code /}, so the entry stays one line
+     * and its fields cannot be forged. Letters, digits and hyphens are left as they are, so an
+     * ordinary key reads exactly as {@link DbAccessKey#describe()} would.
+     * <p>
+     * This never throws. The caller is about to return a denial, and neither the encoding nor the
+     * logger may turn that into an exception the caller's own caller did not expect.
+     */
+    private static void logFailure(
+        @NotNull String eventCode,
+        @NotNull String summary,
+        @Nullable DbAccessKey key,
+        @NotNull Throwable failure
+    ) {
+        try {
+            String keyText = key == null
+                ? KEY_UNRESOLVED
+                : logSafe(key.userId()) + "/" + logSafe(key.projectId()) + "/" + logSafe(key.connectionId());
+            log.error(summary + " [event=" + eventCode
+                + " EVENT_ID=" + UUID.randomUUID()
+                + " exception=" + failure.getClass().getName()
+                + " key=" + keyText + "]");
+        } catch (RuntimeException | Error ignored) {
+            // Deliberately nothing: the decision must not depend on whether it could be logged.
+        }
+    }
+
+    /** One key id in a form that cannot break the log line or its field syntax */
+    @NotNull
+    private static String logSafe(@NotNull String id) {
+        return URLEncoder.encode(id, StandardCharsets.UTF_8);
     }
 
     /**

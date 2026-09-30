@@ -35,6 +35,7 @@ import io.cloudbeaver.test.platform.dbac.DbacSchemaTest;
 import io.cloudbeaver.test.platform.dbac.DbacScriptStatementsTest;
 import io.cloudbeaver.test.platform.dbac.DbacScriptTranslationTest;
 import io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest;
+import io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteModelTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest;
@@ -76,7 +77,8 @@ import org.junit.platform.suite.api.Suite;
         DbAccessPolicyPostgresTest.class,
         TempWriteRepositoryPostgresTest.class,
         DbacPlatformContractTest.class,
-        EnforcementRegressionGuardTest.class
+        EnforcementRegressionGuardTest.class,
+        ExceptionRedactionTest.class
     }
 )
 public class CEServerTestSuite {

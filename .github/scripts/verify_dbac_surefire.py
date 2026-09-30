@@ -79,6 +79,7 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest": 13,
     "io.cloudbeaver.test.platform.dbac.DbacPlatformContractTest": 17,
     "io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest": 6,
+    "io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest": 2,
 }
 
 for _postgres_class in POSTGRES_CLASSES:
