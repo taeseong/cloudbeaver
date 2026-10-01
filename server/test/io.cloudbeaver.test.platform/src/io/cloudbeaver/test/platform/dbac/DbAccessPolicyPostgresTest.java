@@ -17,6 +17,7 @@
 package io.cloudbeaver.test.platform.dbac;
 
 import io.cloudbeaver.service.dbac.policy.AuthorizationDecision;
+import io.cloudbeaver.service.dbac.policy.DbAccessDecision;
 import io.cloudbeaver.service.dbac.policy.DbAccessPolicyConfig;
 import io.cloudbeaver.service.dbac.policy.DbAccessPolicyService;
 import io.cloudbeaver.service.dbac.policy.DbOperationCategory;
@@ -40,11 +41,14 @@ import java.sql.Driver;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Properties;
+import java.util.function.LongSupplier;
 
 /**
  * The same decision, on the engine that runs in production
@@ -104,6 +108,27 @@ public class DbAccessPolicyPostgresTest {
     private static String atNowSchema;
     private static String afterNowSchema;
 
+    /**
+     * A schema whose {@code DBAC_TW_CURRENT} leaves exactly {@link #MARGIN_AFTER_REMAINING}, for the
+     * expiry window cases - see {@link #ex1CheckOneIsStrictAtTheAuditMarginOnPostgres}
+     */
+    private static String marginSchema;
+
+    /** check-1's margin, {@code T_audit + δ}, as the default configuration sets it */
+    private static final Duration AUDIT_MARGIN =
+        DbAccessPolicyConfig.defaults().auditTimeout().plus(DbAccessPolicyConfig.defaults().expiryGuardMargin());
+
+    /** check-2's margin, {@code δ} */
+    private static final Duration EXECUTE_MARGIN = DbAccessPolicyConfig.defaults().expiryGuardMargin();
+
+    /** What {@link #marginSchema} leaves: one millisecond more than check-1's margin */
+    private static final Duration MARGIN_AFTER_REMAINING = AUDIT_MARGIN.plusMillis(1);
+
+    private static final long ONE_MS = 1_000_000L;
+
+    /** Where the hand-moved monotonic clock starts */
+    private static final long BASE = 7_000_000_000_000L;
+
     private final List<String> touchedUsers = new ArrayList<>();
 
     @BeforeAll
@@ -147,7 +172,17 @@ public class DbAccessPolicyPostgresTest {
             createBoundaryViews(connection, atNowSchema, "CURRENT_TIMESTAMP");
             createBoundaryViews(
                 connection, afterNowSchema, "CURRENT_TIMESTAMP + INTERVAL '1 microsecond'");
+            marginSchema = schema + "_margin";
+            createBoundaryViews(connection, marginSchema, marginExpression());
         }
+    }
+
+    /**
+     * The expiry {@link #marginSchema} reports, as SQL evaluated against the reading statement's clock
+     */
+    @NotNull
+    private static String marginExpression() {
+        return "CURRENT_TIMESTAMP + INTERVAL '" + MARGIN_AFTER_REMAINING.toMillis() + " milliseconds'";
     }
 
     /**
@@ -187,7 +222,7 @@ public class DbAccessPolicyPostgresTest {
             return;
         }
         try (Connection connection = open()) {
-            for (String target : new String[]{afterNowSchema, atNowSchema, schema}) {
+            for (String target : new String[]{marginSchema, afterNowSchema, atNowSchema, schema}) {
                 if (target != null) {
                     exec(connection, "DROP SCHEMA IF EXISTS " + target + " CASCADE");
                 }
@@ -282,6 +317,89 @@ public class DbAccessPolicyPostgresTest {
         Assertions.assertTrue(
             service("UTC", afterNowSchema).authorize(request(user, container())).isAllowed(),
             "a grant expiring one microsecond from now has not expired");
+    }
+
+    /**
+     * EX-1 on PostgreSQL: check-1 is strict at {@code T_audit + δ}, from the database's own lifetime
+     * <p>
+     * The H2 case, on the engine that runs in production: the view leaves exactly
+     * {@code T_audit + δ + 1ms}, so one millisecond minus a nanosecond of elapsed time is kept and
+     * exactly one millisecond is refused. The session runs in a zone nine hours from UTC and this
+     * node's clock is four seconds ahead of the database's - neither may change the remaining
+     * lifetime, which must be exactly what the view put there. The monotonic clock is read once when
+     * the window opens and never by authorize.
+     */
+    @Test
+    public void ex1CheckOneIsStrictAtTheAuditMarginOnPostgres() throws Exception {
+        skipIfUnavailable();
+        String user = activeUser("pg-ex1");
+        putGrant(user, Duration.ofMinutes(30), false);
+        assertBoundaryFixture(marginSchema, user, "g.EXPIRES_AT = " + marginExpression(),
+            "FIXTURE EX-1: the margin view must leave exactly T_audit + delta + 1ms");
+        Clock ahead;
+        try (Connection connection = open()) {
+            ahead = PolicyTestSupport.clockOffsetFrom(readNow(connection).toInstant(), Duration.ofSeconds(4));
+        }
+
+        List<String> violations = new ArrayList<>();
+        for (long elapsed : new long[]{0, ONE_MS - 1, ONE_MS, 2 * ONE_MS}) {
+            String what = "check-1 at " + elapsed + "ns";
+            ManualNanoClock clock = new ManualNanoClock(BASE);
+            DbAccessPolicyService service = marginService("Asia/Seoul", ahead, clock);
+            final DbAccessPolicyService.ExpiryWindow window = service.openExpiryWindow();
+            int readsAtOpen = clock.reads();
+            AuthorizationDecision allow = window.authorize(request(user, container()));
+            if (readsAtOpen != 1 || clock.reads() != 1) {
+                violations.add(what + ": the monotonic clock must be read once when the window opens and never"
+                    + " by authorize, read " + readsAtOpen + " and " + (clock.reads() - readsAtOpen));
+            }
+            if (!allow.isAllowed()) {
+                violations.add(what + ": authorize must allow a grant with " + MARGIN_AFTER_REMAINING
+                    + " left while this node's clock is four seconds ahead, got " + allow.denialReason());
+                continue;
+            }
+            if (!MARGIN_AFTER_REMAINING.equals(allow.remainingLifetime())) {
+                violations.add(what + ": the remaining lifetime must be exactly EXPIRES_AT - DB_NOW = "
+                    + MARGIN_AFTER_REMAINING + ", got " + allow.remainingLifetime());
+            }
+            clock.set(BASE + elapsed);
+            expectWindow(violations, what, allow, window.requireMarginBeforeAudit(), elapsed < ONE_MS);
+        }
+        Assertions.assertTrue(violations.isEmpty(), "EX-1 (PostgreSQL): " + String.join("; ", violations));
+    }
+
+    /**
+     * EX-2 on PostgreSQL: check-2 is strict at {@code δ}, counted from before authorize
+     * <p>
+     * check-1 passes with nothing elapsed; then {@code remaining - δ} minus a nanosecond is kept,
+     * exactly {@code remaining - δ} is refused, and a millisecond more is refused.
+     */
+    @Test
+    public void ex2CheckTwoIsStrictAtTheExecuteMarginOnPostgres() throws Exception {
+        skipIfUnavailable();
+        String user = activeUser("pg-ex2");
+        putGrant(user, Duration.ofMinutes(30), false);
+        assertBoundaryFixture(marginSchema, user, "g.EXPIRES_AT = " + marginExpression(),
+            "FIXTURE EX-2: the margin view must leave exactly T_audit + delta + 1ms");
+        long boundary = MARGIN_AFTER_REMAINING.minus(EXECUTE_MARGIN).toNanos();
+
+        List<String> violations = new ArrayList<>();
+        for (long elapsed : new long[]{boundary - 1, boundary, boundary + ONE_MS}) {
+            String what = "check-2 at " + elapsed + "ns";
+            ManualNanoClock clock = new ManualNanoClock(BASE);
+            DbAccessPolicyService service = marginService("UTC", PolicyTestSupport.systemClock(), clock);
+            DbAccessPolicyService.ExpiryWindow window = service.openExpiryWindow();
+            AuthorizationDecision allow = window.authorize(request(user, container()));
+            if (!allow.isAllowed()) {
+                violations.add(what + ": authorize must allow, got " + allow.denialReason());
+                continue;
+            }
+            AuthorizationDecision afterAudit = window.requireMarginBeforeAudit();
+            expectWindow(violations, what + ", check-1 with nothing elapsed", allow, afterAudit, true);
+            clock.set(BASE + elapsed);
+            expectWindow(violations, what, allow, window.requireMarginBeforeExecute(), elapsed < boundary);
+        }
+        Assertions.assertTrue(violations.isEmpty(), "EX-2 (PostgreSQL): " + String.join("; ", violations));
     }
 
     /**
@@ -603,6 +721,96 @@ public class DbAccessPolicyPostgresTest {
         };
         return new DbAccessPolicyService(
             source, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+    }
+
+    /**
+     * A service over {@link #marginSchema}, in the given session zone, with the given clocks
+     */
+    @NotNull
+    private DbAccessPolicyService marginService(
+        @NotNull String zone,
+        @NotNull Clock localClock,
+        @NotNull LongSupplier monotonic
+    ) {
+        MetadataConnectionSource source = () -> {
+            Connection raw = open();
+            try (java.sql.Statement dbStat = raw.createStatement()) {
+                dbStat.execute("SET TIME ZONE '" + zone + "'");
+            }
+            return PrefixingConnection.wrap(raw, marginSchema + ".");
+        };
+        return new DbAccessPolicyService(source, DbAccessPolicyConfig.defaults(), localClock, monotonic);
+    }
+
+    /**
+     * Checks one window result, collecting rather than failing
+     * <p>
+     * A kept allow must be the very object handed in. A refusal must be the expiry denial for that
+     * allow: the same key, category, grant and expiry, {@code GRANT_EXPIRED}, no remaining lifetime,
+     * and a payload recording exactly that.
+     */
+    private static void expectWindow(
+        @NotNull List<String> violations,
+        @NotNull String what,
+        @NotNull AuthorizationDecision allow,
+        @Nullable AuthorizationDecision result,
+        boolean kept
+    ) {
+        if (kept) {
+            if (result != allow) {
+                violations.add(what + ": expected the same allow back, got " + outcome(result));
+            }
+            return;
+        }
+        if (result == null || result.isAllowed() || result.denialReason() != DenialReason.GRANT_EXPIRED) {
+            violations.add(what + ": expected GRANT_EXPIRED, got " + outcome(result));
+            return;
+        }
+        if (!Objects.equals(allow.key(), result.key())
+            || allow.operationCategory() != result.operationCategory()
+            || !Objects.equals(allow.appliedGrantId(), result.appliedGrantId())
+            || !Objects.equals(allow.expiresAt(), result.expiresAt())
+            || result.remainingLifetime() != null
+            || result.auditPayload() == null
+            || result.auditPayload().decision() != DbAccessDecision.DENY
+            || result.auditPayload().denialReason() != DenialReason.GRANT_EXPIRED
+        ) {
+            violations.add(what + ": the expiry denial must describe the allow it replaced, got " + result);
+        }
+    }
+
+    @NotNull
+    private static String outcome(@Nullable AuthorizationDecision decision) {
+        if (decision == null) {
+            return "null";
+        }
+        return decision.isAllowed() ? "an allow" : "a denial for " + decision.denialReason();
+    }
+
+    /**
+     * The monotonic clock, moved by hand, counting how often the code under test reads it
+     */
+    private static final class ManualNanoClock implements LongSupplier {
+        private long now;
+        private int reads;
+
+        ManualNanoClock(long start) {
+            this.now = start;
+        }
+
+        @Override
+        public long getAsLong() {
+            reads++;
+            return now;
+        }
+
+        void set(long value) {
+            now = value;
+        }
+
+        int reads() {
+            return reads;
+        }
     }
 
     @NotNull

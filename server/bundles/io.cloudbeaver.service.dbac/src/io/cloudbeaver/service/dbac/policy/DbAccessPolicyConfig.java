@@ -23,7 +23,22 @@ import org.jkiss.dbeaver.Log;
 import java.time.Duration;
 
 /**
- * The two numbers the policy core is allowed to be configured with
+ * The numbers the policy core is allowed to be configured with
+ * <p>
+ * Two limits, and three timings for the expiry window:
+ * <ul>
+ *   <li>{@code clockSkewThreshold} - how far this node's clock may drift from the database's</li>
+ *   <li>{@code maxGrantDuration} - the longest a single TEMP_WRITE grant may run</li>
+ *   <li>{@code expiryGuardMargin} ({@code δ}) - how much of a grant must still be left when a write
+ *       is let through, after everything before it has been counted</li>
+ *   <li>{@code auditTimeout} ({@code T_audit}) - how long the pre-execution audit insert may take.
+ *       check-1 reserves it: {@code T_audit + δ} must be left before the audit starts</li>
+ *   <li>{@code keyLockTimeout} ({@code T_k}) - how long an enforcement point waits for a grant or
+ *       user lock before refusing. Nothing waits on one yet; the key locks come in a later slice</li>
+ * </ul>
+ * {@code T_audit + δ} is the tail of every grant in which no write can start. A grant no longer
+ * than that can be issued but never used, and nothing here prevents issuing one: the API that
+ * issues grants has to decide how to refuse such a duration before it is wired.
  * <p>
  * Deliberately a plain immutable record built by whoever constructs the service, rather than a
  * reader that reaches into CloudBeaver's server configuration. Phase 2 section 12.4 limits how much
@@ -34,14 +49,19 @@ import java.time.Duration;
  * <p>
  * <b>A bad setting never disables a check.</b> That holds on both routes in, by different means.
  * {@link #sanitized} is the route for external configuration: zero, negative, absurd and missing all
- * become the documented default there, so a typo in a config file cannot turn a guard off. The
+ * become the documented default there, so a typo in a config file cannot turn a guard off. The three
+ * timings have no external binding yet, so the sanitizer takes no parameter for them and gives them
+ * their defaults. The
  * canonical constructor is the route for code, and it <b>throws</b> on the same values rather than
  * substituting anything, so a caller that builds a configuration by hand cannot hand the service a
  * limit the sanitizer would have rejected. Neither route can produce "no limit".
  */
 public record DbAccessPolicyConfig(
     @NotNull Duration clockSkewThreshold,
-    @NotNull Duration maxGrantDuration
+    @NotNull Duration maxGrantDuration,
+    @NotNull Duration expiryGuardMargin,
+    @NotNull Duration auditTimeout,
+    @NotNull Duration keyLockTimeout
 ) {
     private static final Log log = Log.getLog(DbAccessPolicyConfig.class);
 
@@ -59,6 +79,29 @@ public record DbAccessPolicyConfig(
     public static final Duration DEFAULT_MAX_GRANT_DURATION = Duration.ofMinutes(240);
 
     /**
+     * {@code δ}: one second of the grant must be left when a write is let through
+     */
+    public static final Duration DEFAULT_EXPIRY_GUARD_MARGIN = Duration.ofSeconds(1);
+
+    /**
+     * {@code T_audit}: two seconds for the pre-execution audit insert
+     * <p>
+     * Enough for one insert into a remote PostgreSQL metadata database, and short enough that the
+     * locks held around it are not held for long. A whole number of seconds, because it becomes a
+     * JDBC query timeout.
+     */
+    public static final Duration DEFAULT_AUDIT_TIMEOUT = Duration.ofSeconds(2);
+
+    /**
+     * {@code T_k}: five seconds' wait for a grant or user lock
+     * <p>
+     * Every choice refuses the same writes - a timed-out wait is refused, and so is a write that
+     * waited for a revoke to finish - so this only decides how often the refusal says "could not
+     * check" rather than the real reason, against how long a connection may sit waiting.
+     */
+    public static final Duration DEFAULT_KEY_LOCK_TIMEOUT = Duration.ofSeconds(5);
+
+    /**
      * An upper bound on the skew threshold itself
      * <p>
      * Without this, a setting of one day would make the skew guard meaningless while still looking
@@ -70,6 +113,16 @@ public record DbAccessPolicyConfig(
      * An upper bound on the grant duration limit itself, for the same reason
      */
     private static final Duration MAX_SENSIBLE_GRANT_DURATION = Duration.ofHours(24);
+
+    /**
+     * Upper bounds on the three timings
+     * <p>
+     * A margin of minutes refuses nearly every grant while looking like a safety allowance, and a
+     * timeout of minutes is a lock held for minutes; past these, the setting is taken as a mistake.
+     */
+    private static final Duration MAX_SENSIBLE_EXPIRY_GUARD_MARGIN = Duration.ofSeconds(30);
+    private static final Duration MAX_SENSIBLE_AUDIT_TIMEOUT = Duration.ofSeconds(30);
+    private static final Duration MAX_SENSIBLE_KEY_LOCK_TIMEOUT = Duration.ofSeconds(60);
 
     /**
      * Rejects every value the sanitizer would have replaced
@@ -84,10 +137,22 @@ public record DbAccessPolicyConfig(
      * The bounds are inclusive: a value exactly equal to a ceiling is accepted, one nanosecond
      * beyond it is not. {@link #sanitized} turns a rejected external value into the documented
      * default and logs it; nothing turns a rejected value into an absent limit.
+     * <p>
+     * The audit timeout must also be a whole number of seconds, which with the rule above means at
+     * least one. It becomes a JDBC query timeout, an int of seconds, so a fraction could only be
+     * rounded - and a rounded timeout is not the one check-1's margin was computed from.
      */
     public DbAccessPolicyConfig {
         requireInRange(clockSkewThreshold, MAX_SENSIBLE_SKEW, "clock skew threshold");
         requireInRange(maxGrantDuration, MAX_SENSIBLE_GRANT_DURATION, "maximum grant duration");
+        requireInRange(expiryGuardMargin, MAX_SENSIBLE_EXPIRY_GUARD_MARGIN, "expiry guard margin");
+        requireInRange(auditTimeout, MAX_SENSIBLE_AUDIT_TIMEOUT, "audit timeout");
+        if (auditTimeout.getNano() != 0) {
+            throw new IllegalArgumentException(
+                "The audit timeout must be a whole number of seconds, got " + auditTimeout
+                    + "; it becomes a JDBC query timeout, which counts in seconds");
+        }
+        requireInRange(keyLockTimeout, MAX_SENSIBLE_KEY_LOCK_TIMEOUT, "key lock timeout");
     }
 
     private static void requireInRange(
@@ -110,14 +175,17 @@ public record DbAccessPolicyConfig(
      */
     @NotNull
     public static DbAccessPolicyConfig defaults() {
-        return new DbAccessPolicyConfig(DEFAULT_CLOCK_SKEW_THRESHOLD, DEFAULT_MAX_GRANT_DURATION);
+        return new DbAccessPolicyConfig(
+            DEFAULT_CLOCK_SKEW_THRESHOLD, DEFAULT_MAX_GRANT_DURATION,
+            DEFAULT_EXPIRY_GUARD_MARGIN, DEFAULT_AUDIT_TIMEOUT, DEFAULT_KEY_LOCK_TIMEOUT);
     }
 
     /**
      * Builds a configuration from values that may be absent or wrong
      * <p>
      * Every rejected value is logged with what it was and what replaced it, because a silent
-     * substitution is how an operator ends up believing a limit is in force that is not.
+     * substitution is how an operator ends up believing a limit is in force that is not. The expiry
+     * margin, audit timeout and key lock timeout are always their defaults here.
      *
      * @param skewSeconds seconds, or null when unset
      * @param maxGrantMinutes minutes, or null when unset
@@ -133,7 +201,8 @@ public record DbAccessPolicyConfig(
         Duration grant = sanitize(
             maxGrantMinutes == null ? null : Duration.ofMinutes(maxGrantMinutes),
             DEFAULT_MAX_GRANT_DURATION, MAX_SENSIBLE_GRANT_DURATION, "maximum grant duration");
-        return new DbAccessPolicyConfig(skew, grant);
+        return new DbAccessPolicyConfig(
+            skew, grant, DEFAULT_EXPIRY_GUARD_MARGIN, DEFAULT_AUDIT_TIMEOUT, DEFAULT_KEY_LOCK_TIMEOUT);
     }
 
     @NotNull

@@ -18,6 +18,7 @@ package io.cloudbeaver.test.platform.dbac;
 
 import io.cloudbeaver.app.CEAppStarter;
 import io.cloudbeaver.service.dbac.policy.AuthorizationDecision;
+import io.cloudbeaver.service.dbac.policy.DbAccessDecision;
 import io.cloudbeaver.service.dbac.policy.DbAccessPolicyConfig;
 import io.cloudbeaver.service.dbac.policy.DbAccessPolicyService;
 import io.cloudbeaver.service.dbac.policy.DbOperationCategory;
@@ -44,6 +45,10 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
@@ -54,7 +59,11 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.LongSupplier;
 
 /**
  * The write-authorization decision, against the real metadata database
@@ -92,6 +101,39 @@ public class DbAccessPolicyTest {
     private static final String AT_NOW_SCHEMA = "DBAC_POLICY_AT_NOW";
     private static final String AFTER_NOW_SCHEMA = "DBAC_POLICY_AFTER_NOW";
 
+    /**
+     * Schemas whose {@code DBAC_TW_CURRENT} puts {@code EXPIRES_AT} a fixed distance after the reading
+     * statement's own clock, for the expiry window cases
+     * <p>
+     * {@link #MARGIN_AFTER_SCHEMA} leaves exactly {@code T_audit + δ + 1ms}, so check-1's boundary is
+     * one millisecond of elapsed time away; {@link #MARGIN_AT_SCHEMA} leaves exactly
+     * {@code T_audit + δ}, which check-1 refuses with nothing elapsed; {@link #FAR_FUTURE_SCHEMA}
+     * leaves a thousand years, more than a {@code long} of nanoseconds can hold.
+     */
+    private static final String MARGIN_AFTER_SCHEMA = "DBAC_POLICY_MARGIN_AFTER";
+    private static final String MARGIN_AT_SCHEMA = "DBAC_POLICY_MARGIN_AT";
+    private static final String FAR_FUTURE_SCHEMA = "DBAC_POLICY_FAR_FUTURE";
+
+    /** check-1's margin, {@code T_audit + δ}, as the default configuration sets it */
+    private static final Duration AUDIT_MARGIN =
+        DbAccessPolicyConfig.defaults().auditTimeout().plus(DbAccessPolicyConfig.defaults().expiryGuardMargin());
+
+    /** check-2's margin, {@code δ} */
+    private static final Duration EXECUTE_MARGIN = DbAccessPolicyConfig.defaults().expiryGuardMargin();
+
+    /** What {@link #MARGIN_AFTER_SCHEMA} leaves: one millisecond more than check-1's margin */
+    private static final Duration MARGIN_AFTER_REMAINING = AUDIT_MARGIN.plusMillis(1);
+
+    private static final long ONE_MS = 1_000_000L;
+    private static final long ONE_SECOND = 1_000_000_000L;
+    private static final long ONE_HOUR = 3_600L * ONE_SECOND;
+
+    /** Where the hand-moved monotonic clock starts, unless where it starts is the point of the case */
+    private static final long BASE = 7_000_000_000_000L;
+
+    /** How {@link #call} reports a call the window refused */
+    private static final String REFUSED = "refused";
+
     private static CBDatabase database;
 
     private final TempWriteGrantRepository repository = new TempWriteGrantRepository();
@@ -108,13 +150,20 @@ public class DbAccessPolicyTest {
             createBoundaryViews(connection, AT_NOW_SCHEMA, "CURRENT_TIMESTAMP");
             createBoundaryViews(
                 connection, AFTER_NOW_SCHEMA, "DATEADD('MICROSECOND', 1, CURRENT_TIMESTAMP)");
+            createBoundaryViews(connection, MARGIN_AFTER_SCHEMA,
+                "DATEADD('MILLISECOND', " + MARGIN_AFTER_REMAINING.toMillis() + ", CURRENT_TIMESTAMP)");
+            createBoundaryViews(connection, MARGIN_AT_SCHEMA,
+                "DATEADD('MILLISECOND', " + AUDIT_MARGIN.toMillis() + ", CURRENT_TIMESTAMP)");
+            createBoundaryViews(connection, FAR_FUTURE_SCHEMA, "DATEADD('YEAR', 1000, CURRENT_TIMESTAMP)");
         }
     }
 
     @AfterAll
     public static void dropBoundarySchemas() throws Exception {
         try (Connection connection = database.openConnection()) {
-            for (String target : new String[]{AT_NOW_SCHEMA, AFTER_NOW_SCHEMA}) {
+            for (String target : new String[]{
+                AT_NOW_SCHEMA, AFTER_NOW_SCHEMA, MARGIN_AFTER_SCHEMA, MARGIN_AT_SCHEMA, FAR_FUTURE_SCHEMA}
+            ) {
                 execute(connection, "DROP SCHEMA IF EXISTS " + target + " CASCADE");
             }
         }
@@ -1805,6 +1854,711 @@ public class DbAccessPolicyTest {
                 + first + " then " + second);
     }
 
+    // ---------------------------------------------------------------- the expiry window
+    //
+    // authorize() still answers one question - is the grant unexpired right now, by the database's
+    // own comparison - and the boundary tests above keep a grant with one microsecond left allowed.
+    // The margin is applied afterwards, by an ExpiryWindow the caller opens immediately before
+    // authorize. These tests move the window's monotonic clock by hand and read the remaining
+    // lifetime from views that put EXPIRES_AT at a known distance from the statement's own clock, so
+    // every boundary below is exact rather than approximately where a sleep happened to land.
+
+    /**
+     * EX-1: check-1 is strict at {@code T_audit + δ}, and the lifetime it works from is the database's
+     * <p>
+     * With {@code T_audit + δ + 1ms} left, one millisecond minus a nanosecond of elapsed time leaves a
+     * nanosecond of margin and must be kept; exactly one millisecond leaves the remaining lifetime
+     * equal to the margin, which is not greater than it, and must be refused; two milliseconds is
+     * past it. A refusal is the expiry denial for the same grant, with no remaining lifetime.
+     * <p>
+     * This node's clock is four seconds ahead of the database throughout - inside the skew allowance,
+     * so authorize still allows - and the remaining lifetime must still be exactly what the view put
+     * there. One measured against the JVM's clock would be four seconds short, and here negative. The
+     * monotonic clock must be read once, when the window opens, and never by authorize.
+     */
+    @Test
+    public void ex1CheckOneIsStrictAtTheAuditMargin() throws Exception {
+        String user = activeUser("policy-ex1");
+        grant(user, Duration.ofMinutes(30));
+        assertMarginFixture(user);
+        Clock ahead = PolicyTestSupport.clockOffsetFrom(readDatabaseNow().toInstant(), Duration.ofSeconds(4));
+
+        List<String> violations = new ArrayList<>();
+        for (long elapsed : new long[]{0, ONE_MS - 1, ONE_MS, 2 * ONE_MS}) {
+            String what = "check-1 at " + elapsed + "ns";
+            ManualNanoClock clock = new ManualNanoClock(BASE);
+            Attempt attempt = attempt(MARGIN_AFTER_SCHEMA, user, clock, MetadataDelay.NONE, ahead);
+            AuthorizationDecision allow = attempt.decision();
+            if (attempt.readsAtOpen() != 1 || attempt.readsByAuthorize() != 0) {
+                violations.add(what + ": the monotonic clock must be read once when the window opens and never"
+                    + " by authorize, read " + attempt.readsAtOpen() + " and " + attempt.readsByAuthorize());
+            }
+            if (!allow.isAllowed()) {
+                violations.add(what + ": authorize must allow a grant with " + MARGIN_AFTER_REMAINING
+                    + " left while this node's clock is four seconds ahead, got " + allow.denialReason());
+                continue;
+            }
+            if (!MARGIN_AFTER_REMAINING.equals(allow.remainingLifetime())) {
+                violations.add(what + ": the remaining lifetime must be exactly EXPIRES_AT - DB_NOW = "
+                    + MARGIN_AFTER_REMAINING + ", got " + allow.remainingLifetime());
+            }
+            clock.set(BASE + elapsed);
+            expectWindow(violations, what, allow, attempt.window().requireMarginBeforeAudit(), elapsed < ONE_MS);
+        }
+        Assertions.assertTrue(violations.isEmpty(), "EX-1 (H2): " + String.join("; ", violations));
+    }
+
+    /**
+     * EX-2: check-2 is strict at {@code δ}, counted from before authorize
+     * <p>
+     * The same view as EX-1, so check-1 passes with nothing elapsed. The clock then moves to where
+     * the audit insert would have left it: {@code remaining - δ} minus a nanosecond is kept, exactly
+     * {@code remaining - δ} is refused, a millisecond more is refused. The audit itself, and the
+     * compensating row a refusal here needs, belong to the enforcement gate and are not tested here.
+     */
+    @Test
+    public void ex2CheckTwoIsStrictAtTheExecuteMargin() throws Exception {
+        String user = activeUser("policy-ex2");
+        grant(user, Duration.ofMinutes(30));
+        assertMarginFixture(user);
+        long boundary = MARGIN_AFTER_REMAINING.minus(EXECUTE_MARGIN).toNanos();
+
+        List<String> violations = new ArrayList<>();
+        for (long elapsed : new long[]{boundary - 1, boundary, boundary + ONE_MS}) {
+            String what = "check-2 at " + elapsed + "ns";
+            ManualNanoClock clock = new ManualNanoClock(BASE);
+            Attempt attempt = attempt(MARGIN_AFTER_SCHEMA, user, clock, MetadataDelay.NONE, PolicyTestSupport.systemClock());
+            AuthorizationDecision allow = attempt.decision();
+            if (!allow.isAllowed()) {
+                violations.add(what + ": authorize must allow, got " + allow.denialReason());
+                continue;
+            }
+            AuthorizationDecision afterAudit = attempt.window().requireMarginBeforeAudit();
+            expectWindow(violations, what + ", check-1 with nothing elapsed", allow, afterAudit, true);
+            clock.set(BASE + elapsed);
+            expectWindow(violations, what, allow, attempt.window().requireMarginBeforeExecute(), elapsed < boundary);
+        }
+        Assertions.assertTrue(violations.isEmpty(), "EX-2 (H2): " + String.join("; ", violations));
+    }
+
+    /**
+     * EX-4: a clock that runs backwards hands no time back, a refusal is final, and a window judges
+     * only its own attempt
+     * <p>
+     * Four parts.
+     * <ol>
+     *   <li>With exactly {@code T_audit + δ} left, check-1 refuses with nothing elapsed - and a
+     *       monotonic clock read a nanosecond or an hour before the start must not turn "nothing
+     *       elapsed" into "less than nothing" and allow it.</li>
+     *   <li>L-1: with {@code T_audit + δ + 1ms} left, check-1 refuses at one millisecond, exactly on
+     *       its margin. check-2 must then return that very denial - with the clock still there, back
+     *       at the start, or an hour before it - because it judges what check-1 left. Were it to
+     *       judge the original allow, its smaller margin would let the write through.</li>
+     *   <li>L-2: nothing can hand a window a decision from anywhere else. Its public methods are
+     *       exactly {@code authorize(request)} and the two checks, which take no argument; no method
+     *       of the window or the service that is not private takes an {@link AuthorizationDecision} or
+     *       a window; its constructors and fields
+     *       are private and the class is final; and {@code openExpiryWindow()} is the only way the
+     *       service hands one out. So an allow measured in one attempt cannot be judged against a
+     *       window opened later, whose count would start at zero.</li>
+     *   <li>A denial and a recovery allow are carried through both checks as the same object, even
+     *       an hour on.</li>
+     * </ol>
+     */
+    @Test
+    public void ex4ElapsedTimeNeverShrinks() throws Exception {
+        String user = activeUser("policy-ex4");
+        grant(user, Duration.ofMinutes(30));
+        assertMarginFixture(user);
+        assertBoundaryFixture(MARGIN_AT_SCHEMA, user,
+            "g.EXPIRES_AT = DATEADD('MILLISECOND', " + AUDIT_MARGIN.toMillis() + ", CURRENT_TIMESTAMP)",
+            "FIXTURE EX-4: the view must leave exactly T_audit + delta");
+        List<String> violations = new ArrayList<>();
+
+        for (long reading : new long[]{0, -1, -ONE_HOUR}) {
+            ManualNanoClock clock = new ManualNanoClock(BASE);
+            Attempt attempt = attempt(MARGIN_AT_SCHEMA, user, clock, MetadataDelay.NONE, PolicyTestSupport.systemClock());
+            if (!attempt.decision().isAllowed()) {
+                violations.add("exactly the margin left: authorize must allow, got " + attempt.decision().denialReason());
+                continue;
+            }
+            clock.set(BASE + reading);
+            expectWindow(violations, "exactly the margin left, clock " + reading + "ns from the start",
+                attempt.decision(), attempt.window().requireMarginBeforeAudit(), false);
+        }
+
+        for (long back : new long[]{ONE_MS, 0, -ONE_HOUR}) {
+            String what = "L-1, check-2 with the clock at " + back + "ns";
+            ManualNanoClock clock = new ManualNanoClock(BASE);
+            Attempt attempt = attempt(MARGIN_AFTER_SCHEMA, user, clock, MetadataDelay.NONE, PolicyTestSupport.systemClock());
+            if (!attempt.decision().isAllowed()) {
+                violations.add(what + ": authorize must allow, got " + attempt.decision().denialReason());
+                continue;
+            }
+            clock.set(BASE + ONE_MS);
+            AuthorizationDecision refused = attempt.window().requireMarginBeforeAudit();
+            expectWindow(violations, what + ", check-1 at 1ms", attempt.decision(), refused, false);
+            clock.set(BASE + back);
+            AuthorizationDecision afterExecute = attempt.window().requireMarginBeforeExecute();
+            if (afterExecute != refused) {
+                violations.add(what + ": check-2 must return check-1's refusal itself, got " + outcome(afterExecute));
+            }
+        }
+
+        Class<DbAccessPolicyService.ExpiryWindow> window = DbAccessPolicyService.ExpiryWindow.class;
+        Set<String> publicApi = new TreeSet<>();
+        for (Method method : window.getDeclaredMethods()) {
+            if (Modifier.isPublic(method.getModifiers())) {
+                publicApi.add(signature(method));
+            }
+        }
+        Set<String> expectedApi = new TreeSet<>(List.of(
+            "authorize(WriteAuthorizationRequest)", "requireMarginBeforeAudit()", "requireMarginBeforeExecute()"));
+        if (!expectedApi.equals(publicApi)) {
+            violations.add("L-2: the window's public methods must be exactly " + expectedApi + ", got " + publicApi);
+        }
+        // Every method anything outside these two classes can call - public, protected or package-private,
+        // declared or inherited - must take neither a decision nor a window. Either would be a way to put a
+        // decision in front of a window that did not make it, or a window in front of a decision it did
+        // not measure.
+        List<Method> reachable = new ArrayList<>(List.of(window.getMethods()));
+        reachable.addAll(List.of(DbAccessPolicyService.class.getMethods()));
+        for (Class<?> owner : List.of(window, DbAccessPolicyService.class)) {
+            for (Method method : owner.getDeclaredMethods()) {
+                if (!Modifier.isPrivate(method.getModifiers()) && !method.isSynthetic()) {
+                    reachable.add(method);
+                }
+            }
+        }
+        for (Method method : reachable) {
+            for (Class<?> parameter : method.getParameterTypes()) {
+                if (AuthorizationDecision.class.isAssignableFrom(parameter) || parameter == window) {
+                    violations.add("L-2: " + method.getDeclaringClass().getSimpleName() + "." + signature(method)
+                        + " lets a caller put a decision and a window together that do not belong together");
+                }
+            }
+        }
+        for (var constructor : window.getDeclaredConstructors()) {
+            if (!Modifier.isPrivate(constructor.getModifiers())) {
+                violations.add("L-2: constructor " + constructor + " must be private");
+            }
+        }
+        for (var field : window.getDeclaredFields()) {
+            if (!Modifier.isPrivate(field.getModifiers())) {
+                violations.add("L-2: field " + field.getName() + " must be private");
+            }
+        }
+        if (!Modifier.isFinal(window.getModifiers())) {
+            violations.add("L-2: the window class must be final");
+        }
+        List<String> makers = new ArrayList<>();
+        for (Method method : DbAccessPolicyService.class.getMethods()) {
+            if (method.getReturnType() == window) {
+                makers.add(signature(method));
+            }
+        }
+        if (!List.of("openExpiryWindow()").equals(makers)) {
+            violations.add("L-2: openExpiryWindow() must be the only way to get a window, got " + makers);
+        }
+
+        ManualNanoClock laterClock = new ManualNanoClock(BASE);
+        DbAccessPolicyService service = marginService(
+            MARGIN_AFTER_SCHEMA, PolicyTestSupport.systemClock(), laterClock, MetadataDelay.NONE);
+        DbAccessPolicyService.ExpiryWindow deniedWindow = service.openExpiryWindow();
+        AuthorizationDecision noGrant = deniedWindow.authorize(request(activeUser("policy-ex4-nogrant"), container()));
+        DbAccessPolicyService.ExpiryWindow rollbackWindow = service.openExpiryWindow();
+        AuthorizationDecision recovery = rollbackWindow.authorize(new WriteAuthorizationRequest(
+            null, null, DbOperationCategory.TRANSACTION_ROLLBACK, null, false));
+        Assertions.assertEquals(DenialReason.NO_GRANT, noGrant.denialReason(), "FIXTURE EX-4: a user with no grant");
+        Assertions.assertEquals(
+            AuthorizationDecision.RECOVERY_GRANT_ID, recovery.appliedGrantId(), "FIXTURE EX-4: a recovery allow");
+        laterClock.set(BASE + ONE_HOUR);
+        for (DbAccessPolicyService.ExpiryWindow one : List.of(deniedWindow, rollbackWindow)) {
+            AuthorizationDecision decided = one == deniedWindow ? noGrant : recovery;
+            AuthorizationDecision afterAudit = one.requireMarginBeforeAudit();
+            AuthorizationDecision afterExecute = one.requireMarginBeforeExecute();
+            if (afterAudit != decided || afterExecute != decided) {
+                violations.add("a " + outcome(decided) + " must stay the same object through both checks, got "
+                    + outcome(afterAudit) + " and " + outcome(afterExecute));
+            }
+        }
+        Assertions.assertTrue(violations.isEmpty(), "EX-4: " + String.join("; ", violations));
+    }
+
+    /**
+     * EX-M1: time spent on the metadata path is counted, wherever it is spent
+     * <p>
+     * The window is opened before authorize, so everything authorize waits for is inside the elapsed
+     * time check-1 subtracts: the pool handing out a connection (before the database reads its
+     * clock), the statement returning (after), and the connection closing (after the result is
+     * read). Each is given one millisecond minus a nanosecond, which must be kept, and exactly one
+     * millisecond, which must be refused; the last two rows spread the same totals across all three.
+     * A window that took its starting reading any later than it is opened - at the first check, or
+     * from inside authorize - would miss these delays and keep every row.
+     */
+    @Test
+    public void exM1MetadataDelayIsCounted() throws Exception {
+        String user = activeUser("policy-exm1");
+        grant(user, Duration.ofMinutes(30));
+        assertMarginFixture(user);
+
+        record Case(String name, MetadataDelay delay, boolean kept) {
+        }
+
+        Case[] cases = {
+            new Case("no delay", MetadataDelay.NONE, true),
+            new Case("pool wait 1ms - 1ns", new MetadataDelay(ONE_MS - 1, 0, 0), true),
+            new Case("pool wait 1ms", new MetadataDelay(ONE_MS, 0, 0), false),
+            new Case("statement 1ms - 1ns", new MetadataDelay(0, ONE_MS - 1, 0), true),
+            new Case("statement 1ms", new MetadataDelay(0, ONE_MS, 0), false),
+            new Case("close 1ms - 1ns", new MetadataDelay(0, 0, ONE_MS - 1), true),
+            new Case("close 1ms", new MetadataDelay(0, 0, ONE_MS), false),
+            new Case("spread over all three, 1ms - 1ns", new MetadataDelay(400_000, 300_000, 299_999), true),
+            new Case("spread over all three, 1ms", new MetadataDelay(400_000, 300_000, 300_000), false),
+        };
+        List<String> violations = new ArrayList<>();
+        for (Case one : cases) {
+            ManualNanoClock clock = new ManualNanoClock(BASE);
+            Attempt attempt = attempt(MARGIN_AFTER_SCHEMA, user, clock, one.delay(), PolicyTestSupport.systemClock());
+            Assertions.assertEquals(BASE + one.delay().total(), clock.peek(),
+                "FIXTURE EX-M1 " + one.name() + ": the metadata path must have moved the clock");
+            if (attempt.readsAtOpen() != 1 || attempt.readsByAuthorize() != 0) {
+                violations.add(one.name() + ": the monotonic clock must be read once when the window opens and"
+                    + " never by authorize, read " + attempt.readsAtOpen() + " and " + attempt.readsByAuthorize());
+            }
+            if (!attempt.decision().isAllowed()) {
+                violations.add(one.name() + ": authorize must allow, got " + attempt.decision().denialReason());
+                continue;
+            }
+            expectWindow(violations, one.name(), attempt.decision(),
+                attempt.window().requireMarginBeforeAudit(), one.kept());
+        }
+        Assertions.assertTrue(violations.isEmpty(), "EX-M1: " + String.join("; ", violations));
+    }
+
+    /**
+     * EX-M2: the verdict is monotone in the metadata delay
+     * <p>
+     * A grid of delays from none to a quarter of the {@code long} range, each in its own attempt.
+     * Below one millisecond check-1 keeps the allow and check-2 at the same reading keeps it too; at
+     * one millisecond and beyond both refuse. Walking the grid upwards, once a delay has been refused
+     * no longer delay may be kept.
+     */
+    @Test
+    public void exM2TheVerdictIsMonotoneInTheDelay() throws Exception {
+        String user = activeUser("policy-exm2");
+        grant(user, Duration.ofMinutes(30));
+        assertMarginFixture(user);
+
+        long[] delays = {
+            0, 1, ONE_MS / 2, ONE_MS - 1, ONE_MS, ONE_MS + 1, 2 * ONE_MS, ONE_SECOND,
+            MARGIN_AFTER_REMAINING.toNanos(), MARGIN_AFTER_REMAINING.plus(AUDIT_MARGIN).toNanos(),
+            ONE_HOUR, Long.MAX_VALUE / 4};
+        List<String> violations = new ArrayList<>();
+        boolean refusedAlready = false;
+        for (long delay : delays) {
+            String what = "metadata delay " + delay + "ns";
+            ManualNanoClock clock = new ManualNanoClock(BASE);
+            Attempt attempt = attempt(
+                MARGIN_AFTER_SCHEMA, user, clock, MetadataDelay.query(delay), PolicyTestSupport.systemClock());
+            Assertions.assertEquals(BASE + delay, clock.peek(), "FIXTURE EX-M2 " + what + ": the clock must have moved");
+            AuthorizationDecision allow = attempt.decision();
+            if (!allow.isAllowed()) {
+                violations.add(what + ": authorize must allow, got " + allow.denialReason());
+                continue;
+            }
+            AuthorizationDecision afterAudit = attempt.window().requireMarginBeforeAudit();
+            AuthorizationDecision afterExecute = attempt.window().requireMarginBeforeExecute();
+            boolean kept = afterAudit == allow;
+            expectWindow(violations, what + ", check-1", allow, afterAudit, delay < ONE_MS);
+            if (kept) {
+                expectWindow(violations, what + ", check-2", allow, afterExecute, true);
+            } else if (afterExecute != afterAudit) {
+                violations.add(what + ": check-2 must hand check-1's refusal back unchanged, got " + outcome(afterExecute));
+            }
+            if (refusedAlready && kept) {
+                violations.add(what + ": kept after a shorter delay had been refused");
+            }
+            refusedAlready |= !kept;
+        }
+        Assertions.assertTrue(violations.isEmpty(), "EX-M2: " + String.join("; ", violations));
+    }
+
+    /**
+     * EX-M3: a delay between the checks turns the allow into a denial, measured from before authorize
+     * <p>
+     * Half a millisecond on the metadata path leaves check-1 standing. The clock then moves to where
+     * a slow audit would leave it: {@code remaining - δ} minus a nanosecond, counted from the moment
+     * the window opened, is kept, and exactly {@code remaining - δ} is refused. A window that counted
+     * check-2's elapsed time from the end of authorize, or from check-1, would be half a millisecond
+     * short at the boundary and keep it. Run with the half millisecond both before the database reads
+     * its clock (pool) and after (statement).
+     */
+    @Test
+    public void exM3ADelayBetweenTheChecksIsMeasuredFromBeforeAuthorize() throws Exception {
+        String user = activeUser("policy-exm3");
+        grant(user, Duration.ofMinutes(30));
+        assertMarginFixture(user);
+        long metadata = ONE_MS / 2;
+        long boundary = MARGIN_AFTER_REMAINING.minus(EXECUTE_MARGIN).toNanos();
+
+        List<String> violations = new ArrayList<>();
+        for (MetadataDelay delay : new MetadataDelay[]{MetadataDelay.pool(metadata), MetadataDelay.query(metadata)}) {
+            for (long total : new long[]{boundary - 1, boundary}) {
+                String what = (delay.poolNanos() > 0 ? "pool" : "statement") + " delay, check-2 at " + total + "ns";
+                ManualNanoClock clock = new ManualNanoClock(BASE);
+                Attempt attempt = attempt(MARGIN_AFTER_SCHEMA, user, clock, delay, PolicyTestSupport.systemClock());
+                Assertions.assertEquals(BASE + metadata, clock.peek(), "FIXTURE EX-M3 " + what + ": the clock must have moved");
+                AuthorizationDecision allow = attempt.decision();
+                if (!allow.isAllowed()) {
+                    violations.add(what + ": authorize must allow, got " + allow.denialReason());
+                    continue;
+                }
+                AuthorizationDecision afterAudit = attempt.window().requireMarginBeforeAudit();
+                expectWindow(violations, what + ", check-1", allow, afterAudit, true);
+                clock.set(BASE + total);
+                expectWindow(violations, what, allow,
+                    attempt.window().requireMarginBeforeExecute(), total < boundary);
+            }
+        }
+        Assertions.assertTrue(violations.isEmpty(), "EX-M3: " + String.join("; ", violations));
+    }
+
+    /**
+     * EX-M4: a clock that goes back after a metadata delay gives nothing back
+     * <p>
+     * Two sequences. In the first the metadata delay alone - one millisecond - crosses check-1's
+     * boundary, and the clock then reads a nanosecond less, the start, or an hour before it; check-2
+     * must return check-1's refusal, the same object. In the second the metadata delay leaves check-1
+     * standing and the audit crosses check-2's boundary; when the clock then goes back to where the
+     * metadata path left it, to the start or before it, the attempt is already over - another
+     * authorize and either check are refused, and the refusal stands as its last answer.
+     */
+    @Test
+    public void exM4ARegressionAfterAMetadataDelayGivesNothingBack() throws Exception {
+        String user = activeUser("policy-exm4");
+        grant(user, Duration.ofMinutes(30));
+        assertMarginFixture(user);
+        List<String> violations = new ArrayList<>();
+
+        for (long back : new long[]{ONE_MS - 1, 0, -ONE_HOUR}) {
+            String what = "1ms metadata delay, clock back at " + back + "ns";
+            ManualNanoClock clock = new ManualNanoClock(BASE);
+            Attempt crossed = attempt(
+                MARGIN_AFTER_SCHEMA, user, clock, MetadataDelay.query(ONE_MS), PolicyTestSupport.systemClock());
+            if (!crossed.decision().isAllowed()) {
+                violations.add(what + ": authorize must allow, got " + crossed.decision().denialReason());
+                continue;
+            }
+            AuthorizationDecision refused = crossed.window().requireMarginBeforeAudit();
+            expectWindow(violations, what + ", check-1", crossed.decision(), refused, false);
+            clock.set(BASE + back);
+            AuthorizationDecision afterExecute = crossed.window().requireMarginBeforeExecute();
+            if (afterExecute != refused) {
+                violations.add(what + ": check-2 must return check-1's refusal itself, got " + outcome(afterExecute));
+            }
+        }
+
+        long metadata = ONE_MS - 100_000;
+        long boundary = MARGIN_AFTER_REMAINING.minus(EXECUTE_MARGIN).toNanos();
+        ManualNanoClock clock = new ManualNanoClock(BASE);
+        Attempt audited = attempt(
+            MARGIN_AFTER_SCHEMA, user, clock, MetadataDelay.query(metadata), PolicyTestSupport.systemClock());
+        AuthorizationDecision allow = audited.decision();
+        if (allow.isAllowed()) {
+            expectWindow(violations, "check-1 after a " + metadata + "ns metadata delay", allow,
+                audited.window().requireMarginBeforeAudit(), true);
+            clock.set(BASE + boundary);
+            expectWindow(violations, "check-2 at its boundary", allow,
+                audited.window().requireMarginBeforeExecute(), false);
+            for (long back : new long[]{metadata, 0, -ONE_HOUR}) {
+                clock.set(BASE + back);
+                for (Call next : Call.values()) {
+                    String result = call(audited.window(), next, request(user, container()));
+                    if (!REFUSED.equals(result)) {
+                        violations.add("with the attempt over and the clock back at " + back + "ns, " + next
+                            + " must be refused, got " + result);
+                    }
+                }
+            }
+        } else {
+            violations.add("second sequence: authorize must allow, got " + allow.denialReason());
+        }
+        Assertions.assertTrue(violations.isEmpty(), "EX-M4: " + String.join("; ", violations));
+    }
+
+    /**
+     * EX-M5: the monotonic clock wrapping, and lifetimes no {@code long} of nanoseconds can hold
+     * <p>
+     * {@code System.nanoTime()} may start anywhere and wrap, so only the difference of two readings
+     * means anything. Each row puts the window's start somewhere awkward - just below
+     * {@code Long.MAX_VALUE} so the metadata delay wraps, exactly on it, on {@code Long.MIN_VALUE},
+     * just below zero - and the verdict must be exactly the one EX-1 gives for the same elapsed time.
+     * <p>
+     * Then a grant with a thousand years left, more than {@code Long.MAX_VALUE} nanoseconds, checked
+     * after {@code Long.MAX_VALUE} nanoseconds - the longest interval the clock can express - has
+     * elapsed. Both checks must keep it, and neither may overflow: converting that lifetime to
+     * nanoseconds would.
+     */
+    @Test
+    public void exM5TheClockWrapsAndLongLifetimesDoNotOverflow() throws Exception {
+        String user = activeUser("policy-exm5");
+        grant(user, Duration.ofMinutes(30));
+        assertMarginFixture(user);
+
+        record Case(String name, long start, long delay, boolean kept) {
+        }
+
+        Case[] cases = {
+            new Case("wrapping past Long.MAX_VALUE, 1ms - 1ns", Long.MAX_VALUE - ONE_MS / 2, ONE_MS - 1, true),
+            new Case("wrapping past Long.MAX_VALUE, 1ms", Long.MAX_VALUE - ONE_MS / 2, ONE_MS, false),
+            new Case("starting on Long.MAX_VALUE, 1ms - 1ns", Long.MAX_VALUE, ONE_MS - 1, true),
+            new Case("ending on Long.MAX_VALUE, 1ms", Long.MAX_VALUE - ONE_MS, ONE_MS, false),
+            new Case("starting on Long.MIN_VALUE, 1ms - 1ns", Long.MIN_VALUE, ONE_MS - 1, true),
+            new Case("starting on Long.MIN_VALUE, 1ms", Long.MIN_VALUE, ONE_MS, false),
+            new Case("crossing zero, 1ms - 1ns", -ONE_MS / 2, ONE_MS - 1, true),
+            new Case("crossing zero, 1ms", -ONE_MS / 2, ONE_MS, false),
+        };
+        List<String> violations = new ArrayList<>();
+        for (Case one : cases) {
+            ManualNanoClock clock = new ManualNanoClock(one.start());
+            Attempt attempt = attempt(
+                MARGIN_AFTER_SCHEMA, user, clock, MetadataDelay.query(one.delay()), PolicyTestSupport.systemClock());
+            if (!attempt.decision().isAllowed()) {
+                violations.add(one.name() + ": authorize must allow, got " + attempt.decision().denialReason());
+                continue;
+            }
+            expectWindow(violations, one.name(), attempt.decision(),
+                attempt.window().requireMarginBeforeAudit(), one.kept());
+        }
+
+        assertBoundaryFixture(FAR_FUTURE_SCHEMA, user, "g.EXPIRES_AT > DATEADD('YEAR', 999, CURRENT_TIMESTAMP)",
+            "FIXTURE EX-M5: the view must leave a thousand years");
+        ManualNanoClock clock = new ManualNanoClock(0);
+        Attempt far = attempt(FAR_FUTURE_SCHEMA, user, clock, MetadataDelay.NONE, PolicyTestSupport.systemClock());
+        AuthorizationDecision allow = far.decision();
+        if (!allow.isAllowed()) {
+            violations.add("a thousand years left: authorize must allow, got " + allow.denialReason());
+        } else {
+            if (allow.remainingLifetime() == null
+                || allow.remainingLifetime().compareTo(Duration.ofNanos(Long.MAX_VALUE)) <= 0
+            ) {
+                violations.add("a thousand years left must be carried as more than Long.MAX_VALUE nanoseconds, got "
+                    + allow.remainingLifetime());
+            }
+            clock.set(Long.MAX_VALUE);
+            try {
+                AuthorizationDecision afterAudit = far.window().requireMarginBeforeAudit();
+                expectWindow(violations, "a thousand years left, Long.MAX_VALUE ns elapsed, check-1", allow, afterAudit, true);
+                expectWindow(violations, "a thousand years left, Long.MAX_VALUE ns elapsed, check-2", allow,
+                    far.window().requireMarginBeforeExecute(), true);
+            } catch (ArithmeticException e) {
+                violations.add("a thousand years left overflowed in the window: " + e.getClass().getName());
+            }
+        }
+        Assertions.assertTrue(violations.isEmpty(), "EX-M5: " + String.join("; ", violations));
+    }
+
+    /**
+     * EX-M6: no delay, start, regression, call order or clock failure turns a denial into an allow
+     * <p>
+     * Three parts, all through the window's own state; there is no way left to hand it a decision.
+     * <ol>
+     *   <li>Every combination of four starting points (both ends of the range among them), four
+     *       metadata delays either side of check-1's boundary, and seven readings for check-2 -
+     *       either side of its boundary, far past it, and back to or behind the start. Each is one
+     *       attempt, authorize then check-1 then check-2, and every verdict is compared with an
+     *       oracle that knows the true elapsed time - the test decides it and derives the clock
+     *       readings from it - rather than recomputing it from the readings as the window must. A
+     *       refusal from check-1 must be what check-2 returns, the same object; a denial followed by
+     *       an allow is counted.</li>
+     *   <li>The attempt's state machine, exhaustively: from each state a window can be in - just
+     *       opened, authorized, after check-1, after check-2 - each of the three calls. Only
+     *       authorize, check-1 and check-2, once each and in that order, are accepted. Every other
+     *       call is refused and ends the attempt, so the call that would have been next is refused
+     *       too. A request the service refuses outright - a null one - ends it the same way.</li>
+     *   <li>A monotonic clock that throws. Opening a window fails, so there is no window. At check-1
+     *       or check-2 the clock's own exception comes out unchanged, nothing is returned, and every
+     *       later call is refused, so no allow can follow it - the same check retried at once, against
+     *       a clock that works again, included. The window deliberately does not turn
+     *       the failure into a denial of its own: the enforcement gate maps it to
+     *       {@code PERMISSION_STORE_UNAVAILABLE}, and that mapping is a later slice's to build and
+     *       test.</li>
+     * </ol>
+     */
+    @Test
+    public void exM6NoDelayOrRegressionTurnsADenialIntoAnAllow() throws Exception {
+        String user = activeUser("policy-exm6");
+        grant(user, Duration.ofMinutes(30));
+        assertMarginFixture(user);
+        long remaining = MARGIN_AFTER_REMAINING.toNanos();
+        long auditMargin = AUDIT_MARGIN.toNanos();
+        long executeMargin = EXECUTE_MARGIN.toNanos();
+        long boundary = remaining - executeMargin;
+
+        List<String> mismatches = new ArrayList<>();
+        int attempts = 0;
+        int evaluations = 0;
+        int transitions = 0;
+        for (long start : new long[]{0, Long.MAX_VALUE - ONE_MS / 2, Long.MIN_VALUE, -1}) {
+            for (long delay : new long[]{0, ONE_MS - 1, ONE_MS, 5 * ONE_MS}) {
+                for (long beforeExecute : new long[]{
+                    delay, boundary - 1, boundary, 10 * ONE_SECOND, 0, -ONE_HOUR, -(1L << 62)}
+                ) {
+                    attempts++;
+                    String what = "start " + start + ", metadata " + delay + "ns, check-2 at " + beforeExecute + "ns";
+                    ManualNanoClock clock = new ManualNanoClock(start);
+                    Attempt attempt = attempt(
+                        MARGIN_AFTER_SCHEMA, user, clock, MetadataDelay.query(delay), PolicyTestSupport.systemClock());
+                    AuthorizationDecision allow = attempt.decision();
+                    Assertions.assertTrue(allow.isAllowed(), "FIXTURE EX-M6 " + what + ": authorize must allow");
+
+                    clock.set(start + delay);
+                    AuthorizationDecision first = attempt.window().requireMarginBeforeAudit();
+                    long floor = delay;
+                    boolean firstKept = remaining - floor > auditMargin;
+                    evaluations++;
+                    if ((first == allow) != firstKept) {
+                        mismatches.add(what + ": check-1 gave " + outcome(first) + ", the oracle "
+                            + (firstKept ? "keeps it" : "refuses it"));
+                    }
+                    clock.set(start + beforeExecute);
+                    AuthorizationDecision second = attempt.window().requireMarginBeforeExecute();
+                    evaluations++;
+                    if (first != allow) {
+                        if (second != first) {
+                            mismatches.add(what + ": check-2 must return check-1's refusal itself, got " + outcome(second));
+                        }
+                        if (second != null && second.isAllowed()) {
+                            transitions++;
+                        }
+                    } else {
+                        floor = Math.max(floor, Math.max(0, beforeExecute));
+                        boolean secondKept = remaining - floor > executeMargin;
+                        if ((second == allow) != secondKept) {
+                            mismatches.add(what + ": check-2 gave " + outcome(second) + ", the oracle "
+                                + (secondKept ? "keeps it" : "refuses it"));
+                        }
+                    }
+                }
+            }
+        }
+
+        Call[] order = Call.values();
+        int stateCases = 0;
+        for (int done = 0; done <= order.length; done++) {
+            for (Call next : order) {
+                stateCases++;
+                String where = "after " + done + " valid call(s), " + next;
+                DbAccessPolicyService.ExpiryWindow window = marginService(
+                    MARGIN_AFTER_SCHEMA, PolicyTestSupport.systemClock(), new ManualNanoClock(BASE), MetadataDelay.NONE)
+                    .openExpiryWindow();
+                for (int i = 0; i < done; i++) {
+                    String result = call(window, order[i], request(user, container()));
+                    if (REFUSED.equals(result)) {
+                        mismatches.add("state machine, " + where + ": the valid call " + order[i] + " was refused");
+                    }
+                }
+                boolean valid = done < order.length && next == order[done];
+                String result = call(window, next, request(user, container()));
+                if (valid == REFUSED.equals(result)) {
+                    mismatches.add("state machine, " + where + (valid ? " must be accepted" : " must be refused")
+                        + ", got " + result);
+                }
+                if (!valid && done < order.length) {
+                    String following = call(window, order[done], request(user, container()));
+                    if (!REFUSED.equals(following)) {
+                        mismatches.add("state machine, " + where + " was refused, so the attempt is over, but "
+                            + order[done] + " then gave " + following);
+                    }
+                }
+            }
+        }
+        DbAccessPolicyService.ExpiryWindow refusedRequest = marginService(
+            MARGIN_AFTER_SCHEMA, PolicyTestSupport.systemClock(), new ManualNanoClock(BASE), MetadataDelay.NONE)
+            .openExpiryWindow();
+        try {
+            AuthorizationDecision result = refusedRequest.authorize(noRequest());
+            mismatches.add("a null request must be refused, got " + outcome(result));
+        } catch (IllegalArgumentException expected) {
+            for (Call next : order) {
+                String result = call(refusedRequest, next, request(user, container()));
+                if (!REFUSED.equals(result)) {
+                    mismatches.add("after a null request, " + next + " must be refused, got " + result);
+                }
+            }
+        }
+
+        Map<Integer, List<String>> expectedWithFailingClock = Map.of(
+            2, List.of("AUTHORIZE an allow", "CHECK_1 threw", "CHECK_2 " + REFUSED),
+            3, List.of("AUTHORIZE an allow", "CHECK_1 an allow", "CHECK_2 threw"));
+        for (int failingRead = 1; failingRead <= 3; failingRead++) {
+            String where = "a monotonic clock failing from read " + failingRead;
+            DbAccessPolicyService service = new DbAccessPolicyService(
+                marginSource(MARGIN_AFTER_SCHEMA), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock(),
+                new FailingNanoClock(BASE, failingRead));
+            DbAccessPolicyService.ExpiryWindow window;
+            try {
+                window = service.openExpiryWindow();
+            } catch (ClockFailure e) {
+                if (failingRead != 1) {
+                    mismatches.add(where + ": opening the window must read the clock once, not " + failingRead + " times");
+                }
+                continue;
+            }
+            if (failingRead == 1) {
+                mismatches.add(where + ": opening the window must read the clock, and so fail");
+                continue;
+            }
+            List<String> outcomes = new ArrayList<>();
+            for (Call next : order) {
+                try {
+                    outcomes.add(next + " " + call(window, next, request(user, container())));
+                } catch (ClockFailure e) {
+                    outcomes.add(next + " threw");
+                }
+            }
+            if (!expectedWithFailingClock.get(failingRead).equals(outcomes)) {
+                mismatches.add(where + ": expected " + expectedWithFailingClock.get(failingRead) + ", got " + outcomes);
+            }
+            for (Call next : order) {
+                String result = call(window, next, request(user, container()));
+                if (!REFUSED.equals(result)) {
+                    mismatches.add(where + ": after the failure, " + next + " must be refused, got " + result);
+                }
+            }
+        }
+
+        // The same failure with a clock that works again straight afterwards, and the very check that
+        // failed retried at once. The retry must be refused: the attempt ended when the check failed.
+        Map<Integer, List<String>> expectedWithRecoveringClock = Map.of(
+            2, List.of("AUTHORIZE an allow", "CHECK_1 threw", "CHECK_1 again " + REFUSED, "CHECK_2 " + REFUSED),
+            3, List.of("AUTHORIZE an allow", "CHECK_1 an allow", "CHECK_2 threw", "CHECK_2 again " + REFUSED));
+        for (int failingRead = 2; failingRead <= 3; failingRead++) {
+            DbAccessPolicyService.ExpiryWindow window = new DbAccessPolicyService(
+                marginSource(MARGIN_AFTER_SCHEMA), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock(),
+                FailingNanoClock.once(BASE, failingRead)).openExpiryWindow();
+            List<String> outcomes = new ArrayList<>();
+            for (Call next : order) {
+                try {
+                    outcomes.add(next + " " + call(window, next, request(user, container())));
+                } catch (ClockFailure e) {
+                    outcomes.add(next + " threw");
+                    outcomes.add(next + " again " + call(window, next, request(user, container())));
+                }
+            }
+            if (!expectedWithRecoveringClock.get(failingRead).equals(outcomes)) {
+                mismatches.add("a monotonic clock failing once, on read " + failingRead + ": expected "
+                    + expectedWithRecoveringClock.get(failingRead) + ", got " + outcomes);
+            }
+        }
+
+        String summary = attempts + " attempts, " + evaluations + " check evaluations, " + stateCases
+            + " state-machine cases, " + mismatches.size() + " mismatches, " + transitions + " denial-to-allow transitions";
+        Assertions.assertTrue(mismatches.isEmpty() && transitions == 0,
+            "EX-M6 (" + summary + "): " + String.join("; ", mismatches.subList(0, Math.min(20, mismatches.size()))));
+    }
+
     // ---------------------------------------------------------------- helpers
 
     @NotNull
@@ -1986,6 +2740,324 @@ public class DbAccessPolicyTest {
             OffsetDateTime now = dbResult.getObject(1, OffsetDateTime.class);
             Assertions.assertNotNull(now);
             return now;
+        }
+    }
+
+    // ---------------------------------------------------------------- expiry window helpers
+
+    /**
+     * Asserts that {@link #MARGIN_AFTER_SCHEMA} leaves exactly {@link #MARGIN_AFTER_REMAINING}
+     */
+    private void assertMarginFixture(@NotNull String userId) throws Exception {
+        assertBoundaryFixture(MARGIN_AFTER_SCHEMA, userId,
+            "g.EXPIRES_AT = DATEADD('MILLISECOND', " + MARGIN_AFTER_REMAINING.toMillis() + ", CURRENT_TIMESTAMP)",
+            "FIXTURE: the margin view must leave exactly T_audit + delta + 1ms");
+    }
+
+    /**
+     * One attempt, made the way the enforcement gate will make it: open the window, then authorize
+     *
+     * @param readsAtOpen how often opening the window read the monotonic clock
+     * @param readsByAuthorize how often authorize read it
+     */
+    private record Attempt(
+        @NotNull DbAccessPolicyService.ExpiryWindow window,
+        @NotNull AuthorizationDecision decision,
+        int readsAtOpen,
+        int readsByAuthorize
+    ) {
+    }
+
+    @NotNull
+    private Attempt attempt(
+        @NotNull String target,
+        @NotNull String userId,
+        @NotNull ManualNanoClock clock,
+        @NotNull MetadataDelay delay,
+        @NotNull Clock localClock
+    ) {
+        DbAccessPolicyService service = marginService(target, localClock, clock, delay);
+        int before = clock.reads();
+        DbAccessPolicyService.ExpiryWindow window = service.openExpiryWindow();
+        int afterOpen = clock.reads();
+        AuthorizationDecision decision = window.authorize(request(userId, container()));
+        return new Attempt(window, decision, afterOpen - before, clock.reads() - afterOpen);
+    }
+
+    /**
+     * A service over one of the boundary schemas, with a monotonic clock the test moves by hand
+     * <p>
+     * The metadata path moves that clock by the given delay, without reading it, at the point of the
+     * read the delay names - which is how a slow pool, a slow statement or a slow close looks to a
+     * window opened before authorize.
+     */
+    @NotNull
+    private DbAccessPolicyService marginService(
+        @NotNull String target,
+        @NotNull Clock localClock,
+        @NotNull ManualNanoClock monotonic,
+        @NotNull MetadataDelay delay
+    ) {
+        MetadataConnectionSource plain = marginSource(target);
+        MetadataConnectionSource source = () -> {
+            monotonic.advance(delay.poolNanos());
+            return delaying(plain.openConnection(), monotonic, delay);
+        };
+        return new DbAccessPolicyService(source, DbAccessPolicyConfig.defaults(), localClock, monotonic);
+    }
+
+    /**
+     * Metadata connections whose {@code {table_prefix}} resolves to one of the boundary schemas
+     */
+    @NotNull
+    private static MetadataConnectionSource marginSource(@NotNull String target) {
+        return () -> new InternalProxyConnection(
+            database.openConnection(), DbacTestSupport.config(database.getDatabaseConfig(), target));
+    }
+
+    /** The three calls a window takes, in the only order it takes them */
+    private enum Call {
+        AUTHORIZE, CHECK_1, CHECK_2
+    }
+
+    /**
+     * Makes one call on a window and describes what came back
+     *
+     * @return {@link #REFUSED} when the window refused the call, otherwise the decision's outcome.
+     *     Any other exception - a failing clock - propagates.
+     */
+    @NotNull
+    private static String call(
+        @NotNull DbAccessPolicyService.ExpiryWindow window,
+        @NotNull Call call,
+        @Nullable WriteAuthorizationRequest request
+    ) {
+        try {
+            AuthorizationDecision result = switch (call) {
+                case AUTHORIZE -> window.authorize(request);
+                case CHECK_1 -> window.requireMarginBeforeAudit();
+                case CHECK_2 -> window.requireMarginBeforeExecute();
+            };
+            return outcome(result);
+        } catch (IllegalStateException e) {
+            return REFUSED;
+        }
+    }
+
+    /**
+     * A method as {@code name(SimpleParameterType, ...)}, for comparing an API against a list
+     */
+    @NotNull
+    private static String signature(@NotNull Method method) {
+        StringBuilder text = new StringBuilder(method.getName()).append('(');
+        Class<?>[] parameters = method.getParameterTypes();
+        for (int i = 0; i < parameters.length; i++) {
+            text.append(i == 0 ? "" : ", ").append(parameters[i].getSimpleName());
+        }
+        return text.append(')').toString();
+    }
+
+    /**
+     * Wraps a metadata connection so that its statement and its close move the monotonic clock
+     */
+    @NotNull
+    private static Connection delaying(
+        @NotNull Connection delegate,
+        @NotNull ManualNanoClock clock,
+        @NotNull MetadataDelay delay
+    ) {
+        return (Connection) Proxy.newProxyInstance(
+            DbAccessPolicyTest.class.getClassLoader(), new Class<?>[]{Connection.class},
+            (proxy, method, args) -> {
+                Object result = invoke(delegate, method, args);
+                if ("prepareStatement".equals(method.getName()) && result instanceof PreparedStatement statement) {
+                    return Proxy.newProxyInstance(
+                        DbAccessPolicyTest.class.getClassLoader(), new Class<?>[]{PreparedStatement.class},
+                        (innerProxy, innerMethod, innerArgs) -> {
+                            Object innerResult = invoke(statement, innerMethod, innerArgs);
+                            if ("executeQuery".equals(innerMethod.getName())) {
+                                clock.advance(delay.queryNanos());
+                            }
+                            return innerResult;
+                        });
+                }
+                if ("close".equals(method.getName())) {
+                    clock.advance(delay.closeNanos());
+                }
+                return result;
+            });
+    }
+
+    @Nullable
+    private static Object invoke(
+        @NotNull Object target,
+        @NotNull Method method,
+        @Nullable Object[] args
+    ) throws Throwable {
+        try {
+            return method.invoke(target, args);
+        } catch (InvocationTargetException e) {
+            throw e.getCause();
+        }
+    }
+
+    /**
+     * Checks one window result, collecting rather than failing
+     * <p>
+     * A kept allow must be the very object handed in. A refusal must be the expiry denial for that
+     * allow: the same key, category, grant and expiry, {@code GRANT_EXPIRED}, no remaining lifetime,
+     * and a payload recording exactly that.
+     */
+    private static void expectWindow(
+        @NotNull List<String> violations,
+        @NotNull String what,
+        @NotNull AuthorizationDecision allow,
+        @Nullable AuthorizationDecision result,
+        boolean kept
+    ) {
+        if (kept) {
+            if (result != allow) {
+                violations.add(what + ": expected the same allow back, got " + outcome(result));
+            }
+            return;
+        }
+        if (result == null || result.isAllowed() || result.denialReason() != DenialReason.GRANT_EXPIRED) {
+            violations.add(what + ": expected GRANT_EXPIRED, got " + outcome(result));
+            return;
+        }
+        if (!Objects.equals(allow.key(), result.key())
+            || allow.operationCategory() != result.operationCategory()
+            || !Objects.equals(allow.appliedGrantId(), result.appliedGrantId())
+            || !Objects.equals(allow.expiresAt(), result.expiresAt())
+            || result.remainingLifetime() != null
+            || result.auditPayload() == null
+            || result.auditPayload().decision() != DbAccessDecision.DENY
+            || result.auditPayload().denialReason() != DenialReason.GRANT_EXPIRED
+        ) {
+            violations.add(what + ": the expiry denial must describe the allow it replaced, got " + result);
+        }
+    }
+
+    @NotNull
+    private static String outcome(@Nullable AuthorizationDecision decision) {
+        if (decision == null) {
+            return "null";
+        }
+        return decision.isAllowed() ? "an allow" : "a denial for " + decision.denialReason();
+    }
+
+    /**
+     * No request at all, for the one case that hands the window a null
+     */
+    @Nullable
+    private static WriteAuthorizationRequest noRequest() {
+        return null;
+    }
+
+    /**
+     * The monotonic clock, moved by hand
+     * <p>
+     * Additions wrap exactly as {@code System.nanoTime()} does, which is what the wrap cases rely on.
+     * Reads by the code under test are counted; the test's own look goes through {@link #peek()} and
+     * is not.
+     */
+    private static final class ManualNanoClock implements LongSupplier {
+        private long now;
+        private int reads;
+
+        ManualNanoClock(long start) {
+            this.now = start;
+        }
+
+        @Override
+        public long getAsLong() {
+            reads++;
+            return now;
+        }
+
+        void set(long value) {
+            now = value;
+        }
+
+        void advance(long nanos) {
+            now += nanos;
+        }
+
+        long peek() {
+            return now;
+        }
+
+        int reads() {
+            return reads;
+        }
+    }
+
+    /**
+     * A monotonic clock that works until a chosen read and throws there - from then on, or just that once
+     */
+    private static final class FailingNanoClock implements LongSupplier {
+        private final long value;
+        private final int failingRead;
+        private final boolean recovers;
+        private int reads;
+
+        FailingNanoClock(long value, int failingRead) {
+            this(value, failingRead, false);
+        }
+
+        private FailingNanoClock(long value, int failingRead, boolean recovers) {
+            this.value = value;
+            this.failingRead = failingRead;
+            this.recovers = recovers;
+        }
+
+        /** Fails on that one read and works again afterwards */
+        @NotNull
+        static FailingNanoClock once(long value, int failingRead) {
+            return new FailingNanoClock(value, failingRead, true);
+        }
+
+        @Override
+        public long getAsLong() {
+            reads++;
+            if (recovers ? reads == failingRead : reads >= failingRead) {
+                throw new ClockFailure();
+            }
+            return value;
+        }
+    }
+
+    /**
+     * What {@link FailingNanoClock} throws: its own type, so it cannot be mistaken for the window refusing a call
+     */
+    private static final class ClockFailure extends RuntimeException {
+        ClockFailure() {
+            super("the monotonic clock failed");
+        }
+    }
+
+    /**
+     * How far the metadata path moves the monotonic clock, and where
+     * <p>
+     * The pool delay comes before the statement runs, and so before the database reads its clock; the
+     * statement delay as the statement returns, after it has; the close delay after the result has
+     * been read.
+     */
+    private record MetadataDelay(long poolNanos, long queryNanos, long closeNanos) {
+        static final MetadataDelay NONE = new MetadataDelay(0, 0, 0);
+
+        @NotNull
+        static MetadataDelay pool(long nanos) {
+            return new MetadataDelay(nanos, 0, 0);
+        }
+
+        @NotNull
+        static MetadataDelay query(long nanos) {
+            return new MetadataDelay(0, nanos, 0);
+        }
+
+        long total() {
+            return poolNanos + queryNanos + closeNanos;
         }
     }
 
