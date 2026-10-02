@@ -50,12 +50,14 @@ REQUIRED_VALUE = "true"
 #
 # The Slice 4a contract and regression-guard classes are here because they run scenarios against a real
 # PostgreSQL target; a skip there would silently drop platform guarantees that enforcement relies on.
+# DeploymentGuardTest holds and loses a real PostgreSQL advisory lock (DG-4, DG-5, DG-6, DG-13).
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest",
     "io.cloudbeaver.test.platform.dbac.DbacPlatformContractTest",
     "io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest",
+    "io.cloudbeaver.test.platform.dbac.DeploymentGuardTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -80,6 +82,8 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.DbacPlatformContractTest": 17,
     "io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest": 6,
     "io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest": 2,
+    "io.cloudbeaver.test.platform.dbac.EnforcementLifecycleTest": 18,
+    "io.cloudbeaver.test.platform.dbac.DeploymentGuardTest": 11,
 }
 
 for _postgres_class in POSTGRES_CLASSES:
