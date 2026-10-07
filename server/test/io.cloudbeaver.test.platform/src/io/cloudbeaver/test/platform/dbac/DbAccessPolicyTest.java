@@ -140,6 +140,14 @@ public class DbAccessPolicyTest {
     private final List<TempWritePermissionKey> touchedKeys = new ArrayList<>();
     private final List<String> touchedUsers = new ArrayList<>();
 
+    /** Owns every bounded metadata source this class makes, and shuts each down after the test */
+    private final MetadataLeaseFixture leases = new MetadataLeaseFixture();
+
+    @AfterEach
+    public void closeLeases() {
+        leases.close();
+    }
+
     @BeforeAll
     public static void startServer() throws Exception {
         CEAppStarter.startServerIfNotStarted();
@@ -614,7 +622,7 @@ public class DbAccessPolicyTest {
     public void anUnsupportedDatabaseKeepsItsKeyWithoutReadingTheStore() throws Exception {
         CountingSource source = new CountingSource();
         DbAccessPolicyService service = new DbAccessPolicyService(
-            source, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+            leases.of(source), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
 
         DBPDataSourceContainer oracle = PolicyTestSupport.builder(PROJECT, CONNECTION)
             .driver("oracle", "oracle_thin").build();
@@ -644,7 +652,7 @@ public class DbAccessPolicyTest {
     public void refusedCategoryHasNoKeyOrPayload() throws Exception {
         CountingSource source = new CountingSource();
         DbAccessPolicyService service = new DbAccessPolicyService(
-            source, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+            leases.of(source), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
 
         AuthorizationDecision decision = service.authorize(new WriteAuthorizationRequest(
             "someone", container(), DbOperationCategory.CONTAINER_READ, null, true));
@@ -785,7 +793,7 @@ public class DbAccessPolicyTest {
         ) {
             CountingSource source = new CountingSource();
             DbAccessPolicyService service = new DbAccessPolicyService(
-                source, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+                leases.of(source), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
 
             AuthorizationDecision viaProperties = service.authorize(request("someone",
                 PolicyTestSupport.builder(PROJECT, CONNECTION).property(key, "com.example.Redirect").build()));
@@ -897,10 +905,10 @@ public class DbAccessPolicyTest {
         cases.put("configuration accessor throws", service().authorize(request(user,
             PolicyTestSupport.builder(PROJECT, CONNECTION).configurationFails().build())));
         cases.put("clock throws an exception", new DbAccessPolicyService(
-            database::openConnection, DbAccessPolicyConfig.defaults(),
+            leases.of(database::openConnection), DbAccessPolicyConfig.defaults(),
             PolicyTestSupport.failingClock(false)).authorize(request(user, container())));
         cases.put("clock throws an Error", new DbAccessPolicyService(
-            database::openConnection, DbAccessPolicyConfig.defaults(),
+            leases.of(database::openConnection), DbAccessPolicyConfig.defaults(),
             PolicyTestSupport.failingClock(true)).authorize(request(user, container())));
 
         for (Map.Entry<String, AuthorizationDecision> one : cases.entrySet()) {
@@ -1154,7 +1162,7 @@ public class DbAccessPolicyTest {
     public void missingIdentityIsDeniedBeforeAnyLookup() throws Exception {
         CountingSource source = new CountingSource();
         DbAccessPolicyService service = new DbAccessPolicyService(
-            source, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+            leases.of(source), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
 
         for (String userId : new String[]{null, "", "   "}) {
             AuthorizationDecision decision = service.authorize(request(userId, container()));
@@ -1180,7 +1188,7 @@ public class DbAccessPolicyTest {
     public void theAnonymousProjectIsDeniedBeforeAnyLookup() throws Exception {
         CountingSource source = new CountingSource();
         DbAccessPolicyService service = new DbAccessPolicyService(
-            source, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+            leases.of(source), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
 
         String platformAnonymousId = RMUtils.createAnonymousProject().getId();
         Assertions.assertEquals(
@@ -1214,7 +1222,7 @@ public class DbAccessPolicyTest {
     public void brokenContainerIsDeniedBeforeAnyLookup() throws Exception {
         CountingSource source = new CountingSource();
         DbAccessPolicyService service = new DbAccessPolicyService(
-            source, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+            leases.of(source), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
 
         List<DBPDataSourceContainer> broken = List.of(
             PolicyTestSupport.builder(PROJECT, CONNECTION).withoutProject().build(),
@@ -1626,7 +1634,7 @@ public class DbAccessPolicyTest {
     public void unsupportedCategoriesAreDeniedBeforeAnyLookup() throws Exception {
         CountingSource source = new CountingSource();
         DbAccessPolicyService service = new DbAccessPolicyService(
-            source, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+            leases.of(source), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
 
         DbOperationCategory[] notGoverned = java.util.Arrays.stream(DbOperationCategory.values())
             .filter(one -> one.gate() == DbOperationCategory.Gate.NOT_WRITE_GATED)
@@ -1678,7 +1686,7 @@ public class DbAccessPolicyTest {
     public void rollbackIsAllowedWithoutAnyLookup() throws Exception {
         CountingSource source = new CountingSource();
         DbAccessPolicyService service = new DbAccessPolicyService(
-            source, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+            leases.of(source), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
 
         AuthorizationDecision decision = service.authorize(new WriteAuthorizationRequest(
             null, null, DbOperationCategory.TRANSACTION_ROLLBACK, null, false));
@@ -1692,7 +1700,7 @@ public class DbAccessPolicyTest {
     public void anUnsupportedTargetDatabaseIsDeniedBeforeAnyLookup() throws Exception {
         CountingSource source = new CountingSource();
         DbAccessPolicyService service = new DbAccessPolicyService(
-            source, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+            leases.of(source), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
 
         List<DBPDataSourceContainer> unsupported = List.of(
             PolicyTestSupport.builder(PROJECT, CONNECTION).driver("postgresql", "postgres-redshift-jdbc").build(),
@@ -1716,9 +1724,9 @@ public class DbAccessPolicyTest {
         grant(user, Duration.ofMinutes(30));
 
         DbAccessPolicyService service = new DbAccessPolicyService(
-            () -> {
+            leases.of(() -> {
                 throw new SQLException("Injected metadata outage", "08006");
-            },
+            }),
             DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
 
         AuthorizationDecision decision = service.authorize(request(user, container()));
@@ -1776,7 +1784,7 @@ public class DbAccessPolicyTest {
 
         CountingSource source = new CountingSource();
         DbAccessPolicyService service = new DbAccessPolicyService(
-            source, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+            leases.of(source), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
 
         Assertions.assertTrue(service.authorize(request(user, container())).isAllowed());
         revoke(user);
@@ -2495,7 +2503,7 @@ public class DbAccessPolicyTest {
         for (int failingRead = 1; failingRead <= 3; failingRead++) {
             String where = "a monotonic clock failing from read " + failingRead;
             DbAccessPolicyService service = new DbAccessPolicyService(
-                marginSource(MARGIN_AFTER_SCHEMA), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock(),
+                leases.of(marginSource(MARGIN_AFTER_SCHEMA)), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock(),
                 new FailingNanoClock(BASE, failingRead));
             DbAccessPolicyService.ExpiryWindow window;
             try {
@@ -2536,7 +2544,7 @@ public class DbAccessPolicyTest {
             3, List.of("AUTHORIZE an allow", "CHECK_1 an allow", "CHECK_2 threw", "CHECK_2 again " + REFUSED));
         for (int failingRead = 2; failingRead <= 3; failingRead++) {
             DbAccessPolicyService.ExpiryWindow window = new DbAccessPolicyService(
-                marginSource(MARGIN_AFTER_SCHEMA), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock(),
+                leases.of(marginSource(MARGIN_AFTER_SCHEMA)), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock(),
                 FailingNanoClock.once(BASE, failingRead)).openExpiryWindow();
             List<String> outcomes = new ArrayList<>();
             for (Call next : order) {
@@ -2564,12 +2572,12 @@ public class DbAccessPolicyTest {
     @NotNull
     private DbAccessPolicyService service() {
         return new DbAccessPolicyService(
-            database::openConnection, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+            leases.of(database::openConnection), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
     }
 
     @NotNull
     private AuthorizationDecision authorizeWithClock(@NotNull String user, @NotNull Clock clock) {
-        return new DbAccessPolicyService(database::openConnection, DbAccessPolicyConfig.defaults(), clock)
+        return new DbAccessPolicyService(leases.of(database::openConnection), DbAccessPolicyConfig.defaults(), clock)
             .authorize(request(user, container()));
     }
 
@@ -2688,8 +2696,8 @@ public class DbAccessPolicyTest {
     @NotNull
     private DbAccessPolicyService boundaryService(@NotNull String target) {
         return new DbAccessPolicyService(
-            () -> new InternalProxyConnection(
-                database.openConnection(), DbacTestSupport.config(database.getDatabaseConfig(), target)),
+            leases.of(() -> new InternalProxyConnection(
+                database.openConnection(), DbacTestSupport.config(database.getDatabaseConfig(), target))),
             DbAccessPolicyConfig.defaults(),
             PolicyTestSupport.systemClock());
     }
@@ -2803,7 +2811,7 @@ public class DbAccessPolicyTest {
             monotonic.advance(delay.poolNanos());
             return delaying(plain.openConnection(), monotonic, delay);
         };
-        return new DbAccessPolicyService(source, DbAccessPolicyConfig.defaults(), localClock, monotonic);
+        return new DbAccessPolicyService(leases.of(source), DbAccessPolicyConfig.defaults(), localClock, monotonic);
     }
 
     /**

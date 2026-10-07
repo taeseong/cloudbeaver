@@ -25,7 +25,7 @@ import java.time.Duration;
 /**
  * The numbers the policy core is allowed to be configured with
  * <p>
- * Two limits, and three timings for the expiry window:
+ * Two limits, three timings for the expiry window, and the snapshot's own bound:
  * <ul>
  *   <li>{@code clockSkewThreshold} - how far this node's clock may drift from the database's</li>
  *   <li>{@code maxGrantDuration} - the longest a single TEMP_WRITE grant may run</li>
@@ -35,6 +35,9 @@ import java.time.Duration;
  *       check-1 reserves it: {@code T_audit + δ} must be left before the audit starts</li>
  *   <li>{@code keyLockTimeout} ({@code T_k}) - how long an enforcement point waits for a grant or
  *       user lock before refusing. Nothing waits on one yet; the key locks come in a later slice</li>
+ *   <li>{@code snapshotTimeout} ({@code T_s}) - how long the authorization snapshot may take in total,
+ *       waiting for a metadata connection included. It is not part of any margin: it bounds how long
+ *       the locks around the decision are held, and a snapshot that takes longer is not acted on</li>
  * </ul>
  * {@code T_audit + δ} is the tail of every grant in which no write can start. A grant no longer
  * than that can be issued but never used, and nothing here prevents issuing one: the API that
@@ -49,7 +52,7 @@ import java.time.Duration;
  * <p>
  * <b>A bad setting never disables a check.</b> That holds on both routes in, by different means.
  * {@link #sanitized} is the route for external configuration: zero, negative, absurd and missing all
- * become the documented default there, so a typo in a config file cannot turn a guard off. The three
+ * become the documented default there, so a typo in a config file cannot turn a guard off. The four
  * timings have no external binding yet, so the sanitizer takes no parameter for them and gives them
  * their defaults. The
  * canonical constructor is the route for code, and it <b>throws</b> on the same values rather than
@@ -61,7 +64,8 @@ public record DbAccessPolicyConfig(
     @NotNull Duration maxGrantDuration,
     @NotNull Duration expiryGuardMargin,
     @NotNull Duration auditTimeout,
-    @NotNull Duration keyLockTimeout
+    @NotNull Duration keyLockTimeout,
+    @NotNull Duration snapshotTimeout
 ) {
     private static final Log log = Log.getLog(DbAccessPolicyConfig.class);
 
@@ -102,6 +106,14 @@ public record DbAccessPolicyConfig(
     public static final Duration DEFAULT_KEY_LOCK_TIMEOUT = Duration.ofSeconds(5);
 
     /**
+     * {@code T_s}: two seconds for the authorization snapshot, borrow and statement together
+     * <p>
+     * One indexed round trip, the same size as {@code T_audit}. A whole number of seconds, because what
+     * is left of it becomes a JDBC query timeout.
+     */
+    public static final Duration DEFAULT_SNAPSHOT_TIMEOUT = Duration.ofSeconds(2);
+
+    /**
      * An upper bound on the skew threshold itself
      * <p>
      * Without this, a setting of one day would make the skew guard meaningless while still looking
@@ -123,6 +135,7 @@ public record DbAccessPolicyConfig(
     private static final Duration MAX_SENSIBLE_EXPIRY_GUARD_MARGIN = Duration.ofSeconds(30);
     private static final Duration MAX_SENSIBLE_AUDIT_TIMEOUT = Duration.ofSeconds(30);
     private static final Duration MAX_SENSIBLE_KEY_LOCK_TIMEOUT = Duration.ofSeconds(60);
+    private static final Duration MAX_SENSIBLE_SNAPSHOT_TIMEOUT = Duration.ofSeconds(30);
 
     /**
      * Rejects every value the sanitizer would have replaced
@@ -140,7 +153,8 @@ public record DbAccessPolicyConfig(
      * <p>
      * The audit timeout must also be a whole number of seconds, which with the rule above means at
      * least one. It becomes a JDBC query timeout, an int of seconds, so a fraction could only be
-     * rounded - and a rounded timeout is not the one check-1's margin was computed from.
+     * rounded - and a rounded timeout is not the one check-1's margin was computed from. The snapshot
+     * timeout follows the same rule, for the same reason.
      */
     public DbAccessPolicyConfig {
         requireInRange(clockSkewThreshold, MAX_SENSIBLE_SKEW, "clock skew threshold");
@@ -153,6 +167,25 @@ public record DbAccessPolicyConfig(
                     + "; it becomes a JDBC query timeout, which counts in seconds");
         }
         requireInRange(keyLockTimeout, MAX_SENSIBLE_KEY_LOCK_TIMEOUT, "key lock timeout");
+        requireInRange(snapshotTimeout, MAX_SENSIBLE_SNAPSHOT_TIMEOUT, "snapshot timeout");
+        if (snapshotTimeout.getNano() != 0) {
+            throw new IllegalArgumentException(
+                "The snapshot timeout must be a whole number of seconds, got " + snapshotTimeout
+                    + "; it becomes a JDBC query timeout, which counts in seconds");
+        }
+    }
+
+    /**
+     * The same, with the default snapshot timeout
+     */
+    public DbAccessPolicyConfig(
+        @NotNull Duration clockSkewThreshold,
+        @NotNull Duration maxGrantDuration,
+        @NotNull Duration expiryGuardMargin,
+        @NotNull Duration auditTimeout,
+        @NotNull Duration keyLockTimeout
+    ) {
+        this(clockSkewThreshold, maxGrantDuration, expiryGuardMargin, auditTimeout, keyLockTimeout, DEFAULT_SNAPSHOT_TIMEOUT);
     }
 
     private static void requireInRange(
@@ -177,7 +210,7 @@ public record DbAccessPolicyConfig(
     public static DbAccessPolicyConfig defaults() {
         return new DbAccessPolicyConfig(
             DEFAULT_CLOCK_SKEW_THRESHOLD, DEFAULT_MAX_GRANT_DURATION,
-            DEFAULT_EXPIRY_GUARD_MARGIN, DEFAULT_AUDIT_TIMEOUT, DEFAULT_KEY_LOCK_TIMEOUT);
+            DEFAULT_EXPIRY_GUARD_MARGIN, DEFAULT_AUDIT_TIMEOUT, DEFAULT_KEY_LOCK_TIMEOUT, DEFAULT_SNAPSHOT_TIMEOUT);
     }
 
     /**
@@ -185,7 +218,7 @@ public record DbAccessPolicyConfig(
      * <p>
      * Every rejected value is logged with what it was and what replaced it, because a silent
      * substitution is how an operator ends up believing a limit is in force that is not. The expiry
-     * margin, audit timeout and key lock timeout are always their defaults here.
+     * margin, audit timeout, key lock timeout and snapshot timeout are always their defaults here.
      *
      * @param skewSeconds seconds, or null when unset
      * @param maxGrantMinutes minutes, or null when unset
@@ -202,7 +235,8 @@ public record DbAccessPolicyConfig(
             maxGrantMinutes == null ? null : Duration.ofMinutes(maxGrantMinutes),
             DEFAULT_MAX_GRANT_DURATION, MAX_SENSIBLE_GRANT_DURATION, "maximum grant duration");
         return new DbAccessPolicyConfig(
-            skew, grant, DEFAULT_EXPIRY_GUARD_MARGIN, DEFAULT_AUDIT_TIMEOUT, DEFAULT_KEY_LOCK_TIMEOUT);
+            skew, grant, DEFAULT_EXPIRY_GUARD_MARGIN, DEFAULT_AUDIT_TIMEOUT, DEFAULT_KEY_LOCK_TIMEOUT,
+            DEFAULT_SNAPSHOT_TIMEOUT);
     }
 
     @NotNull

@@ -33,6 +33,7 @@ import io.cloudbeaver.service.dbac.tempwrite.TempWritePermissionKey;
 import io.cloudbeaver.service.dbac.tempwrite.TempWriteRequestLimits;
 import io.cloudbeaver.service.dbac.tempwrite.TempWriteRevokeRequest;
 import org.jkiss.code.NotNull;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -74,6 +75,14 @@ public class DbAccessPolicyModelTest {
 
     /** The user the snapshot-row cases decide about; the project and connection come from the container */
     private static final String ROW_USER = "row-user";
+
+    /** Owns every bounded metadata source this class makes, and shuts each down after the test */
+    private final MetadataLeaseFixture leases = new MetadataLeaseFixture();
+
+    @AfterEach
+    public void closeLeases() {
+        leases.close();
+    }
 
     // ---------------------------------------------------------------- supported target databases
 
@@ -539,9 +548,9 @@ public class DbAccessPolicyModelTest {
             "an absurd external value becomes the default rather than being honoured");
         Assertions.assertThrows(IllegalArgumentException.class,
             () -> new DbAccessPolicyService(
-                () -> {
+                leases.of(() -> {
                     throw new UnsupportedOperationException("no connection should be needed");
-                },
+                }),
                 new DbAccessPolicyConfig(
                     Duration.ofDays(365), Duration.ofDays(365),
                     DbAccessPolicyConfig.DEFAULT_EXPIRY_GUARD_MARGIN, DbAccessPolicyConfig.DEFAULT_AUDIT_TIMEOUT,
@@ -1135,12 +1144,12 @@ public class DbAccessPolicyModelTest {
      * the monotonic clock throws if it is read.
      */
     @NotNull
-    private static AuthorizationDecision authorizeAgainstRow(
+    private AuthorizationDecision authorizeAgainstRow(
         @NotNull OffsetDateTime dbNow,
         @NotNull OffsetDateTime expiresAt
     ) {
         DbAccessPolicyService service = new DbAccessPolicyService(
-            () -> snapshotConnection(dbNow, expiresAt),
+            leases.of(() -> snapshotConnection(dbNow, expiresAt)),
             DbAccessPolicyConfig.defaults(),
             Clock.fixed(dbNow.toInstant().plusSeconds(4), ZoneOffset.UTC),
             () -> {
@@ -1161,6 +1170,10 @@ public class DbAccessPolicyModelTest {
      * the two timestamps say - the flag is the statement's verdict and the timestamps are its
      * inputs, and this is the one place they can be made to disagree. Anything the policy core did
      * not ask for before is refused loudly, so a new read shows up here rather than as a silent null.
+     * <p>
+     * The metadata lease added four calls, each answered here on purpose: the statement's query
+     * timeout is read and set, {@code wasNull} follows the integer read, and the timeout is put back
+     * on a statement of its own.
      */
     @NotNull
     private static Connection snapshotConnection(@NotNull OffsetDateTime dbNow, @NotNull OffsetDateTime expiresAt) {
@@ -1180,6 +1193,7 @@ public class DbAccessPolicyModelTest {
         row.put("DATABASE_SNAPSHOT", stored.database());
         row.put("NOT_EXPIRED", 1);
         boolean[] consumed = {false};
+        boolean[] lastWasNull = {false};
         ResultSet result = jdbcProxy(ResultSet.class, (proxy, method, args) -> switch (method.getName()) {
             case "next" -> {
                 boolean first = !consumed[0];
@@ -1190,19 +1204,28 @@ public class DbAccessPolicyModelTest {
                 if (!row.containsKey((String) args[0])) {
                     throw new UnsupportedOperationException("the fake row has no column " + args[0]);
                 }
-                yield row.get((String) args[0]);
+                Object value = row.get((String) args[0]);
+                lastWasNull[0] = value == null;
+                yield value;
             }
+            case "wasNull" -> lastWasNull[0];
             case "close" -> null;
             default -> throw new UnsupportedOperationException("ResultSet." + method.getName());
         });
         PreparedStatement statement = jdbcProxy(PreparedStatement.class, (proxy, method, args) -> switch (method.getName()) {
-            case "setString", "close" -> null;
+            case "setString", "setQueryTimeout", "close" -> null;
+            case "getQueryTimeout" -> 0;
             case "executeQuery" -> result;
             default -> throw new UnsupportedOperationException("PreparedStatement." + method.getName());
+        });
+        java.sql.Statement restore = jdbcProxy(java.sql.Statement.class, (proxy, method, args) -> switch (method.getName()) {
+            case "setQueryTimeout", "close" -> null;
+            default -> throw new UnsupportedOperationException("Statement." + method.getName());
         });
         return jdbcProxy(Connection.class, (proxy, method, args) -> switch (method.getName()) {
             case "getAutoCommit" -> true;
             case "prepareStatement" -> statement;
+            case "createStatement" -> restore;
             case "close" -> null;
             default -> throw new UnsupportedOperationException("Connection." + method.getName());
         });

@@ -53,6 +53,8 @@ REQUIRED_VALUE = "true"
 # DeploymentGuardTest holds and loses a real PostgreSQL advisory lock (DG-4, DG-5, DG-6, DG-13).
 # The P4 lock classes run their grant-key races on PostgreSQL as well as H2, check user writers against
 # a real PostgreSQL target's locks, and characterize PostgreSQL's identity comparison.
+# MetadataLeasePostgresTest runs the P5-1a lease template on a real pgjdbc connection: the query timeout
+# belongs to the statement there, a timed-out statement is cancelled, and an abort really closes.
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
@@ -63,6 +65,7 @@ POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest",
     "io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest",
     "io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest",
+    "io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -92,6 +95,12 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest": 13,
     "io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest": 14,
     "io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest": 3,
+    "io.cloudbeaver.test.platform.dbac.MetadataLeaseTest": 21,
+    "io.cloudbeaver.test.platform.dbac.BoundedBorrowTest": 16,
+    "io.cloudbeaver.test.platform.dbac.MetadataDisposalTest": 19,
+    "io.cloudbeaver.test.platform.dbac.MetadataShutdownTest": 22,
+    "io.cloudbeaver.test.platform.dbac.MetadataDeadlineTest": 10,
+    "io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest": 3,
 }
 
 for _postgres_class in POSTGRES_CLASSES:

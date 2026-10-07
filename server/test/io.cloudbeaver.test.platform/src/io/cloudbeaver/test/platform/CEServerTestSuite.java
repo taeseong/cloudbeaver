@@ -26,6 +26,7 @@ import io.cloudbeaver.model.session.WebSessionTest;
 import io.cloudbeaver.service.dbac.policy.enforcement.DeploymentGuard;
 import io.cloudbeaver.test.platform.admin.AdminCreateUserTest;
 import io.cloudbeaver.test.platform.admin.AdminLastLoginTimeTest;
+import io.cloudbeaver.test.platform.dbac.BoundedBorrowTest;
 import io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest;
 import io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest;
 import io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest;
@@ -41,6 +42,11 @@ import io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest;
 import io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest;
 import io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest;
 import io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest;
+import io.cloudbeaver.test.platform.dbac.MetadataDeadlineTest;
+import io.cloudbeaver.test.platform.dbac.MetadataDisposalTest;
+import io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest;
+import io.cloudbeaver.test.platform.dbac.MetadataLeaseTest;
+import io.cloudbeaver.test.platform.dbac.MetadataShutdownTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteModelTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest;
@@ -90,7 +96,13 @@ import org.junit.platform.suite.api.Suite;
         DeploymentGuardTest.class,
         GrantRevokeRaceTest.class,
         UserDeactivationRaceTest.class,
-        LockIdentityCharacterizationTest.class
+        LockIdentityCharacterizationTest.class,
+        MetadataLeaseTest.class,
+        BoundedBorrowTest.class,
+        MetadataDisposalTest.class,
+        MetadataShutdownTest.class,
+        MetadataDeadlineTest.class,
+        MetadataLeasePostgresTest.class
     }
 )
 public class CEServerTestSuite {

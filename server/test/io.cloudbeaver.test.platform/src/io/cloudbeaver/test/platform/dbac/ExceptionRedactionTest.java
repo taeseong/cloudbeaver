@@ -29,6 +29,7 @@ import org.jkiss.dbeaver.Log;
 import org.jkiss.dbeaver.model.DBPDataSourceContainer;
 import org.jkiss.dbeaver.model.app.DBPDataSourceRegistry;
 import org.jkiss.dbeaver.model.app.DBPProject;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -111,6 +112,14 @@ public class ExceptionRedactionTest {
 
     private static final Log log = Log.getLog(ExceptionRedactionTest.class);
 
+    /** Owns every bounded metadata source this class makes, and shuts each down after the test */
+    private final MetadataLeaseFixture leases = new MetadataLeaseFixture();
+
+    @AfterEach
+    public void closeLeases() {
+        leases.close();
+    }
+
     @BeforeAll
     public static void startServer() throws Exception {
         CEAppStarter.startServerIfNotStarted();
@@ -127,9 +136,9 @@ public class ExceptionRedactionTest {
         String message = "Connection to jdbc:postgresql://metadata.internal.invalid:5432/cb?user=cbadmin&password="
             + MARKER_F10 + " refused";
         List<String> fragments = List.of("jdbc:postgresql://", "metadata.internal.invalid", "user=cbadmin", "password=", MARKER_F10);
-        DbAccessPolicyService service = new DbAccessPolicyService(() -> {
+        DbAccessPolicyService service = new DbAccessPolicyService(leases.of(() -> {
             throw new SQLException(message);
-        }, DbAccessPolicyConfig.defaults());
+        }), DbAccessPolicyConfig.defaults());
 
         Captured first = authorizeCapturing(service, USER, PolicyTestSupport.container(PROJECT, CONNECTION, HOST, DATABASE));
         Captured second = authorizeCapturing(service, USER, PolicyTestSupport.container(PROJECT, CONNECTION, HOST, DATABASE));
@@ -169,9 +178,9 @@ public class ExceptionRedactionTest {
         String message = "driver accessor failed for jdbc:postgresql://target.internal.invalid:5432/prod user=admin password="
             + MARKER_F11;
         List<String> fragments = List.of("jdbc:postgresql://", "target.internal.invalid", "user=admin", "password=", MARKER_F11);
-        DbAccessPolicyService service = new DbAccessPolicyService(() -> {
+        DbAccessPolicyService service = new DbAccessPolicyService(leases.of(() -> {
             throw new SQLException("F11 must fail before the permission store is read");
-        }, DbAccessPolicyConfig.defaults());
+        }), DbAccessPolicyConfig.defaults());
 
         Captured first = authorizeCapturing(service, USER, failingContainer(PROJECT, CONNECTION, message));
         Captured second = authorizeCapturing(service, USER, failingContainer(PROJECT, CONNECTION, message));

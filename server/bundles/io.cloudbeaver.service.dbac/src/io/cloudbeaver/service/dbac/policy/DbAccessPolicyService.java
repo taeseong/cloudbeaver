@@ -17,7 +17,6 @@
 package io.cloudbeaver.service.dbac.policy;
 
 import io.cloudbeaver.service.dbac.tempwrite.EndpointSnapshot;
-import io.cloudbeaver.service.dbac.tempwrite.MetadataConnectionSource;
 import org.jkiss.code.NotNull;
 import org.jkiss.code.Nullable;
 import org.jkiss.dbeaver.Log;
@@ -25,7 +24,6 @@ import org.jkiss.dbeaver.model.DBPDataSourceContainer;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.sql.Connection;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.OffsetDateTime;
@@ -59,6 +57,12 @@ import java.util.function.LongSupplier;
  * <b>Nothing calls this yet.</b> No production path invokes {@code authorize} or
  * {@code openExpiryWindow}. Until an enforcement point does, a running server behaves exactly as it
  * did before: this class decides nothing that anybody acts on.
+ * <p>
+ * <b>The snapshot is bounded.</b> It is read through a {@link MetadataLeaseSource}, within a budget
+ * of {@code T_s} that covers waiting for a connection and running the statement together. A snapshot
+ * that cannot be had within it is the same answer as an outage. The budget is measured on its own
+ * monotonic clock, never on the one the expiry window counts with: authorize still does not read
+ * that one.
  */
 public final class DbAccessPolicyService {
 
@@ -71,7 +75,15 @@ public final class DbAccessPolicyService {
     /** Stands in for the key when the failure came before identity was resolved */
     private static final String KEY_UNRESOLVED = "<unresolved>";
 
-    private final MetadataConnectionSource connectionSource;
+    /**
+     * What the snapshot budget is measured on
+     * <p>
+     * Not {@code monotonicClock}: that one belongs to the expiry window, which counts the snapshot's
+     * time from outside, and authorize must not read it.
+     */
+    private static final LongSupplier BUDGET_CLOCK = System::nanoTime;
+
+    private final MetadataLeaseSource leases;
     private final DbAccessPolicyConfig config;
     private final Clock localClock;
     private final LongSupplier monotonicClock;
@@ -79,9 +91,10 @@ public final class DbAccessPolicyService {
     /**
      * Builds a service that takes every fact it decides on from the metadata database
      *
-     * @param connectionSource where a metadata connection comes from. Must hand out connections from
-     *     {@code CBDatabase.openConnection()} so that {@code {table_prefix}} is substituted and the
-     *     connection is in auto-commit.
+     * @param leases where a metadata lease comes from. In production the metadata database's own
+     *     bounded source, which wraps {@code CBDatabase.openConnection()} so that
+     *     {@code {table_prefix}} is substituted and the connection is in auto-commit. A service never
+     *     owns it: whoever made the source shuts it down.
      * @param localClock this node's clock. Used <b>only</b> to measure how far it has drifted from
      *     the database's, never to decide whether a grant has expired or how long it has left.
      * @param monotonicClock a monotonic nanosecond counter, {@code System::nanoTime} in production.
@@ -89,12 +102,12 @@ public final class DbAccessPolicyService {
      *     read by {@code authorize}.
      */
     public DbAccessPolicyService(
-        @NotNull MetadataConnectionSource connectionSource,
+        @NotNull MetadataLeaseSource leases,
         @NotNull DbAccessPolicyConfig config,
         @NotNull Clock localClock,
         @NotNull LongSupplier monotonicClock
     ) {
-        this.connectionSource = connectionSource;
+        this.leases = leases;
         this.config = config;
         this.localClock = localClock;
         this.monotonicClock = monotonicClock;
@@ -104,18 +117,21 @@ public final class DbAccessPolicyService {
      * The same, measuring elapsed time with {@code System::nanoTime}
      */
     public DbAccessPolicyService(
-        @NotNull MetadataConnectionSource connectionSource,
+        @NotNull MetadataLeaseSource leases,
         @NotNull DbAccessPolicyConfig config,
         @NotNull Clock localClock
     ) {
-        this(connectionSource, config, localClock, System::nanoTime);
+        this(leases, config, localClock, System::nanoTime);
     }
 
+    /**
+     * The same, on the system clocks
+     */
     public DbAccessPolicyService(
-        @NotNull MetadataConnectionSource connectionSource,
+        @NotNull MetadataLeaseSource leases,
         @NotNull DbAccessPolicyConfig config
     ) {
-        this(connectionSource, config, Clock.systemUTC(), System::nanoTime);
+        this(leases, config, Clock.systemUTC(), System::nanoTime);
     }
 
     /**
@@ -131,7 +147,8 @@ public final class DbAccessPolicyService {
      *   <li>The category must be one this gate authorizes</li>
      *   <li>Identity and container: user, project, connection, not anonymous, still in the registry</li>
      *   <li>The target database must be PostgreSQL or MySQL</li>
-     *   <li>One metadata statement: clock, user, grant, revocation, expiry, snapshot</li>
+     *   <li>One metadata statement: clock, user, grant, revocation, expiry, snapshot - within
+     *       {@code T_s}, borrow included</li>
      *   <li>The user must exist and be active</li>
      *   <li>A current grant must exist</li>
      *   <li>It must not have expired, by the database's own comparison</li>
@@ -213,13 +230,26 @@ public final class DbAccessPolicyService {
                 return AuthorizationDecision.deny(endpoint.failure(), key, category, null, null);
             }
 
-            // 6. One statement, one linearization point.
+            // 6. One statement, one linearization point, within T_s.
             PolicySnapshot snapshot;
-            try (Connection connection = connectionSource.openConnection()) {
-                snapshot = PolicySnapshotRepository.read(connection, key);
-            } catch (Exception e) {
-                // Every failure to read is the same answer. An outage must never be mistaken for
-                // "this user has no grant", so it is not allowed to fall through to step 7.
+            try {
+                MetadataBudget budget = MetadataBudget.startingNow(BUDGET_CLOCK, config.snapshotTimeout());
+                PolicySnapshotRepository.SnapshotRead read = PolicySnapshotRepository.read(leases, budget, key);
+                if (read instanceof PolicySnapshotRepository.SnapshotRead.Unusable unusable) {
+                    // Every failure to read is the same answer. An outage must never be mistaken for
+                    // "this user has no grant", so it is not allowed to fall through to step 7.
+                    logFailure(EVENT_STORE_READ_FAILED, "DBAC could not read the permission store", key,
+                        null, unusable.cause().name());
+                    return AuthorizationDecision.deny(
+                        DenialReason.PERMISSION_STORE_UNAVAILABLE, key, category, null, null);
+                }
+                snapshot = ((PolicySnapshotRepository.SnapshotRead.Read) read).snapshot();
+            } catch (MetadataUnavailableException e) {
+                logFailure(EVENT_STORE_READ_FAILED, "DBAC could not read the permission store", key,
+                    e.failureClass(), e.reason().name());
+                return AuthorizationDecision.deny(
+                    DenialReason.PERMISSION_STORE_UNAVAILABLE, key, category, null, null);
+            } catch (RuntimeException e) {
                 logFailure(EVENT_STORE_READ_FAILED, "DBAC could not read the permission store", key, e);
                 return AuthorizationDecision.deny(
                     DenialReason.PERMISSION_STORE_UNAVAILABLE, key, category, null, null);
@@ -326,13 +356,31 @@ public final class DbAccessPolicyService {
         @Nullable DbAccessKey key,
         @NotNull Throwable failure
     ) {
+        logFailure(eventCode, summary, key, failure.getClass().getName(), null);
+    }
+
+    /**
+     * The same, for a failure known by a class name and a fixed detail rather than by an exception object
+     * <p>
+     * A failed borrow reaches here as the class name of what failed on the worker; an unusable lease
+     * result as no class and the step that failed. The detail is an enum constant name, never
+     * anything read from the failure.
+     */
+    private static void logFailure(
+        @NotNull String eventCode,
+        @NotNull String summary,
+        @Nullable DbAccessKey key,
+        @Nullable String exceptionClass,
+        @Nullable String detail
+    ) {
         try {
             String keyText = key == null
                 ? KEY_UNRESOLVED
                 : logSafe(key.userId()) + "/" + logSafe(key.projectId()) + "/" + logSafe(key.connectionId());
             log.error(summary + " [event=" + eventCode
                 + " EVENT_ID=" + UUID.randomUUID()
-                + " exception=" + failure.getClass().getName()
+                + (exceptionClass == null ? "" : " exception=" + exceptionClass)
+                + (detail == null ? "" : " detail=" + detail)
                 + " key=" + keyText + "]");
         } catch (RuntimeException | Error ignored) {
             // Deliberately nothing: the decision must not depend on whether it could be logged.

@@ -131,6 +131,14 @@ public class DbAccessPolicyPostgresTest {
 
     private final List<String> touchedUsers = new ArrayList<>();
 
+    /** Owns every bounded metadata source this class makes, and shuts each down after the test */
+    private final MetadataLeaseFixture leases = new MetadataLeaseFixture();
+
+    @AfterEach
+    public void closeLeases() {
+        leases.close();
+    }
+
     @BeforeAll
     public static void prepareSchema() throws Exception {
         available = probe();
@@ -546,9 +554,9 @@ public class DbAccessPolicyPostgresTest {
         putGrant(user, Duration.ofMinutes(30), false);
 
         DbAccessPolicyService service = new DbAccessPolicyService(
-            () -> {
+            leases.of(() -> {
                 throw new SQLException("Injected metadata outage", "08006");
-            },
+            }),
             DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
         assertDenied(
             service.authorize(request(user, container())), DenialReason.PERMISSION_STORE_UNAVAILABLE);
@@ -587,7 +595,7 @@ public class DbAccessPolicyPostgresTest {
             return PrefixingConnection.wrap(raw, schema + ".");
         };
         DbAccessPolicyService service = new DbAccessPolicyService(
-            inTransaction, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+            leases.of(inTransaction), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
         assertDenied(
             service.authorize(request(user, container())), DenialReason.PERMISSION_STORE_UNAVAILABLE);
     }
@@ -720,7 +728,7 @@ public class DbAccessPolicyPostgresTest {
             return PrefixingConnection.wrap(raw, target + ".");
         };
         return new DbAccessPolicyService(
-            source, DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
+            leases.of(source), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock());
     }
 
     /**
@@ -739,7 +747,7 @@ public class DbAccessPolicyPostgresTest {
             }
             return PrefixingConnection.wrap(raw, marginSchema + ".");
         };
-        return new DbAccessPolicyService(source, DbAccessPolicyConfig.defaults(), localClock, monotonic);
+        return new DbAccessPolicyService(leases.of(source), DbAccessPolicyConfig.defaults(), localClock, monotonic);
     }
 
     /**

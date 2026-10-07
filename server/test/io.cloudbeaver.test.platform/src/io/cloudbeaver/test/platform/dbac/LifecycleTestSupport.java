@@ -355,7 +355,7 @@ final class LifecycleTestSupport {
             calls.incrementAndGet();
             journal.add("service");
             raise(fault, "service", journal);
-            return new DbAccessPolicyService(database::openConnection, DbAccessPolicyConfig.defaults());
+            return new DbAccessPolicyService(database.metadataLeases(), DbAccessPolicyConfig.defaults());
         }
     }
 

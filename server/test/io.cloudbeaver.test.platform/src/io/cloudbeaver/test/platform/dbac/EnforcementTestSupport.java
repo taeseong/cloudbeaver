@@ -24,11 +24,13 @@ import io.cloudbeaver.model.WebConnectionInfo;
 import io.cloudbeaver.model.session.BaseWebSession;
 import io.cloudbeaver.model.session.WebSession;
 import io.cloudbeaver.server.WebAppUtils;
+import io.cloudbeaver.service.dbac.db.DbacCBDatabase;
 import io.cloudbeaver.service.dbac.policy.AuthorizationDecision;
 import io.cloudbeaver.service.dbac.policy.DbAccessPolicyConfig;
 import io.cloudbeaver.service.dbac.policy.DbAccessPolicyService;
 import io.cloudbeaver.service.dbac.policy.DbOperationCategory;
 import io.cloudbeaver.service.dbac.policy.DenialReason;
+import io.cloudbeaver.service.dbac.policy.MetadataLeaseSource;
 import io.cloudbeaver.service.dbac.policy.WriteAuthorizationRequest;
 import io.cloudbeaver.service.dbac.tempwrite.EndpointSnapshot;
 import io.cloudbeaver.service.dbac.tempwrite.TempWriteGrant;
@@ -494,6 +496,15 @@ final class EnforcementTestSupport {
         return database;
     }
 
+    /**
+     * The server metadata database's own leases, which production builds the policy service on
+     */
+    @NotNull
+    static MetadataLeaseSource metadataLeases() {
+        return Assertions.assertInstanceOf(DbacCBDatabase.class, metadata(),
+            "FIXTURE: the server metadata database must be the DBAC one").metadataLeases();
+    }
+
     static void grant(@NotNull TempWritePermissionKey key) throws Exception {
         long observed;
         try (Connection connection = metadata().openConnection()) {
@@ -637,7 +648,7 @@ final class EnforcementTestSupport {
      */
     @NotNull
     static AuthorizationDecision decide(@NotNull Target target, @NotNull DbOperationCategory category) {
-        return new DbAccessPolicyService(metadata()::openConnection, DbAccessPolicyConfig.defaults())
+        return new DbAccessPolicyService(metadataLeases(), DbAccessPolicyConfig.defaults())
             .authorize(WriteAuthorizationRequest.of(target.subject.userId(), target.container, category));
     }
 

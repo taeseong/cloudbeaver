@@ -307,7 +307,7 @@ public class DbacSecurityControllerFactory<T extends ServletAuthApplication>
             (database, revocation) -> guard.admit(DeploymentGuard.MetadataTarget.of(database), revocation),
             TaintContextCloseHandler.HandlerRegistrar.QUERY_MANAGER,
             TaintContextCloseHandler.TaintSink.NONE,
-            database -> new DbAccessPolicyService(database::openConnection, DbAccessPolicyConfig.defaults())
+            database -> new DbAccessPolicyService(database.metadataLeases(), DbAccessPolicyConfig.defaults())
         );
     }
 }
