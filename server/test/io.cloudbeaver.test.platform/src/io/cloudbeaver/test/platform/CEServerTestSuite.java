@@ -39,9 +39,12 @@ import io.cloudbeaver.test.platform.dbac.DeploymentGuardTest;
 import io.cloudbeaver.test.platform.dbac.EnforcementLifecycleTest;
 import io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest;
 import io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest;
+import io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest;
+import io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteModelTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest;
+import io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest;
 import io.cloudbeaver.test.platform.sql.*;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -84,7 +87,10 @@ import org.junit.platform.suite.api.Suite;
         EnforcementRegressionGuardTest.class,
         ExceptionRedactionTest.class,
         EnforcementLifecycleTest.class,
-        DeploymentGuardTest.class
+        DeploymentGuardTest.class,
+        GrantRevokeRaceTest.class,
+        UserDeactivationRaceTest.class,
+        LockIdentityCharacterizationTest.class
     }
 )
 public class CEServerTestSuite {

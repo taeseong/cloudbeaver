@@ -30,11 +30,13 @@ import io.cloudbeaver.service.dbac.policy.DbAccessPolicyConfig;
 import io.cloudbeaver.service.dbac.policy.DbAccessPolicyService;
 import io.cloudbeaver.service.dbac.policy.enforcement.DeploymentGuard;
 import io.cloudbeaver.service.dbac.policy.enforcement.TaintContextCloseHandler;
+import io.cloudbeaver.service.security.CBEmbeddedSecurityController;
 import io.cloudbeaver.service.security.EmbeddedSecurityControllerFactory;
 import io.cloudbeaver.service.security.db.CBDatabase;
 import org.jkiss.code.NotNull;
 import org.jkiss.code.Nullable;
 import org.jkiss.dbeaver.DBException;
+import org.jkiss.dbeaver.model.auth.SMCredentialsProvider;
 
 /**
  * Security controller factory which registers the fork-owned DBAC schema and starts the DBAC policy service
@@ -61,6 +63,11 @@ import org.jkiss.dbeaver.DBException;
  * </ol>
  * An {@code Error} in step 3 releases what was acquired, closes the database and rethrows the same
  * {@code Error}. A failure while cleaning up never replaces the original throwable.
+ * <p>
+ * Every embedded security controller this factory builds is a {@link DbacEmbeddedSecurityController},
+ * which takes the DBAC user lock around deactivation, deletion and team deletion. That includes the
+ * database's own admin controller, which the upstream factory builds through the same method while the
+ * database is being initialized.
  */
 public class DbacSecurityControllerFactory<T extends ServletAuthApplication>
     extends EmbeddedSecurityControllerFactory<T> {
@@ -189,6 +196,22 @@ public class DbacSecurityControllerFactory<T extends ServletAuthApplication>
             throw new IllegalStateException("DBAC creates one metadata database per initialization");
         }
         return database;
+    }
+
+    /**
+     * Builds the DBAC controller, which locks the user around every change that takes a user away
+     * <p>
+     * Not final: an isolated test factory overrides it to inject failures and then calls this one.
+     */
+    @Override
+    @NotNull
+    protected CBEmbeddedSecurityController<T> createEmbeddedSecurityController(
+        @NotNull T application,
+        @NotNull CBDatabase database,
+        @NotNull SMCredentialsProvider credentialsProvider,
+        @NotNull SMControllerConfiguration smConfig
+    ) {
+        return new DbacEmbeddedSecurityController<>(application, database, credentialsProvider, smConfig);
     }
 
     /**

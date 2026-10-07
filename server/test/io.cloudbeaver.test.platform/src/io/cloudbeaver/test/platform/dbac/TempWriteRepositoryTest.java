@@ -46,13 +46,6 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.Callable;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.CyclicBarrier;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
@@ -633,94 +626,144 @@ public class TempWriteRepositoryTest {
     /**
      * Two grants that start from the same revision produce one winner and one refusal
      * <p>
-     * This is the corrected I10. Both requests are valid and both start from revision 0; the loser is
-     * refused rather than retried into success, so the key ends with exactly one current row and
-     * exactly one {@code GRANTED} event, and the refused request leaves no history at all.
+     * This is the corrected I10, under the key lock (C17 D5). The second grant cannot reach the
+     * database while the first holds the key: it waits, and when it runs it finds the revision
+     * moved and is refused rather than retried into success. The key ends with exactly one current
+     * row and one {@code GRANTED} event, and the refused request leaves no history at all.
      */
     @Test
     public void concurrentGrantsLeaveExactlyOneWinner() throws Exception {
         TempWritePermissionKey key = key("concurrent-grants");
-        remember(key);
-        CyclicBarrier barrier = new CyclicBarrier(2);
-        List<TempWriteMutationResult> results = runBoth(
-            () -> barrierCoordinator(barrier).grant(TempWriteTestSupport.grantRequest(
-                key, TempWriteGrant.NO_ROW_REVISION, Duration.ofMinutes(30), "first")),
-            () -> barrierCoordinator(barrier).grant(TempWriteTestSupport.grantRequest(
-                key, TempWriteGrant.NO_ROW_REVISION, Duration.ofMinutes(60), "second")));
-        assertOneWinnerOneConflict(results);
+        KeyLockTestSupport.Serialized race = KeyLockTestSupport.serialize(database::openConnection, repository,
+            c -> c.grant(TempWriteTestSupport.grantRequest(key, TempWriteGrant.NO_ROW_REVISION, Duration.ofMinutes(30), "first")),
+            c -> c.grant(TempWriteTestSupport.grantRequest(key, TempWriteGrant.NO_ROW_REVISION, Duration.ofMinutes(60), "second")));
+        race.assertSerialized();
+        assertOneWinnerOneConflict(List.of(race.first(), race.second()));
+        Assertions.assertTrue(race.first().isCommitted(), "the writer that held the key must be the one that wins");
         assertState(key, 1, TempWriteGrant.FIRST_REVISION, List.of("GRANTED@1"));
     }
 
     /**
-     * A grant and a revoke racing from the same revision leave one consistent row
+     * A grant and a revoke racing from the same revision leave one consistent row, whichever holds the key first
+     * <p>
+     * Under the key lock the order is decided by who takes the key; both orders are run. The loser
+     * is refused for its stale revision, and the history describes exactly the state the current
+     * row is in.
      */
     @Test
     public void concurrentGrantAndRevokeLeaveOneConsistentRow() throws Exception {
-        TempWritePermissionKey key = key("concurrent-mixed");
-        commitGrant(key, TempWriteGrant.NO_ROW_REVISION);
-        CyclicBarrier barrier = new CyclicBarrier(2);
-        List<TempWriteMutationResult> results = runBoth(
-            () -> barrierCoordinator(barrier).grant(TempWriteTestSupport.grantRequest(
-                key, TempWriteGrant.FIRST_REVISION, Duration.ofMinutes(30), "racing grant")),
-            () -> barrierCoordinator(barrier).revoke(
-                TempWriteTestSupport.revokeRequest(key, TempWriteGrant.FIRST_REVISION)));
-        assertOneWinnerOneConflict(results);
+        TempWritePermissionKey grantFirst = key("concurrent-mixed-grant");
+        commitGrant(grantFirst, TempWriteGrant.NO_ROW_REVISION);
+        KeyLockTestSupport.Serialized race = KeyLockTestSupport.serialize(database::openConnection, repository,
+            c -> c.grant(TempWriteTestSupport.grantRequest(
+                grantFirst, TempWriteGrant.FIRST_REVISION, Duration.ofMinutes(30), "racing grant")),
+            c -> c.revoke(TempWriteTestSupport.revokeRequest(grantFirst, TempWriteGrant.FIRST_REVISION)));
+        race.assertSerialized();
+        assertOneWinnerOneConflict(List.of(race.first(), race.second()));
+        Assertions.assertTrue(race.first().isCommitted(), "the grant held the key and wins");
         try (Connection connection = database.openConnection()) {
-            Assertions.assertEquals(1, TempWriteTestSupport.countCurrent(connection, key));
-            Assertions.assertEquals(2L, TempWriteTestSupport.currentRevision(connection, key));
-            TempWriteGrant current = repository.findCurrent(connection, key).orElseThrow();
-            // Either outcome is correct; what must hold is that the history describes the state the
-            // row is actually in. Which of the two won is not deterministic and asserting one of them
-            // would be asserting a coin toss. A replacement records two events because it both ends
-            // the old grant and starts a new one; a revoke records one.
-            Assertions.assertEquals(
-                current.isRevoked()
-                    ? List.of("GRANTED@1", "REVOKED@2")
-                    : List.of("GRANTED@1", "GRANTED@2", "SUPERSEDED@2"),
-                TempWriteTestSupport.historyOf(connection, key),
-                "history must describe the state the current row is actually in");
+            Assertions.assertEquals(1, TempWriteTestSupport.countCurrent(connection, grantFirst));
+            Assertions.assertEquals(2L, TempWriteTestSupport.currentRevision(connection, grantFirst));
+            Assertions.assertFalse(repository.findCurrent(connection, grantFirst).orElseThrow().isRevoked(),
+                "the refused revoke must not have been applied");
+            Assertions.assertEquals(List.of("GRANTED@1", "GRANTED@2", "SUPERSEDED@2"),
+                TempWriteTestSupport.historyOf(connection, grantFirst), "history must describe the replacing grant");
+        }
+
+        TempWritePermissionKey revokeFirst = key("concurrent-mixed-revoke");
+        commitGrant(revokeFirst, TempWriteGrant.NO_ROW_REVISION);
+        race = KeyLockTestSupport.serialize(database::openConnection, repository,
+            c -> c.revoke(TempWriteTestSupport.revokeRequest(revokeFirst, TempWriteGrant.FIRST_REVISION)),
+            c -> c.grant(TempWriteTestSupport.grantRequest(
+                revokeFirst, TempWriteGrant.FIRST_REVISION, Duration.ofMinutes(30), "racing grant")));
+        race.assertSerialized();
+        assertOneWinnerOneConflict(List.of(race.first(), race.second()));
+        Assertions.assertTrue(race.first().isCommitted(), "the revoke held the key and wins");
+        try (Connection connection = database.openConnection()) {
+            Assertions.assertEquals(1, TempWriteTestSupport.countCurrent(connection, revokeFirst));
+            Assertions.assertEquals(2L, TempWriteTestSupport.currentRevision(connection, revokeFirst));
+            Assertions.assertTrue(repository.findCurrent(connection, revokeFirst).orElseThrow().isRevoked(),
+                "the revoke must stand");
+            Assertions.assertEquals(List.of("GRANTED@1", "REVOKED@2"),
+                TempWriteTestSupport.historyOf(connection, revokeFirst), "history must describe the revoked row");
         }
     }
 
     /**
      * A grant that commits after a revoke cannot bring the old permission back
      * <p>
-     * This is I12, and it is the reason the start revision is never refreshed. The delayed grant is
-     * held just before its write, the revoke commits, and then the grant is released: it finds the
-     * revision moved and is refused. A build that re-read the revision on retry would let it succeed
-     * and quietly restore write access that an administrator had just taken away.
+     * This is I12, and it is the reason the start revision is never refreshed. The grant was asked
+     * for at revision 1, before the revoke. Under the key lock (C17 D5) the revoke holds the key and
+     * the grant waits without touching the database; when the revoke has committed, the grant runs,
+     * finds the revision moved and is refused. A build that re-read the revision would let it succeed
+     * and quietly restore write access that an administrator had just taken away. The same property
+     * without the key lock - two connections racing on the stored revision - is
+     * {@link #repositoryCompareAndSetRefusesAWriteOverACommittedRevision}.
      */
     @Test
     public void grantDelayedPastARevokeCannotResurrect() throws Exception {
         TempWritePermissionKey key = key("delayed-grant");
         commitGrant(key, TempWriteGrant.NO_ROW_REVISION);
-        CountDownLatch hasRead = new CountDownLatch(1);
-        CountDownLatch mayWrite = new CountDownLatch(1);
-        ExecutorService pool = Executors.newSingleThreadExecutor();
-        try {
-            final Future<TempWriteMutationResult> delayed = pool.submit(
-                () -> pausedCoordinator(hasRead, mayWrite).grant(TempWriteTestSupport.grantRequest(
-                    key, TempWriteGrant.FIRST_REVISION, Duration.ofMinutes(30), "delayed")));
-            // Both halves of the ordering are forced: the grant has provably read revision 1 before
-            // the revoke starts, and it cannot write until the revoke has committed.
-            Assertions.assertTrue(
-                hasRead.await(30, TimeUnit.SECONDS), "the delayed grant never reached its write");
-            TempWriteMutationResult revoke =
-                coordinator().revoke(TempWriteTestSupport.revokeRequest(key, TempWriteGrant.FIRST_REVISION));
-            Assertions.assertEquals(TempWriteMutationStatus.COMMITTED, revoke.status());
-            mayWrite.countDown();
-            TempWriteMutationResult late = delayed.get(60, TimeUnit.SECONDS);
-            Assertions.assertEquals(TempWriteMutationStatus.CONFLICT_SUPERSEDED, late.status());
-            Assertions.assertEquals(0, late.affectedRows());
-        } finally {
-            pool.shutdownNow();
-        }
+        KeyLockTestSupport.Serialized race = KeyLockTestSupport.serialize(database::openConnection, repository,
+            c -> c.revoke(TempWriteTestSupport.revokeRequest(key, TempWriteGrant.FIRST_REVISION)),
+            c -> c.grant(TempWriteTestSupport.grantRequest(key, TempWriteGrant.FIRST_REVISION, Duration.ofMinutes(30), "delayed")));
+        race.assertSerialized();
+        Assertions.assertEquals(TempWriteMutationStatus.COMMITTED, race.first().status());
+        Assertions.assertEquals(TempWriteMutationStatus.CONFLICT_SUPERSEDED, race.second().status());
+        Assertions.assertEquals(0, race.second().affectedRows());
         try (Connection connection = database.openConnection()) {
             TempWriteGrant current = repository.findCurrent(connection, key).orElseThrow();
             Assertions.assertTrue(current.isRevoked(), "the revoke must still stand");
             Assertions.assertEquals(2L, current.revision());
             Assertions.assertEquals(
                 List.of("GRANTED@1", "REVOKED@2"), TempWriteTestSupport.historyOf(connection, key));
+        }
+    }
+
+    /**
+     * The stored revision refuses a write that read an older one, even with no key lock in the way
+     * <p>
+     * The coordinator's lock serializes writers inside one server. What still stands behind it is the
+     * database: a write conditioned on revision 1 applies to nothing once another connection has
+     * committed revision 2, and a second insert of a key fails on the primary key. Both are checked
+     * here through the repository directly, bypassing the coordinator and its lock on purpose.
+     */
+    @Test
+    public void repositoryCompareAndSetRefusesAWriteOverACommittedRevision() throws Exception {
+        TempWritePermissionKey key = key("repository-cas");
+        commitGrant(key, TempWriteGrant.NO_ROW_REVISION);
+        try (Connection late = database.openConnection(); Connection early = database.openConnection()) {
+            late.setAutoCommit(false);
+            early.setAutoCommit(false);
+            Assertions.assertEquals(TempWriteGrant.FIRST_REVISION, repository.findCurrent(late, key).orElseThrow().revision(),
+                "the late writer has read revision 1");
+            Assertions.assertEquals(1, repository.revokeCurrentWithRevision(early, key, TempWriteGrant.FIRST_REVISION, 2,
+                MetadataDbClock.readNow(early), "admin-2", "repository race"));
+            early.commit();
+            TempWriteGrant overwrite = TempWriteTestSupport.storedGrant(key, 2, MetadataDbClock.readNow(late));
+            Assertions.assertEquals(0, repository.updateCurrentWithRevision(late, overwrite, TempWriteGrant.FIRST_REVISION),
+                "a write conditioned on revision 1 must not apply once revision 2 is committed");
+            late.rollback();
+            late.setAutoCommit(true);
+            early.setAutoCommit(true);
+        }
+        try (Connection connection = database.openConnection()) {
+            TempWriteGrant current = repository.findCurrent(connection, key).orElseThrow();
+            Assertions.assertTrue(current.isRevoked(), "the committed revoke must stand");
+            Assertions.assertEquals(2L, current.revision());
+        }
+
+        TempWritePermissionKey fresh = key("repository-pk");
+        try (Connection first = database.openConnection(); Connection second = database.openConnection()) {
+            MetadataDbTime now = MetadataDbClock.readNow(first);
+            Assertions.assertEquals(1, repository.insertCurrent(first, TempWriteTestSupport.storedGrant(fresh, 1, now)));
+            SQLException collision = Assertions.assertThrows(SQLException.class,
+                () -> repository.insertCurrent(second, TempWriteTestSupport.storedGrant(fresh, 1, now)),
+                "a second insert of the same key must fail on the primary key");
+            Assertions.assertEquals("23505", collision.getSQLState(), "the failure must be a unique violation");
+        }
+        try (Connection connection = database.openConnection()) {
+            Assertions.assertEquals(1, TempWriteTestSupport.countCurrent(connection, fresh), "exactly one row for the key");
         }
     }
 
@@ -844,21 +887,6 @@ public class TempWriteRepositoryTest {
     }
 
     @NotNull
-    private TempWriteMutationCoordinator barrierCoordinator(@NotNull CyclicBarrier barrier) {
-        return TempWriteMutationCoordinator.withoutAuditing(
-            TempWriteTestSupport.barrierBeforeWrite(database::openConnection, barrier), repository);
-    }
-
-    @NotNull
-    private TempWriteMutationCoordinator pausedCoordinator(
-        @NotNull CountDownLatch hasRead,
-        @NotNull CountDownLatch mayWrite
-    ) {
-        return TempWriteMutationCoordinator.withoutAuditing(
-            TempWriteTestSupport.pauseBeforeWrite(database::openConnection, hasRead, mayWrite), repository);
-    }
-
-    @NotNull
     private TempWritePermissionKey key(@NotNull String user) {
         TempWritePermissionKey key = new TempWritePermissionKey(user, PROJECT, CONNECTION);
         remember(key);
@@ -937,21 +965,6 @@ public class TempWriteRepositoryTest {
             TempWriteMutationStatus.CONFLICT_SUPERSEDED,
             results.stream().filter(TempWriteMutationResult::isRefused).findFirst().orElseThrow().status(),
             "the loser is superseded, not retried into success or failure");
-    }
-
-    @NotNull
-    private static List<TempWriteMutationResult> runBoth(
-        @NotNull Callable<TempWriteMutationResult> first,
-        @NotNull Callable<TempWriteMutationResult> second
-    ) throws Exception {
-        ExecutorService pool = Executors.newFixedThreadPool(2);
-        try {
-            Future<TempWriteMutationResult> a = pool.submit(first);
-            Future<TempWriteMutationResult> b = pool.submit(second);
-            return List.of(a.get(60, TimeUnit.SECONDS), b.get(60, TimeUnit.SECONDS));
-        } finally {
-            pool.shutdownNow();
-        }
     }
 
     @NotNull

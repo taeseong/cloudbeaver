@@ -61,12 +61,6 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Properties;
-import java.util.concurrent.Callable;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.CyclicBarrier;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
@@ -227,21 +221,53 @@ public class TempWriteRepositoryPostgresTest {
     }
 
     /**
-     * A primary key collision is survived by starting over, not by continuing
+     * A primary key collision between two uncommitted inserts of one key leaves exactly one row
+     * <p>
+     * The coordinator now serializes writers of a key inside one server (C17 D5), so the collision
+     * this guards against is driven through the repository directly, bypassing the coordinator and
+     * its lock: the second insert waits on the first one's uncommitted key and, once that commits,
+     * fails with a unique violation. This is the database-level defence that stays behind the lock.
      */
     @Test
     public void concurrentGrantsLeaveOneWinnerAfterThePrimaryKeyCollision() throws Exception {
         TempWritePermissionKey key = key("pg-concurrent");
-        CyclicBarrier barrier = new CyclicBarrier(2);
-        List<TempWriteMutationResult> results = runBoth(
-            () -> barrierCoordinator(barrier).grant(TempWriteTestSupport.grantRequest(
-                key, TempWriteGrant.NO_ROW_REVISION, Duration.ofMinutes(30), "first")),
-            () -> barrierCoordinator(barrier).grant(TempWriteTestSupport.grantRequest(
-                key, TempWriteGrant.NO_ROW_REVISION, Duration.ofMinutes(60), "second")));
-        long committed = results.stream().filter(TempWriteMutationResult::isCommitted).count();
-        long refused = results.stream().filter(TempWriteMutationResult::isRefused).count();
-        Assertions.assertEquals(1, committed, "exactly one writer may win: " + results);
-        Assertions.assertEquals(1, refused, "exactly one writer must be refused: " + results);
+        try (Connection first = open(); Connection second = open()) {
+            first.setAutoCommit(false);
+            second.setAutoCommit(false);
+            MetadataDbTime now = MetadataDbClock.readNow(first);
+            Assertions.assertEquals(1, repository.insertCurrent(first, TempWriteTestSupport.storedGrant(key, 1, now)));
+            int secondPid = backendPid(second);
+            KeyLockTestSupport.Worker<Integer> collision = KeyLockTestSupport.Worker.start("dbac-pg-pk-second",
+                () -> repository.insertCurrent(second, TempWriteTestSupport.storedGrant(key, 1, now)));
+            Assertions.assertTrue(waitsOnALock(secondPid), "the second insert must wait on the first one's uncommitted key");
+            first.commit();
+            Assertions.assertTrue(collision.awaitDone(), "the second insert must return once the first committed");
+            Assertions.assertInstanceOf(SQLException.class, collision.error, "the second insert must fail");
+            Assertions.assertEquals("23505", ((SQLException) collision.error).getSQLState(), "the failure must be a unique violation");
+            second.rollback();
+            first.setAutoCommit(true);
+            second.setAutoCommit(true);
+        }
+        try (Connection connection = open()) {
+            Assertions.assertEquals(1, TempWriteTestSupport.countCurrent(connection, key));
+            Assertions.assertEquals(
+                TempWriteGrant.FIRST_REVISION, TempWriteTestSupport.currentRevision(connection, key));
+        }
+    }
+
+    /**
+     * Two grants of one key through the coordinator: the second waits on the key lock, then is refused
+     */
+    @Test
+    public void concurrentGrantsAreSerializedByTheKeyLock() throws Exception {
+        TempWritePermissionKey key = key("pg-serialized");
+        KeyLockTestSupport.Serialized race = KeyLockTestSupport.serialize(TempWriteRepositoryPostgresTest::open, repository,
+            c -> c.grant(TempWriteTestSupport.grantRequest(key, TempWriteGrant.NO_ROW_REVISION, Duration.ofMinutes(30), "first")),
+            c -> c.grant(TempWriteTestSupport.grantRequest(key, TempWriteGrant.NO_ROW_REVISION, Duration.ofMinutes(60), "second")));
+        race.assertSerialized();
+        Assertions.assertTrue(race.first().isCommitted(), "exactly one writer may win: " + race);
+        Assertions.assertEquals(TempWriteMutationStatus.CONFLICT_SUPERSEDED, race.second().status(),
+            "exactly one writer must be refused: " + race);
         try (Connection connection = open()) {
             Assertions.assertEquals(1, TempWriteTestSupport.countCurrent(connection, key));
             Assertions.assertEquals(
@@ -251,39 +277,55 @@ public class TempWriteRepositoryPostgresTest {
     }
 
     /**
-     * A grant released after a revoke committed cannot resurrect the permission
+     * A grant asked for before a revoke cannot resurrect the permission once the revoke has committed
+     * <p>
+     * Under the key lock (C17 D5) the revoke holds the key and the grant waits without touching the
+     * database; it then finds the revision moved and is refused.
      */
     @Test
     public void grantDelayedPastARevokeCannotResurrect() throws Exception {
         TempWritePermissionKey key = key("pg-delayed");
         grant(key, TempWriteGrant.NO_ROW_REVISION, "original");
-        CountDownLatch hasRead = new CountDownLatch(1);
-        CountDownLatch mayWrite = new CountDownLatch(1);
-        ExecutorService pool = Executors.newSingleThreadExecutor();
-        try {
-            final Future<TempWriteMutationResult> delayed = pool.submit(
-                () -> pausedCoordinator(hasRead, mayWrite).grant(TempWriteTestSupport.grantRequest(
-                    key, TempWriteGrant.FIRST_REVISION, Duration.ofMinutes(30), "delayed")));
-            // Both halves forced: the grant has read revision 1 before the revoke starts, and cannot
-            // write until the revoke has committed.
-            Assertions.assertTrue(
-                hasRead.await(30, TimeUnit.SECONDS), "the delayed grant never reached its write");
-            Assertions.assertEquals(
-                TempWriteMutationStatus.COMMITTED,
-                coordinator().revoke(
-                    TempWriteTestSupport.revokeRequest(key, TempWriteGrant.FIRST_REVISION)).status());
-            mayWrite.countDown();
-            Assertions.assertEquals(
-                TempWriteMutationStatus.CONFLICT_SUPERSEDED,
-                delayed.get(60, TimeUnit.SECONDS).status());
-        } finally {
-            pool.shutdownNow();
-        }
+        KeyLockTestSupport.Serialized race = KeyLockTestSupport.serialize(TempWriteRepositoryPostgresTest::open, repository,
+            c -> c.revoke(TempWriteTestSupport.revokeRequest(key, TempWriteGrant.FIRST_REVISION)),
+            c -> c.grant(TempWriteTestSupport.grantRequest(key, TempWriteGrant.FIRST_REVISION, Duration.ofMinutes(30), "delayed")));
+        race.assertSerialized();
+        Assertions.assertEquals(TempWriteMutationStatus.COMMITTED, race.first().status());
+        Assertions.assertEquals(TempWriteMutationStatus.CONFLICT_SUPERSEDED, race.second().status());
         try (Connection connection = open()) {
             TempWriteGrant current = repository.findCurrent(connection, key).orElseThrow();
             Assertions.assertTrue(current.isRevoked(), "the revoke must still stand");
         }
         assertHistory(key, List.of("GRANTED@1", "REVOKED@2"));
+    }
+
+    /**
+     * The stored revision refuses a write that read an older one, through the repository, without the key lock
+     */
+    @Test
+    public void repositoryCompareAndSetRefusesAWriteOverACommittedRevision() throws Exception {
+        TempWritePermissionKey key = key("pg-repository-cas");
+        grant(key, TempWriteGrant.NO_ROW_REVISION, "original");
+        try (Connection late = open(); Connection early = open()) {
+            late.setAutoCommit(false);
+            early.setAutoCommit(false);
+            Assertions.assertEquals(TempWriteGrant.FIRST_REVISION, repository.findCurrent(late, key).orElseThrow().revision(),
+                "the late writer has read revision 1");
+            Assertions.assertEquals(1, repository.revokeCurrentWithRevision(early, key, TempWriteGrant.FIRST_REVISION, 2,
+                MetadataDbClock.readNow(early), "admin-2", "repository race"));
+            early.commit();
+            TempWriteGrant overwrite = TempWriteTestSupport.storedGrant(key, 2, MetadataDbClock.readNow(late));
+            Assertions.assertEquals(0, repository.updateCurrentWithRevision(late, overwrite, TempWriteGrant.FIRST_REVISION),
+                "a write conditioned on revision 1 must not apply once revision 2 is committed");
+            late.rollback();
+            late.setAutoCommit(true);
+            early.setAutoCommit(true);
+        }
+        try (Connection connection = open()) {
+            TempWriteGrant current = repository.findCurrent(connection, key).orElseThrow();
+            Assertions.assertTrue(current.isRevoked(), "the committed revoke must stand");
+            Assertions.assertEquals(2L, current.revision());
+        }
     }
 
     // ---------------------------------------------------------------- atomicity and errors
@@ -678,21 +720,30 @@ public class TempWriteRepositoryPostgresTest {
         return TempWriteMutationCoordinator.withoutAuditing(TempWriteRepositoryPostgresTest::open, repository);
     }
 
-    @NotNull
-    private TempWriteMutationCoordinator barrierCoordinator(@NotNull CyclicBarrier barrier) {
-        return TempWriteMutationCoordinator.withoutAuditing(
-            TempWriteTestSupport.barrierBeforeWrite(TempWriteRepositoryPostgresTest::open, barrier),
-            repository);
+    private static int backendPid(@NotNull Connection connection) throws SQLException {
+        try (PreparedStatement dbStat = connection.prepareStatement("SELECT pg_backend_pid()");
+             ResultSet dbResult = dbStat.executeQuery()) {
+            dbResult.next();
+            return dbResult.getInt(1);
+        }
     }
 
-    @NotNull
-    private TempWriteMutationCoordinator pausedCoordinator(
-        @NotNull CountDownLatch hasRead,
-        @NotNull CountDownLatch mayWrite
-    ) {
-        return TempWriteMutationCoordinator.withoutAuditing(
-            TempWriteTestSupport.pauseBeforeWrite(TempWriteRepositoryPostgresTest::open, hasRead, mayWrite),
-            repository);
+    /** Whether the backend is seen waiting on a lock, from a separate session */
+    private static boolean waitsOnALock(int pid) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        try (Connection observer = open();
+             PreparedStatement dbStat = observer.prepareStatement("SELECT wait_event_type FROM pg_stat_activity WHERE pid = ?")) {
+            dbStat.setInt(1, pid);
+            while (System.nanoTime() < deadline) {
+                try (ResultSet dbResult = dbStat.executeQuery()) {
+                    if (dbResult.next() && "Lock".equals(dbResult.getString(1))) {
+                        return true;
+                    }
+                }
+                Thread.sleep(20);
+            }
+        }
+        return false;
     }
 
     private void assertHistory(
@@ -875,18 +926,4 @@ public class TempWriteRepositoryPostgresTest {
         return null;
     }
 
-    @NotNull
-    private static List<TempWriteMutationResult> runBoth(
-        @NotNull Callable<TempWriteMutationResult> first,
-        @NotNull Callable<TempWriteMutationResult> second
-    ) throws Exception {
-        ExecutorService pool = Executors.newFixedThreadPool(2);
-        try {
-            Future<TempWriteMutationResult> a = pool.submit(first);
-            Future<TempWriteMutationResult> b = pool.submit(second);
-            return List.of(a.get(60, TimeUnit.SECONDS), b.get(60, TimeUnit.SECONDS));
-        } finally {
-            pool.shutdownNow();
-        }
-    }
 }

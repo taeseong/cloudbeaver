@@ -51,6 +51,8 @@ REQUIRED_VALUE = "true"
 # The Slice 4a contract and regression-guard classes are here because they run scenarios against a real
 # PostgreSQL target; a skip there would silently drop platform guarantees that enforcement relies on.
 # DeploymentGuardTest holds and loses a real PostgreSQL advisory lock (DG-4, DG-5, DG-6, DG-13).
+# The P4 lock classes run their grant-key races on PostgreSQL as well as H2, check user writers against
+# a real PostgreSQL target's locks, and characterize PostgreSQL's identity comparison.
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
@@ -58,6 +60,9 @@ POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacPlatformContractTest",
     "io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest",
     "io.cloudbeaver.test.platform.dbac.DeploymentGuardTest",
+    "io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest",
+    "io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest",
+    "io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -74,8 +79,8 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.DbacSchemaTest": 7,
     "io.cloudbeaver.test.platform.dbac.DbacScriptStatementsTest": 6,
     "io.cloudbeaver.test.platform.dbac.TempWriteModelTest": 24,
-    "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest": 32,
-    "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest": 18,
+    "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest": 33,
+    "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest": 20,
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest": 50,
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest": 76,
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest": 15,
@@ -84,6 +89,9 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest": 2,
     "io.cloudbeaver.test.platform.dbac.EnforcementLifecycleTest": 18,
     "io.cloudbeaver.test.platform.dbac.DeploymentGuardTest": 11,
+    "io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest": 13,
+    "io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest": 14,
+    "io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest": 3,
 }
 
 for _postgres_class in POSTGRES_CLASSES:

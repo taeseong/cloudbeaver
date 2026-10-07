@@ -16,6 +16,8 @@
  */
 package io.cloudbeaver.service.dbac.tempwrite;
 
+import io.cloudbeaver.service.dbac.policy.DbAccessKey;
+import io.cloudbeaver.service.dbac.policy.enforcement.EnforcementKeyLocks;
 import org.jkiss.code.NotNull;
 import org.jkiss.code.Nullable;
 import org.jkiss.dbeaver.Log;
@@ -56,6 +58,16 @@ import java.util.UUID;
  * the request is not retried. See {@link MetadataTransaction} for why the platform's
  * {@code JDBCTransaction} is not used - its {@code close()} restores auto-commit unconditionally,
  * which JDBC turns into a commit of exactly the half-written state that must not be stored.
+ * <p>
+ * <b>The key lock.</b> {@link #grant} and {@link #revoke} - a supersede is a grant over an active one -
+ * take the grant key's write lock from {@link EnforcementKeyLocks} before they open a metadata connection,
+ * and give it back only after the attempt that decided has committed or rolled back, retries included.
+ * A future enforcement point holds the key's read lock from before it authorizes until its operation has
+ * returned, so a revoke cannot commit while a write it forbids is in flight, and a reader that gets the
+ * key afterwards sees the committed state. The lock is taken without a time limit, since a revoke that
+ * gave up would leave the grant in place. Inside one server it also serializes writers of a key, so the
+ * compare-and-set below decides between them deterministically; it remains what protects the stored
+ * state from anything that writes without the lock.
  */
 public class TempWriteMutationCoordinator {
 
@@ -146,17 +158,19 @@ public class TempWriteMutationCoordinator {
      */
     @NotNull
     public TempWriteMutationResult grant(@NotNull TempWriteGrantRequest request) throws SQLException {
-        int attempt = 0;
-        while (true) {
-            attempt++;
-            Optional<TempWriteMutationResult> outcome = attemptGrant(request, attempt);
-            if (outcome.isPresent()) {
-                return outcome.get();
-            }
-            if (attempt > MAX_TRANSIENT_RETRIES) {
-                log.warn("TEMP_WRITE grant gave up after " + attempt + " attempts on unchanged revision "
-                    + request.observedRevisionAtRequestStart());
-                return TempWriteMutationResult.retryExhausted(attempt);
+        try (EnforcementKeyLocks.Held ignored = EnforcementKeyLocks.global().lockGrantForWrite(accessKeyOf(request.key()))) {
+            int attempt = 0;
+            while (true) {
+                attempt++;
+                Optional<TempWriteMutationResult> outcome = attemptGrant(request, attempt);
+                if (outcome.isPresent()) {
+                    return outcome.get();
+                }
+                if (attempt > MAX_TRANSIENT_RETRIES) {
+                    log.warn("TEMP_WRITE grant gave up after " + attempt + " attempts on unchanged revision "
+                        + request.observedRevisionAtRequestStart());
+                    return TempWriteMutationResult.retryExhausted(attempt);
+                }
             }
         }
     }
@@ -173,17 +187,19 @@ public class TempWriteMutationCoordinator {
      */
     @NotNull
     public TempWriteMutationResult revoke(@NotNull TempWriteRevokeRequest request) throws SQLException {
-        int attempt = 0;
-        while (true) {
-            attempt++;
-            Optional<TempWriteMutationResult> outcome = attemptRevoke(request, attempt);
-            if (outcome.isPresent()) {
-                return outcome.get();
-            }
-            if (attempt > MAX_TRANSIENT_RETRIES) {
-                log.warn("TEMP_WRITE revoke gave up after " + attempt + " attempts on unchanged revision "
-                    + request.observedRevisionAtRequestStart());
-                return TempWriteMutationResult.retryExhausted(attempt);
+        try (EnforcementKeyLocks.Held ignored = EnforcementKeyLocks.global().lockGrantForWrite(accessKeyOf(request.key()))) {
+            int attempt = 0;
+            while (true) {
+                attempt++;
+                Optional<TempWriteMutationResult> outcome = attemptRevoke(request, attempt);
+                if (outcome.isPresent()) {
+                    return outcome.get();
+                }
+                if (attempt > MAX_TRANSIENT_RETRIES) {
+                    log.warn("TEMP_WRITE revoke gave up after " + attempt + " attempts on unchanged revision "
+                        + request.observedRevisionAtRequestStart());
+                    return TempWriteMutationResult.retryExhausted(attempt);
+                }
             }
         }
     }
@@ -292,6 +308,14 @@ public class TempWriteMutationCoordinator {
                 throw e;
             }
         }
+    }
+
+    /**
+     * The lock identity of a grant key: the same three strings, as the policy layer keys them
+     */
+    @NotNull
+    private static DbAccessKey accessKeyOf(@NotNull TempWritePermissionKey key) {
+        return new DbAccessKey(key.userId(), key.projectId(), key.connectionId());
     }
 
     private static long observedRevision(@NotNull Optional<TempWriteGrant> current) {
