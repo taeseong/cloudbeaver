@@ -59,6 +59,8 @@ REQUIRED_VALUE = "true"
 # upgrades among it - and the grant fence's user lookup and timeouts against a PostgreSQL metadata schema.
 # TaintRegistryLifecycleTest closes real PostgreSQL execution contexts through the query manager, to prove the
 # production close handler empties the taint registry (TR-2) and keeps a registry failure to itself (TR-10).
+# AuditFailClosedTest writes pre-execution audit rows into a PostgreSQL metadata schema as well as H2: committed
+# and visible before the writer returns, a statement timeout from the audit budget, nothing past the budget kept.
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
@@ -73,6 +75,7 @@ POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacFenceMigrationTest",
     "io.cloudbeaver.test.platform.dbac.UserRecreationTest",
     "io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest",
+    "io.cloudbeaver.test.platform.dbac.AuditFailClosedTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -92,7 +95,7 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest": 33,
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest": 20,
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest": 50,
-    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest": 76,
+    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest": 79,
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest": 15,
     "io.cloudbeaver.test.platform.dbac.DbacPlatformContractTest": 17,
     "io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest": 6,
@@ -111,6 +114,7 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.DbacFenceMigrationTest": 15,
     "io.cloudbeaver.test.platform.dbac.UserRecreationTest": 8,
     "io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest": 14,
+    "io.cloudbeaver.test.platform.dbac.AuditFailClosedTest": 12,
 }
 
 for _postgres_class in POSTGRES_CLASSES:

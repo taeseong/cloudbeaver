@@ -43,9 +43,10 @@ import java.util.function.LongSupplier;
  * would turn "immediately" into "eventually", and there is no correct TTL for a security decision.
  * <p>
  * <b>What this slice does not decide.</b> Transaction state (Phase 2 section 9) and the pre-execution
- * audit (section 11) are later slices. The corresponding denial reasons exist in {@link DenialReason}
+ * audit (section 11) are not decided here. The corresponding denial reasons exist in {@link DenialReason}
  * so their arrival does not reshape this API, but nothing here evaluates them, and this class does
- * not claim to. {@code executionContextId} and {@code autoCommit} travel on the request unread.
+ * not claim to. {@code executionContextId} and {@code autoCommit} travel on the request unread. The
+ * expiry window hands out the audit's budget; writing the audit row is the enforcement layer's.
  * <p>
  * <b>The expiry margin is not applied by {@code authorize}.</b> It answers whether the grant is
  * unexpired by the database's own comparison, and reports how long it has left. Whether that is
@@ -435,6 +436,13 @@ public final class DbAccessPolicyService {
      * for the same grant. A denial or a recovery allow is carried through both checks as the same
      * object: the window can take an allow away, never grant one.
      * <p>
+     * <b>The audit gets exactly what check-1 reserved.</b> Between the checks a write-gated allow
+     * claims its audit budget, {@link #claimAuditBudget}: {@code T_audit}, counted from the very
+     * reading check-1 judged. An audit that finishes within that budget therefore finishes no later
+     * than {@code start + e1 + T_audit}, where check-1 found more than {@code T_audit + δ} left - so
+     * at least {@code δ} is still left when it ends, and check-2 can fail only for time spent after
+     * the audit. A budget counted from any later point would let the audit eat into {@code δ}.
+     * <p>
      * <b>The window owns its attempt.</b> It authorizes through the service that opened it -
      * {@link #authorize} - and judges only the decision that call produced, which it keeps as the
      * attempt's current decision. Each check reads that decision and replaces it with its own answer.
@@ -454,7 +462,10 @@ public final class DbAccessPolicyService {
      *   <li>{@code OPEN}, as {@link DbAccessPolicyService#openExpiryWindow} returns it - only
      *       {@link #authorize}</li>
      *   <li>{@code AUTHORIZED} - only {@link #requireMarginBeforeAudit}</li>
-     *   <li>{@code AUDIT_CHECKED} - only {@link #requireMarginBeforeExecute}</li>
+     *   <li>{@code AUDIT_CHECKED} with a write-gated allow - only {@link #claimAuditBudget}; with a
+     *       denial or a recovery allow - only {@link #requireMarginBeforeExecute}, since nothing is
+     *       audited before a write that will not happen</li>
+     *   <li>{@code AUDIT_CLAIMED} - only {@link #requireMarginBeforeExecute}</li>
      *   <li>{@code EXECUTE_CHECKED} - nothing; the attempt is over</li>
      * </ul>
      * Any other call is refused with {@link IllegalStateException} and ends the attempt: every later
@@ -479,7 +490,7 @@ public final class DbAccessPolicyService {
 
         /** Where the attempt is; see the class comment for which call each state accepts */
         private enum State {
-            OPEN, AUTHORIZED, AUDIT_CHECKED, EXECUTE_CHECKED,
+            OPEN, AUTHORIZED, AUDIT_CHECKED, AUDIT_CLAIMED, EXECUTE_CHECKED,
             /** A call was refused or failed; nothing more is accepted */
             FAILED
         }
@@ -492,6 +503,8 @@ public final class DbAccessPolicyService {
         private AuthorizationDecision current;
         /** The largest elapsed time this window has measured; no later measurement is smaller */
         private long elapsedFloorNanos;
+        /** The elapsed time check-1 judged an allow against; the audit budget starts there */
+        private long checkOneElapsedNanos;
 
         private ExpiryWindow(@NotNull DbAccessPolicyService service) {
             this.service = service;
@@ -526,56 +539,103 @@ public final class DbAccessPolicyService {
         @NotNull
         public AuthorizationDecision requireMarginBeforeAudit() {
             leave(State.AUTHORIZED, "check-1");
-            current = requireMargin(current, service.config.auditTimeout().plus(service.config.expiryGuardMargin()));
+            if (isWriteAllow(current)) {
+                checkOneElapsedNanos = elapsedNanos();
+                current = requireMargin(current, checkOneElapsedNanos,
+                    service.config.auditTimeout().plus(service.config.expiryGuardMargin()));
+            }
             state = State.AUDIT_CHECKED;
             return current;
         }
 
         /**
+         * The audit's budget: {@code T_audit}, from the reading check-1 judged the allow against
+         * <p>
+         * Exactly what check-1 reserved - the same size, from the same point - so the budget is
+         * {@code T_audit - d} when {@code d} has passed since check-1. The monotonic clock is not read
+         * here; the budget reads it as it is spent, and a clock that runs backwards gives it no more
+         * than {@code T_audit}. One claim per attempt; a retry is a new attempt, with a new window and
+         * a new budget.
+         *
+         * @return a budget for the borrow and the insert together
+         * @throws IllegalStateException unless this is the first call after a check-1 that kept a
+         *     write-gated allow. A denial and a recovery allow have nothing to audit before a write, so
+         *     they have no budget.
+         */
+        @NotNull
+        public MetadataBudget claimAuditBudget() {
+            leave(state == State.AUDIT_CHECKED && isWriteAllow(current), "the audit budget claim",
+                State.AUDIT_CHECKED + " holding an allow check-1 kept");
+            MetadataBudget budget = MetadataBudget.startedAt(
+                service.monotonicClock, startNanos + checkOneElapsedNanos, service.config.auditTimeout());
+            state = State.AUDIT_CLAIMED;
+            return budget;
+        }
+
+        /**
          * check-2: enough left, after the audit insert, to reach the platform with {@code δ} to spare
          * <p>
-         * Judges what check-1 left, so a refusal from check-1 comes back as the very same object.
+         * Judges what check-1 left, so a refusal from check-1 comes back as the very same object, and
+         * so does a recovery allow. An allow is judged only once its audit budget has been claimed.
          *
          * @return the attempt's final decision - the only one the platform call may act on
-         * @throws IllegalStateException unless this is the first call after
-         *     {@link #requireMarginBeforeAudit}
+         * @throws IllegalStateException unless this is the first call after {@link #claimAuditBudget},
+         *     or, for a decision that is not a write-gated allow, after {@link #requireMarginBeforeAudit}
          */
         @NotNull
         public AuthorizationDecision requireMarginBeforeExecute() {
-            leave(State.AUDIT_CHECKED, "check-2");
-            current = requireMargin(current, service.config.expiryGuardMargin());
+            boolean claimed = state == State.AUDIT_CLAIMED;
+            leave(claimed || (state == State.AUDIT_CHECKED && !isWriteAllow(current)), "check-2",
+                State.AUDIT_CLAIMED + ", or " + State.AUDIT_CHECKED + " holding no write-gated allow");
+            if (claimed) {
+                current = requireMargin(current, elapsedNanos(), service.config.expiryGuardMargin());
+            }
             state = State.EXECUTE_CHECKED;
             return current;
         }
 
         /**
          * Leaves {@code expected} for good, or refuses the call and ends the attempt
+         */
+        private void leave(@NotNull State expected, @NotNull String call) {
+            leave(state == expected, call, expected.name());
+        }
+
+        /**
+         * Moves on when {@code accepted}, otherwise refuses the call and ends the attempt
          * <p>
          * The window is marked failed before the call does any work, and only a call that completes
          * moves it on. So a call that throws part way - whatever throws - leaves nothing a later
          * call could pick up.
          */
-        private void leave(@NotNull State expected, @NotNull String call) {
+        private void leave(boolean accepted, @NotNull String call, @NotNull String expected) {
             State was = state;
             state = State.FAILED;
-            if (was != expected) {
+            if (!accepted) {
                 throw new IllegalStateException(
                     "An expiry window accepts " + call + " only when " + expected + ", this one was " + was
                         + "; the attempt is over, and a retry needs a new window");
             }
         }
 
+        /**
+         * Whether a decision is one the margin applies to
+         * <p>
+         * A denial is already a denial, and a recovery allow was never measured against a grant.
+         */
+        private static boolean isWriteAllow(@Nullable AuthorizationDecision decision) {
+            return decision != null && decision.isAllowed()
+                && !AuthorizationDecision.RECOVERY_GRANT_ID.equals(decision.appliedGrantId());
+        }
+
         @NotNull
-        private AuthorizationDecision requireMargin(
+        private static AuthorizationDecision requireMargin(
             @NotNull AuthorizationDecision decision,
+            long elapsedNanos,
             @NotNull Duration margin
         ) {
-            // A denial is already a denial, and a recovery allow was never measured against a grant.
-            if (!decision.isAllowed() || AuthorizationDecision.RECOVERY_GRANT_ID.equals(decision.appliedGrantId())) {
-                return decision;
-            }
             // Never null here: the decision's constructor refuses a write-gated allow without one.
-            Duration left = decision.remainingLifetime().minus(Duration.ofNanos(elapsedNanos()));
+            Duration left = decision.remainingLifetime().minus(Duration.ofNanos(elapsedNanos));
             if (left.compareTo(margin) > 0) {
                 return decision;
             }

@@ -379,8 +379,9 @@ public class DbAccessPolicyPostgresTest {
     /**
      * EX-2 on PostgreSQL: check-2 is strict at {@code δ}, counted from before authorize
      * <p>
-     * check-1 passes with nothing elapsed; then {@code remaining - δ} minus a nanosecond is kept,
-     * exactly {@code remaining - δ} is refused, and a millisecond more is refused.
+     * check-1 passes with nothing elapsed and the audit budget is claimed; then {@code remaining - δ}
+     * minus a nanosecond is kept, exactly {@code remaining - δ} is refused, and a millisecond more is
+     * refused.
      */
     @Test
     public void ex2CheckTwoIsStrictAtTheExecuteMarginOnPostgres() throws Exception {
@@ -404,6 +405,7 @@ public class DbAccessPolicyPostgresTest {
             }
             AuthorizationDecision afterAudit = window.requireMarginBeforeAudit();
             expectWindow(violations, what + ", check-1 with nothing elapsed", allow, afterAudit, true);
+            window.claimAuditBudget();
             clock.set(BASE + elapsed);
             expectWindow(violations, what, allow, window.requireMarginBeforeExecute(), elapsed < boundary);
         }

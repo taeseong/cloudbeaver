@@ -23,6 +23,7 @@ import io.cloudbeaver.service.dbac.policy.DbAccessPolicyConfig;
 import io.cloudbeaver.service.dbac.policy.DbAccessPolicyService;
 import io.cloudbeaver.service.dbac.policy.DbOperationCategory;
 import io.cloudbeaver.service.dbac.policy.DenialReason;
+import io.cloudbeaver.service.dbac.policy.MetadataBudget;
 import io.cloudbeaver.service.dbac.policy.WriteAuthorizationRequest;
 import io.cloudbeaver.service.dbac.tempwrite.EndpointSnapshot;
 import io.cloudbeaver.service.dbac.tempwrite.MetadataConnectionSource;
@@ -121,6 +122,9 @@ public class DbAccessPolicyTest {
     /** check-2's margin, {@code δ} */
     private static final Duration EXECUTE_MARGIN = DbAccessPolicyConfig.defaults().expiryGuardMargin();
 
+    /** {@code T_audit}: what check-1 reserves for the audit, and the budget the audit is given */
+    private static final Duration AUDIT_TIMEOUT = DbAccessPolicyConfig.defaults().auditTimeout();
+
     /** What {@link #MARGIN_AFTER_SCHEMA} leaves: one millisecond more than check-1's margin */
     private static final Duration MARGIN_AFTER_REMAINING = AUDIT_MARGIN.plusMillis(1);
 
@@ -133,6 +137,9 @@ public class DbAccessPolicyTest {
 
     /** How {@link #call} reports a call the window refused */
     private static final String REFUSED = "refused";
+
+    /** How {@link #call} reports an audit budget the window handed out */
+    private static final String BUDGET = "a budget";
 
     private static CBDatabase database;
 
@@ -1919,10 +1926,11 @@ public class DbAccessPolicyTest {
     /**
      * EX-2: check-2 is strict at {@code δ}, counted from before authorize
      * <p>
-     * The same view as EX-1, so check-1 passes with nothing elapsed. The clock then moves to where
-     * the audit insert would have left it: {@code remaining - δ} minus a nanosecond is kept, exactly
-     * {@code remaining - δ} is refused, a millisecond more is refused. The audit itself, and the
-     * compensating row a refusal here needs, belong to the enforcement gate and are not tested here.
+     * The same view as EX-1, so check-1 passes with nothing elapsed, and the attempt claims its audit
+     * budget as an allow must before check-2. The clock then moves to where the audit insert would have
+     * left it: {@code remaining - δ} minus a nanosecond is kept, exactly {@code remaining - δ} is
+     * refused, a millisecond more is refused. The audit itself, and the compensating row a refusal here
+     * needs, belong to the enforcement gate and are not tested here.
      */
     @Test
     public void ex2CheckTwoIsStrictAtTheExecuteMargin() throws Exception {
@@ -1943,6 +1951,7 @@ public class DbAccessPolicyTest {
             }
             AuthorizationDecision afterAudit = attempt.window().requireMarginBeforeAudit();
             expectWindow(violations, what + ", check-1 with nothing elapsed", allow, afterAudit, true);
+            attempt.window().claimAuditBudget();
             clock.set(BASE + elapsed);
             expectWindow(violations, what, allow, attempt.window().requireMarginBeforeExecute(), elapsed < boundary);
         }
@@ -1963,12 +1972,14 @@ public class DbAccessPolicyTest {
      *       at the start, or an hour before it - because it judges what check-1 left. Were it to
      *       judge the original allow, its smaller margin would let the write through.</li>
      *   <li>L-2: nothing can hand a window a decision from anywhere else. Its public methods are
-     *       exactly {@code authorize(request)} and the two checks, which take no argument; no method
-     *       of the window or the service that is not private takes an {@link AuthorizationDecision} or
-     *       a window; its constructors and fields
+     *       exactly {@code authorize(request)}, the two checks and the audit budget claim, which take
+     *       no argument - P5-3 added the claim on purpose; no method of the window or the service that
+     *       is not private takes an {@link AuthorizationDecision}, a window or a {@link MetadataBudget};
+     *       its constructors and fields
      *       are private and the class is final; and {@code openExpiryWindow()} is the only way the
      *       service hands one out. So an allow measured in one attempt cannot be judged against a
-     *       window opened later, whose count would start at zero.</li>
+     *       window opened later, whose count would start at zero, and no budget made elsewhere can be
+     *       passed off as the one check-1 reserved.</li>
      *   <li>A denial and a recovery allow are carried through both checks as the same object, even
      *       an hour on.</li>
      * </ol>
@@ -2021,7 +2032,8 @@ public class DbAccessPolicyTest {
             }
         }
         Set<String> expectedApi = new TreeSet<>(List.of(
-            "authorize(WriteAuthorizationRequest)", "requireMarginBeforeAudit()", "requireMarginBeforeExecute()"));
+            "authorize(WriteAuthorizationRequest)", "requireMarginBeforeAudit()", "claimAuditBudget()",
+            "requireMarginBeforeExecute()"));
         if (!expectedApi.equals(publicApi)) {
             violations.add("L-2: the window's public methods must be exactly " + expectedApi + ", got " + publicApi);
         }
@@ -2040,9 +2052,11 @@ public class DbAccessPolicyTest {
         }
         for (Method method : reachable) {
             for (Class<?> parameter : method.getParameterTypes()) {
-                if (AuthorizationDecision.class.isAssignableFrom(parameter) || parameter == window) {
+                if (AuthorizationDecision.class.isAssignableFrom(parameter) || parameter == window
+                    || MetadataBudget.class.isAssignableFrom(parameter)
+                ) {
                     violations.add("L-2: " + method.getDeclaringClass().getSimpleName() + "." + signature(method)
-                        + " lets a caller put a decision and a window together that do not belong together");
+                        + " lets a caller put a decision, a budget and a window together that do not belong together");
                 }
             }
         }
@@ -2176,8 +2190,11 @@ public class DbAccessPolicyTest {
                 continue;
             }
             AuthorizationDecision afterAudit = attempt.window().requireMarginBeforeAudit();
-            AuthorizationDecision afterExecute = attempt.window().requireMarginBeforeExecute();
             boolean kept = afterAudit == allow;
+            if (kept) {
+                attempt.window().claimAuditBudget();
+            }
+            AuthorizationDecision afterExecute = attempt.window().requireMarginBeforeExecute();
             expectWindow(violations, what + ", check-1", allow, afterAudit, delay < ONE_MS);
             if (kept) {
                 expectWindow(violations, what + ", check-2", allow, afterExecute, true);
@@ -2224,6 +2241,7 @@ public class DbAccessPolicyTest {
                 }
                 AuthorizationDecision afterAudit = attempt.window().requireMarginBeforeAudit();
                 expectWindow(violations, what + ", check-1", allow, afterAudit, true);
+                attempt.window().claimAuditBudget();
                 clock.set(BASE + total);
                 expectWindow(violations, what, allow,
                     attempt.window().requireMarginBeforeExecute(), total < boundary);
@@ -2240,7 +2258,7 @@ public class DbAccessPolicyTest {
      * must return check-1's refusal, the same object. In the second the metadata delay leaves check-1
      * standing and the audit crosses check-2's boundary; when the clock then goes back to where the
      * metadata path left it, to the start or before it, the attempt is already over - another
-     * authorize and either check are refused, and the refusal stands as its last answer.
+     * authorize, either check and the claim are refused, and the refusal stands as its last answer.
      */
     @Test
     public void exM4ARegressionAfterAMetadataDelayGivesNothingBack() throws Exception {
@@ -2276,6 +2294,7 @@ public class DbAccessPolicyTest {
         if (allow.isAllowed()) {
             expectWindow(violations, "check-1 after a " + metadata + "ns metadata delay", allow,
                 audited.window().requireMarginBeforeAudit(), true);
+            audited.window().claimAuditBudget();
             clock.set(BASE + boundary);
             expectWindow(violations, "check-2 at its boundary", allow,
                 audited.window().requireMarginBeforeExecute(), false);
@@ -2358,6 +2377,7 @@ public class DbAccessPolicyTest {
             try {
                 AuthorizationDecision afterAudit = far.window().requireMarginBeforeAudit();
                 expectWindow(violations, "a thousand years left, Long.MAX_VALUE ns elapsed, check-1", allow, afterAudit, true);
+                far.window().claimAuditBudget();
                 expectWindow(violations, "a thousand years left, Long.MAX_VALUE ns elapsed, check-2", allow,
                     far.window().requireMarginBeforeExecute(), true);
             } catch (ArithmeticException e) {
@@ -2375,20 +2395,23 @@ public class DbAccessPolicyTest {
      *   <li>Every combination of four starting points (both ends of the range among them), four
      *       metadata delays either side of check-1's boundary, and seven readings for check-2 -
      *       either side of its boundary, far past it, and back to or behind the start. Each is one
-     *       attempt, authorize then check-1 then check-2, and every verdict is compared with an
+     *       attempt, authorize then check-1 then - for an allow it kept - the audit budget claim,
+     *       then check-2, and every verdict is compared with an
      *       oracle that knows the true elapsed time - the test decides it and derives the clock
      *       readings from it - rather than recomputing it from the readings as the window must. A
      *       refusal from check-1 must be what check-2 returns, the same object; a denial followed by
      *       an allow is counted.</li>
      *   <li>The attempt's state machine, exhaustively: from each state a window can be in - just
-     *       opened, authorized, after check-1, after check-2 - each of the three calls. Only
-     *       authorize, check-1 and check-2, once each and in that order, are accepted. Every other
+     *       opened, authorized, after check-1, after the claim, after check-2 - each of the four calls.
+     *       Only authorize, check-1, the claim and check-2, once each and in that order, are accepted
+     *       for an allow. Every other
      *       call is refused and ends the attempt, so the call that would have been next is refused
      *       too. A request the service refuses outright - a null one - ends it the same way.</li>
      *   <li>A monotonic clock that throws. Opening a window fails, so there is no window. At check-1
      *       or check-2 the clock's own exception comes out unchanged, nothing is returned, and every
      *       later call is refused, so no allow can follow it - the same check retried at once, against
-     *       a clock that works again, included. The window deliberately does not turn
+     *       a clock that works again, included. The claim reads no clock, so the third read is still
+     *       check-2's. The window deliberately does not turn
      *       the failure into a denial of its own: the enforcement gate maps it to
      *       {@code PERMISSION_STORE_UNAVAILABLE}, and that mapping is a later slice's to build and
      *       test.</li>
@@ -2429,6 +2452,9 @@ public class DbAccessPolicyTest {
                     if ((first == allow) != firstKept) {
                         mismatches.add(what + ": check-1 gave " + outcome(first) + ", the oracle "
                             + (firstKept ? "keeps it" : "refuses it"));
+                    }
+                    if (first == allow) {
+                        attempt.window().claimAuditBudget();
                     }
                     clock.set(start + beforeExecute);
                     AuthorizationDecision second = attempt.window().requireMarginBeforeExecute();
@@ -2498,8 +2524,8 @@ public class DbAccessPolicyTest {
         }
 
         Map<Integer, List<String>> expectedWithFailingClock = Map.of(
-            2, List.of("AUTHORIZE an allow", "CHECK_1 threw", "CHECK_2 " + REFUSED),
-            3, List.of("AUTHORIZE an allow", "CHECK_1 an allow", "CHECK_2 threw"));
+            2, List.of("AUTHORIZE an allow", "CHECK_1 threw", "CLAIM " + REFUSED, "CHECK_2 " + REFUSED),
+            3, List.of("AUTHORIZE an allow", "CHECK_1 an allow", "CLAIM " + BUDGET, "CHECK_2 threw"));
         for (int failingRead = 1; failingRead <= 3; failingRead++) {
             String where = "a monotonic clock failing from read " + failingRead;
             DbAccessPolicyService service = new DbAccessPolicyService(
@@ -2530,7 +2556,7 @@ public class DbAccessPolicyTest {
                 mismatches.add(where + ": expected " + expectedWithFailingClock.get(failingRead) + ", got " + outcomes);
             }
             for (Call next : order) {
-                String result = call(window, next, request(user, container()));
+                String result = callOrThrew(window, next, request(user, container()));
                 if (!REFUSED.equals(result)) {
                     mismatches.add(where + ": after the failure, " + next + " must be refused, got " + result);
                 }
@@ -2540,8 +2566,10 @@ public class DbAccessPolicyTest {
         // The same failure with a clock that works again straight afterwards, and the very check that
         // failed retried at once. The retry must be refused: the attempt ended when the check failed.
         Map<Integer, List<String>> expectedWithRecoveringClock = Map.of(
-            2, List.of("AUTHORIZE an allow", "CHECK_1 threw", "CHECK_1 again " + REFUSED, "CHECK_2 " + REFUSED),
-            3, List.of("AUTHORIZE an allow", "CHECK_1 an allow", "CHECK_2 threw", "CHECK_2 again " + REFUSED));
+            2, List.of("AUTHORIZE an allow", "CHECK_1 threw", "CHECK_1 again " + REFUSED, "CLAIM " + REFUSED,
+                "CHECK_2 " + REFUSED),
+            3, List.of("AUTHORIZE an allow", "CHECK_1 an allow", "CLAIM " + BUDGET, "CHECK_2 threw",
+                "CHECK_2 again " + REFUSED));
         for (int failingRead = 2; failingRead <= 3; failingRead++) {
             DbAccessPolicyService.ExpiryWindow window = new DbAccessPolicyService(
                 leases.of(marginSource(MARGIN_AFTER_SCHEMA)), DbAccessPolicyConfig.defaults(), PolicyTestSupport.systemClock(),
@@ -2552,7 +2580,7 @@ public class DbAccessPolicyTest {
                     outcomes.add(next + " " + call(window, next, request(user, container())));
                 } catch (ClockFailure e) {
                     outcomes.add(next + " threw");
-                    outcomes.add(next + " again " + call(window, next, request(user, container())));
+                    outcomes.add(next + " again " + callOrThrew(window, next, request(user, container())));
                 }
             }
             if (!expectedWithRecoveringClock.get(failingRead).equals(outcomes)) {
@@ -2565,6 +2593,223 @@ public class DbAccessPolicyTest {
             + " state-machine cases, " + mismatches.size() + " mismatches, " + transitions + " denial-to-allow transitions";
         Assertions.assertTrue(mismatches.isEmpty() && transitions == 0,
             "EX-M6 (" + summary + "): " + String.join("; ", mismatches.subList(0, Math.min(20, mismatches.size()))));
+    }
+
+    // ---------------------------------------------------------------- the audit budget (P5-3)
+    //
+    // check-1 reserves T_audit + δ before the audit. The audit must then be given exactly the T_audit of
+    // that reservation: the same size, counted from the same reading. A budget that started later would
+    // let the audit eat into δ; one that started earlier would refuse audits check-1 made room for.
+
+    /**
+     * EX-A1: the audit budget is {@code T_audit} from the reading check-1 judged, and claiming it reads no clock
+     * <p>
+     * Each attempt spends {@code metadata} on the metadata path - none, or half a millisecond that
+     * check-1 still keeps - and then {@code d} more after check-1 before the claim. Exactly
+     * {@code T_audit - d} must be left: not {@code T_audit}, which a budget counted from the claim would
+     * leave, and not {@code T_audit - metadata - d}, which one counted from the window's opening would.
+     * The claim must not read the monotonic clock; the budget reads it when asked what is left.
+     */
+    @Test
+    public void exA1TheAuditBudgetStartsAtCheckOnesReading() throws Exception {
+        String user = activeUser("policy-exa1");
+        grant(user, Duration.ofMinutes(30));
+        assertMarginFixture(user);
+        long auditNanos = AUDIT_TIMEOUT.toNanos();
+        List<String> violations = new ArrayList<>();
+        int cases = 0;
+        for (long metadata : new long[]{0, ONE_MS / 2}) {
+            for (long d : new long[]{0, 1, ONE_MS, ONE_SECOND, auditNanos - 1, auditNanos, auditNanos + ONE_MS}) {
+                cases++;
+                String what = "metadata " + metadata + "ns, claimed " + d + "ns after check-1";
+                ManualNanoClock clock = new ManualNanoClock(BASE);
+                Attempt attempt = attempt(
+                    MARGIN_AFTER_SCHEMA, user, clock, MetadataDelay.query(metadata), PolicyTestSupport.systemClock());
+                Assertions.assertTrue(attempt.decision().isAllowed(), "FIXTURE EX-A1 " + what + ": authorize must allow");
+                expectWindow(violations, what + ", check-1", attempt.decision(),
+                    attempt.window().requireMarginBeforeAudit(), true);
+                clock.set(BASE + metadata + d);
+                int readsBefore = clock.reads();
+                MetadataBudget budget = attempt.window().claimAuditBudget();
+                if (clock.reads() != readsBefore) {
+                    violations.add(what + ": the claim read the monotonic clock " + (clock.reads() - readsBefore) + " time(s)");
+                }
+                if (!AUDIT_TIMEOUT.equals(budget.total())) {
+                    violations.add(what + ": the budget must be T_audit = " + AUDIT_TIMEOUT + ", got " + budget.total());
+                }
+                Duration expected = AUDIT_TIMEOUT.minusNanos(d);
+                Duration left = budget.remaining();
+                if (!expected.equals(left)) {
+                    violations.add(what + ": T_audit - d = " + expected + " must be left, got " + left);
+                }
+            }
+        }
+        Assertions.assertEquals(14, cases, "FIXTURE EX-A1");
+        Assertions.assertEquals(List.of(), violations, "EX-A1");
+    }
+
+    /**
+     * EX-A2: a clock that runs backwards gives the audit budget nothing, and a wrapping clock costs it nothing
+     * <p>
+     * Three parts. After the budget has seen 300 ms spent, the clock reads check-1's point, the window's
+     * start and an hour before it: what is left must not grow. A claim made while the clock is already
+     * behind check-1's reading leaves {@code T_audit} and never more - a budget counted from the window's
+     * opening would leave less. And starts that make the readings wrap - just below
+     * {@code Long.MAX_VALUE}, on it, on {@code Long.MIN_VALUE}, either side of zero - must leave exactly
+     * {@code T_audit - d}, as EX-A1 does for the same {@code d}.
+     */
+    @Test
+    public void exA2TheAuditBudgetGivesNothingBackAndSurvivesAWrap() throws Exception {
+        String user = activeUser("policy-exa2");
+        grant(user, Duration.ofMinutes(30));
+        assertMarginFixture(user);
+        final long auditNanos = AUDIT_TIMEOUT.toNanos();
+        long metadata = ONE_MS / 4;
+        List<String> violations = new ArrayList<>();
+
+        for (long back : new long[]{metadata, 0, -ONE_HOUR}) {
+            String what = "300ms spent, then the clock at " + back + "ns";
+            ManualNanoClock clock = new ManualNanoClock(BASE);
+            Attempt attempt = attempt(
+                MARGIN_AFTER_SCHEMA, user, clock, MetadataDelay.query(metadata), PolicyTestSupport.systemClock());
+            Assertions.assertTrue(attempt.decision().isAllowed(), "FIXTURE EX-A2 " + what + ": authorize must allow");
+            expectWindow(violations, what + ", check-1", attempt.decision(), attempt.window().requireMarginBeforeAudit(), true);
+            MetadataBudget budget = attempt.window().claimAuditBudget();
+            clock.set(BASE + metadata + 300 * ONE_MS);
+            Duration spent = budget.remaining();
+            clock.set(BASE + back);
+            Duration afterRegression = budget.remaining();
+            if (!AUDIT_TIMEOUT.minusMillis(300).equals(spent) || !spent.equals(afterRegression)) {
+                violations.add(what + ": expected " + AUDIT_TIMEOUT.minusMillis(300)
+                    + " left before and after the regression, got " + spent + " then " + afterRegression);
+            }
+        }
+
+        for (long behind : new long[]{1, ONE_MS / 8, ONE_HOUR}) {
+            String what = "claimed with the clock " + behind + "ns behind check-1's reading";
+            ManualNanoClock clock = new ManualNanoClock(BASE);
+            Attempt attempt = attempt(
+                MARGIN_AFTER_SCHEMA, user, clock, MetadataDelay.query(metadata), PolicyTestSupport.systemClock());
+            Assertions.assertTrue(attempt.decision().isAllowed(), "FIXTURE EX-A2 " + what + ": authorize must allow");
+            expectWindow(violations, what + ", check-1", attempt.decision(), attempt.window().requireMarginBeforeAudit(), true);
+            clock.set(BASE + metadata - behind);
+            MetadataBudget budget = attempt.window().claimAuditBudget();
+            Duration left = budget.remaining();
+            if (!AUDIT_TIMEOUT.equals(left)) {
+                violations.add(what + ": T_audit and no more must be left, got " + left);
+            }
+        }
+
+        record Case(String name, long start, long d) {
+        }
+
+        Case[] cases = {
+            new Case("check-1's reading wraps past Long.MAX_VALUE", Long.MAX_VALUE - metadata / 2, 500 * ONE_MS),
+            new Case("the audit wraps past Long.MAX_VALUE", Long.MAX_VALUE - metadata - ONE_MS, 500 * ONE_MS),
+            new Case("starting on Long.MAX_VALUE", Long.MAX_VALUE, auditNanos - 1),
+            new Case("starting on Long.MIN_VALUE", Long.MIN_VALUE, auditNanos),
+            new Case("crossing zero", -metadata / 2, auditNanos + 1),
+            new Case("ending just below zero", -metadata - auditNanos, auditNanos - ONE_MS),
+        };
+        for (Case one : cases) {
+            ManualNanoClock clock = new ManualNanoClock(one.start());
+            Attempt attempt = attempt(
+                MARGIN_AFTER_SCHEMA, user, clock, MetadataDelay.query(metadata), PolicyTestSupport.systemClock());
+            Assertions.assertTrue(attempt.decision().isAllowed(), "FIXTURE EX-A2 " + one.name() + ": authorize must allow");
+            expectWindow(violations, one.name() + ", check-1", attempt.decision(),
+                attempt.window().requireMarginBeforeAudit(), true);
+            MetadataBudget budget = attempt.window().claimAuditBudget();
+            clock.set(one.start() + metadata + one.d());
+            Duration expected = AUDIT_TIMEOUT.minusNanos(one.d());
+            Duration left = budget.remaining();
+            if (!expected.equals(left)) {
+                violations.add(one.name() + ": T_audit - d = " + expected + " must be left, got " + left);
+            }
+        }
+        Assertions.assertEquals(List.of(), violations, "EX-A2");
+    }
+
+    /**
+     * EX-A3: one claim, only between a check-1 that kept a write-gated allow and check-2 - and check-2 waits for it
+     * <p>
+     * Each row is an attempt of its own and every refusal ends it, so the call after a refused one is
+     * refused too. A claim before authorize, before check-1, a second time, or after check-2 is
+     * refused. check-2 on a kept allow with no claim is refused. A denial - check-1's own
+     * {@code GRANT_EXPIRED} or a {@code NO_GRANT} from authorize - and a recovery allow have nothing to
+     * audit before a write and get no budget; without a claim, check-2 hands each back as the very
+     * object check-1 left, exactly as before the claim existed.
+     */
+    @Test
+    public void exA3TheAuditBudgetIsClaimedOnceAndOnlyForAKeptAllow() throws Exception {
+        String user = activeUser("policy-exa3");
+        grant(user, Duration.ofMinutes(30));
+        assertMarginFixture(user);
+        String noGrant = activeUser("policy-exa3-nogrant");
+        WriteAuthorizationRequest rollback = new WriteAuthorizationRequest(
+            null, null, DbOperationCategory.TRANSACTION_ROLLBACK, null, false);
+        String allow = "an allow";
+        String expired = "a denial for " + DenialReason.GRANT_EXPIRED;
+        String none = "a denial for " + DenialReason.NO_GRANT;
+        MetadataDelay crossing = MetadataDelay.query(ONE_MS);
+
+        record Case(String name, String requester, MetadataDelay delay, List<Call> calls, List<String> expected) {
+        }
+
+        List<Case> cases = List.of(
+            new Case("a claim before authorize", user, MetadataDelay.NONE,
+                List.of(Call.CLAIM, Call.AUTHORIZE), List.of(REFUSED, REFUSED)),
+            new Case("a claim before check-1", user, MetadataDelay.NONE,
+                List.of(Call.AUTHORIZE, Call.CLAIM, Call.CHECK_1), List.of(allow, REFUSED, REFUSED)),
+            new Case("a second claim", user, MetadataDelay.NONE,
+                List.of(Call.AUTHORIZE, Call.CHECK_1, Call.CLAIM, Call.CLAIM, Call.CHECK_2),
+                List.of(allow, allow, BUDGET, REFUSED, REFUSED)),
+            new Case("check-2 on a kept allow without a claim", user, MetadataDelay.NONE,
+                List.of(Call.AUTHORIZE, Call.CHECK_1, Call.CHECK_2, Call.CLAIM), List.of(allow, allow, REFUSED, REFUSED)),
+            new Case("a claim after check-2", user, MetadataDelay.NONE,
+                List.of(Call.AUTHORIZE, Call.CHECK_1, Call.CLAIM, Call.CHECK_2, Call.CLAIM),
+                List.of(allow, allow, BUDGET, allow, REFUSED)),
+            new Case("a claim after check-1 refused the allow", user, crossing,
+                List.of(Call.AUTHORIZE, Call.CHECK_1, Call.CLAIM, Call.CHECK_2), List.of(allow, expired, REFUSED, REFUSED)),
+            new Case("check-2 after check-1 refused the allow", user, crossing,
+                List.of(Call.AUTHORIZE, Call.CHECK_1, Call.CHECK_2), List.of(allow, expired, expired)),
+            new Case("a claim for a denial", noGrant, MetadataDelay.NONE,
+                List.of(Call.AUTHORIZE, Call.CHECK_1, Call.CLAIM, Call.CHECK_2), List.of(none, none, REFUSED, REFUSED)),
+            new Case("check-2 for a denial", noGrant, MetadataDelay.NONE,
+                List.of(Call.AUTHORIZE, Call.CHECK_1, Call.CHECK_2), List.of(none, none, none)),
+            new Case("a claim for a recovery allow", null, MetadataDelay.NONE,
+                List.of(Call.AUTHORIZE, Call.CHECK_1, Call.CLAIM, Call.CHECK_2), List.of(allow, allow, REFUSED, REFUSED)),
+            new Case("check-2 for a recovery allow", null, MetadataDelay.NONE,
+                List.of(Call.AUTHORIZE, Call.CHECK_1, Call.CHECK_2), List.of(allow, allow, allow)));
+        List<String> violations = new ArrayList<>();
+        for (Case one : cases) {
+            DbAccessPolicyService.ExpiryWindow window = marginService(
+                MARGIN_AFTER_SCHEMA, PolicyTestSupport.systemClock(), new ManualNanoClock(BASE), one.delay()).openExpiryWindow();
+            WriteAuthorizationRequest request = one.requester() == null ? rollback : request(one.requester(), container());
+            List<String> results = new ArrayList<>();
+            for (Call next : one.calls()) {
+                results.add(callReportingFailure(window, next, request));
+            }
+            if (!one.expected().equals(results)) {
+                violations.add(one.name() + ": expected " + one.expected() + ", got " + results);
+            }
+        }
+
+        // Without a claim, check-2 must hand back the very object check-1 left - and, for a decision
+        // check-1 does not judge, the very object authorize returned.
+        for (String requester : new String[]{user, noGrant, null}) {
+            boolean refusedByCheckOne = user.equals(requester);
+            String what = requester == null ? "a recovery allow" : refusedByCheckOne ? "check-1's refusal" : "a denial";
+            DbAccessPolicyService.ExpiryWindow window = marginService(MARGIN_AFTER_SCHEMA, PolicyTestSupport.systemClock(),
+                new ManualNanoClock(BASE), refusedByCheckOne ? crossing : MetadataDelay.NONE).openExpiryWindow();
+            AuthorizationDecision authorized = window.authorize(requester == null ? rollback : request(requester, container()));
+            AuthorizationDecision afterAudit = window.requireMarginBeforeAudit();
+            AuthorizationDecision afterExecute = window.requireMarginBeforeExecute();
+            if (afterExecute != afterAudit || (!refusedByCheckOne && afterAudit != authorized)) {
+                violations.add(what + ": must be the same object through both checks without a claim, got "
+                    + outcome(authorized) + ", " + outcome(afterAudit) + ", " + outcome(afterExecute));
+            }
+        }
+        Assertions.assertEquals(List.of(), violations, "EX-A3");
     }
 
     // ---------------------------------------------------------------- helpers
@@ -2841,16 +3086,16 @@ public class DbAccessPolicyTest {
             database.openConnection(), DbacTestSupport.config(database.getDatabaseConfig(), target));
     }
 
-    /** The three calls a window takes, in the only order it takes them */
+    /** The four calls a window takes for a write-gated allow, in the only order it takes them */
     private enum Call {
-        AUTHORIZE, CHECK_1, CHECK_2
+        AUTHORIZE, CHECK_1, CLAIM, CHECK_2
     }
 
     /**
      * Makes one call on a window and describes what came back
      *
-     * @return {@link #REFUSED} when the window refused the call, otherwise the decision's outcome.
-     *     Any other exception - a failing clock - propagates.
+     * @return {@link #REFUSED} when the window refused the call, {@link #BUDGET} for a budget it handed
+     *     out, otherwise the decision's outcome. Any other exception - a failing clock - propagates.
      */
     @NotNull
     private static String call(
@@ -2859,14 +3104,50 @@ public class DbAccessPolicyTest {
         @Nullable WriteAuthorizationRequest request
     ) {
         try {
-            AuthorizationDecision result = switch (call) {
-                case AUTHORIZE -> window.authorize(request);
-                case CHECK_1 -> window.requireMarginBeforeAudit();
-                case CHECK_2 -> window.requireMarginBeforeExecute();
+            return switch (call) {
+                case AUTHORIZE -> outcome(window.authorize(request));
+                case CHECK_1 -> outcome(window.requireMarginBeforeAudit());
+                case CLAIM -> window.claimAuditBudget() == null ? "no budget" : BUDGET;
+                case CHECK_2 -> outcome(window.requireMarginBeforeExecute());
             };
-            return outcome(result);
         } catch (IllegalStateException e) {
             return REFUSED;
+        }
+    }
+
+    /**
+     * The same, reporting a failing clock as {@code "threw"} rather than letting it end the test
+     */
+    @NotNull
+    private static String callOrThrew(
+        @NotNull DbAccessPolicyService.ExpiryWindow window,
+        @NotNull Call call,
+        @Nullable WriteAuthorizationRequest request
+    ) {
+        try {
+            return call(window, call, request);
+        } catch (ClockFailure e) {
+            return "threw";
+        }
+    }
+
+    /**
+     * The same, reporting any other exception as {@code "threw <type>"}
+     * <p>
+     * A window that hands a budget to a decision it should not ends up judging that decision at check-2,
+     * and a denial has no remaining lifetime to judge. That must read as the wrong answer it is, not end
+     * the test before the answer is compared.
+     */
+    @NotNull
+    private static String callReportingFailure(
+        @NotNull DbAccessPolicyService.ExpiryWindow window,
+        @NotNull Call call,
+        @Nullable WriteAuthorizationRequest request
+    ) {
+        try {
+            return call(window, call, request);
+        } catch (RuntimeException e) {
+            return "threw " + e.getClass().getSimpleName();
         }
     }
 

@@ -26,6 +26,7 @@ import io.cloudbeaver.model.session.WebSessionTest;
 import io.cloudbeaver.service.dbac.policy.enforcement.DeploymentGuard;
 import io.cloudbeaver.test.platform.admin.AdminCreateUserTest;
 import io.cloudbeaver.test.platform.admin.AdminLastLoginTimeTest;
+import io.cloudbeaver.test.platform.dbac.AuditFailClosedTest;
 import io.cloudbeaver.test.platform.dbac.BoundedBorrowTest;
 import io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest;
 import io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest;
@@ -108,7 +109,8 @@ import org.junit.platform.suite.api.Suite;
         MetadataLeasePostgresTest.class,
         DbacFenceMigrationTest.class,
         UserRecreationTest.class,
-        TaintRegistryLifecycleTest.class
+        TaintRegistryLifecycleTest.class,
+        AuditFailClosedTest.class
     }
 )
 public class CEServerTestSuite {
