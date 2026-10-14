@@ -48,6 +48,7 @@ import io.cloudbeaver.test.platform.dbac.MetadataDisposalTest;
 import io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest;
 import io.cloudbeaver.test.platform.dbac.MetadataLeaseTest;
 import io.cloudbeaver.test.platform.dbac.MetadataShutdownTest;
+import io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteModelTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest;
@@ -106,7 +107,8 @@ import org.junit.platform.suite.api.Suite;
         MetadataDeadlineTest.class,
         MetadataLeasePostgresTest.class,
         DbacFenceMigrationTest.class,
-        UserRecreationTest.class
+        UserRecreationTest.class,
+        TaintRegistryLifecycleTest.class
     }
 )
 public class CEServerTestSuite {

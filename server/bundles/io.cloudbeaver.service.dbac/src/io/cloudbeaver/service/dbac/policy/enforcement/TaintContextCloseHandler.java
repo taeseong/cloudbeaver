@@ -30,8 +30,8 @@ import java.util.function.BooleanSupplier;
  * Tells the taint sink when an execution context closes
  * <p>
  * A close is reported synchronously on the closing thread, and a sever or a reconnect is not
- * reported at all (CH-7). In P3 the production sink does nothing, because nothing can be tainted
- * before enforcement is wired; the transaction taint registry takes its place in P5.
+ * reported at all (CH-7). The production sink is the {@link TransactionTaintRegistry}, which forgets
+ * the closed context at once.
  * <p>
  * The handler has no way to change the policy lifecycle. It reports a close only while
  * {@code accepting} says the lifecycle it belongs to is ready or failed, so a close after the
@@ -43,7 +43,7 @@ public final class TaintContextCloseHandler extends DefaultExecutionHandler {
      * Where closes are reported, and what the lifecycle clears when it stops
      */
     public interface TaintSink {
-        /** Records nothing; the P3 production sink, until the taint registry exists */
+        /** Records nothing; production uses the {@link TransactionTaintRegistry} */
         TaintSink NONE = new TaintSink() {
             @Override
             public void contextClosed(long contextId) {
@@ -119,8 +119,8 @@ public final class TaintContextCloseHandler extends DefaultExecutionHandler {
      * <p>
      * Nothing it hits leaves it (C16): a {@code RuntimeException} or an {@code Error} from the
      * accepting check or from the sink is logged by event code, correlation id and exception class
-     * only, and a log that cannot be written is ignored. Otherwise the query manager would log what
-     * reached it with its message and stack trace, and an {@code Error} would leave its dispatcher.
+     * only, and a log that cannot be written is ignored. Otherwise the query manager's dispatcher would
+     * catch it - an {@code Error} included - and log it with its message and stack trace.
      */
     @Override
     public void handleContextClose(@NotNull DBCExecutionContext context) {

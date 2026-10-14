@@ -57,6 +57,8 @@ REQUIRED_VALUE = "true"
 # belongs to the statement there, a timed-out statement is cancelled, and an abort really closes.
 # The P5-F classes run the version 4 quarantine on PostgreSQL - version-only recovery and two concurrent
 # upgrades among it - and the grant fence's user lookup and timeouts against a PostgreSQL metadata schema.
+# TaintRegistryLifecycleTest closes real PostgreSQL execution contexts through the query manager, to prove the
+# production close handler empties the taint registry (TR-2) and keeps a registry failure to itself (TR-10).
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
@@ -70,6 +72,7 @@ POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest",
     "io.cloudbeaver.test.platform.dbac.DbacFenceMigrationTest",
     "io.cloudbeaver.test.platform.dbac.UserRecreationTest",
+    "io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -107,6 +110,7 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest": 3,
     "io.cloudbeaver.test.platform.dbac.DbacFenceMigrationTest": 15,
     "io.cloudbeaver.test.platform.dbac.UserRecreationTest": 8,
+    "io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest": 14,
 }
 
 for _postgres_class in POSTGRES_CLASSES:

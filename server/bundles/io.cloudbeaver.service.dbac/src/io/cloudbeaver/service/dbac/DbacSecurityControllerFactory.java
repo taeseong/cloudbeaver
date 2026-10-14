@@ -30,6 +30,7 @@ import io.cloudbeaver.service.dbac.policy.DbAccessPolicyConfig;
 import io.cloudbeaver.service.dbac.policy.DbAccessPolicyService;
 import io.cloudbeaver.service.dbac.policy.enforcement.DeploymentGuard;
 import io.cloudbeaver.service.dbac.policy.enforcement.TaintContextCloseHandler;
+import io.cloudbeaver.service.dbac.policy.enforcement.TransactionTaintRegistry;
 import io.cloudbeaver.service.security.CBEmbeddedSecurityController;
 import io.cloudbeaver.service.security.EmbeddedSecurityControllerFactory;
 import io.cloudbeaver.service.security.db.CBDatabase;
@@ -300,13 +301,19 @@ public class DbacSecurityControllerFactory<T extends ServletAuthApplication>
         }
     }
 
+    /**
+     * The server's seams: the production guard, the query manager, the global taint registry and the policy service
+     * <p>
+     * The one registry instance becomes both the close handler's sink and the cleanup plan's, so the shutdown clears
+     * exactly the registry the handler reported to.
+     */
     @NotNull
     private static LifecycleSeams productionSeams(@NotNull ServletApplication application) {
         DeploymentGuard guard = new DeploymentGuard(DeploymentGuard.Environment.production(application));
         return new LifecycleSeams(
             (database, revocation) -> guard.admit(DeploymentGuard.MetadataTarget.of(database), revocation),
             TaintContextCloseHandler.HandlerRegistrar.QUERY_MANAGER,
-            TaintContextCloseHandler.TaintSink.NONE,
+            TransactionTaintRegistry.global(),
             database -> new DbAccessPolicyService(database.metadataLeases(), DbAccessPolicyConfig.defaults())
         );
     }
