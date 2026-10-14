@@ -72,6 +72,8 @@ public class TempWriteRepositoryTest {
 
     private final TempWriteGrantRepository repository = new TempWriteGrantRepository();
     private final List<TempWritePermissionKey> touched = new ArrayList<>();
+    /** Users made for the keys this test grants on: a grant is issued only to a user that exists (P5-F) */
+    private final List<String> users = new ArrayList<>();
 
     @BeforeAll
     public static void startServer() throws Exception {
@@ -86,8 +88,12 @@ public class TempWriteRepositoryTest {
             for (TempWritePermissionKey key : touched) {
                 TempWriteTestSupport.deleteKey(connection, key);
             }
+            for (String user : users) {
+                PolicyTestSupport.deleteUser(connection, user);
+            }
         }
         touched.clear();
+        users.clear();
     }
 
     // ---------------------------------------------------------------- reads
@@ -887,15 +893,21 @@ public class TempWriteRepositoryTest {
     }
 
     @NotNull
-    private TempWritePermissionKey key(@NotNull String user) {
+    private TempWritePermissionKey key(@NotNull String user) throws SQLException {
         TempWritePermissionKey key = new TempWritePermissionKey(user, PROJECT, CONNECTION);
         remember(key);
         return key;
     }
 
-    private void remember(@NotNull TempWritePermissionKey key) {
+    private void remember(@NotNull TempWritePermissionKey key) throws SQLException {
         if (!touched.contains(key)) {
             touched.add(key);
+        }
+        if (!users.contains(key.userId())) {
+            users.add(key.userId());
+            try (Connection connection = database.openConnection()) {
+                PolicyTestSupport.putUser(connection, key.userId(), true);
+            }
         }
     }
 

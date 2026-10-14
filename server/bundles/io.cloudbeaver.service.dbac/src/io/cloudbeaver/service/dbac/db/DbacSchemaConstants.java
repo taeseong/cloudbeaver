@@ -44,8 +44,34 @@ public final class DbacSchemaConstants {
      * empty on purpose: a version 2 grant was issued without these checks, so it is denied until it
      * is granted again rather than being blessed by a migration. See
      * {@code db/dbac_schema_update_3.sql} and {@code docs/db-access-control-endpoint-identity.md}.
+     * <p>
+     * Version 4 changes no structure. It marks the start of the user-incarnation fence era, see
+     * {@link #USER_FENCE_SINCE_VERSION}: recording it revokes every grant that is not already revoked,
+     * in the same transaction, and from then on a user cannot be deleted while holding a live grant
+     * and a grant cannot be issued to a user that does not exist. A version 3 build refuses to start on
+     * a version 4 database, so there is no going back without restoring a backup taken before the
+     * upgrade. See {@code db/dbac_schema_update_4.sql}.
      */
-    public static final int CURRENT_SCHEMA_VERSION = 3;
+    public static final int CURRENT_SCHEMA_VERSION = 4;
+
+    /**
+     * The first schema version whose database is guarded by the user-incarnation fences
+     * <p>
+     * CloudBeaver gives a user nothing that tells one incarnation of an id from the next, so a grant
+     * left behind by a deleted user would be inherited by whoever is created under the same id. Three
+     * things close that together, and all three refer to this constant so they cannot drift apart:
+     * <ul>
+     *     <li>the version manager, which revokes every legacy grant in the transaction that records this
+     *     version - nothing written before the fences existed is trusted;</li>
+     *     <li>the deletion fence in the DBAC security controller, which refuses to delete a user who still
+     *     holds a grant that is neither revoked nor expired;</li>
+     *     <li>the grant fence in the TEMP_WRITE coordinator, which issues a grant only while holding the
+     *     user's read lock and only to a user that exists.</li>
+     * </ul>
+     * A build that records this version without the two fences would claim an invariant it does not
+     * keep, which is why the migration and the fences ship as one change.
+     */
+    public static final int USER_FENCE_SINCE_VERSION = 4;
 
     /**
      * No version is considered obsolete: drop+recreate of this schema is never allowed.

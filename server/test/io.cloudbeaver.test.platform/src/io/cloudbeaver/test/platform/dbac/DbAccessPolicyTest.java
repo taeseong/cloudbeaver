@@ -1450,7 +1450,7 @@ public class DbAccessPolicyTest {
     public void grantForAUserWithNoRowIsDenied() throws Exception {
         String user = "policy-no-user-row";
         touchedUsers.add(user);
-        grant(user, Duration.ofMinutes(30));
+        grantThenRemoveUser(user, Duration.ofMinutes(30));
 
         assertDenied(service().authorize(request(user, container())), DenialReason.USER_INACTIVE);
     }
@@ -1554,7 +1554,7 @@ public class DbAccessPolicyTest {
     @Test
     public void userWithNoRowIsDenied() throws Exception {
         String user = "policy-ghost";
-        grant(user, Duration.ofMinutes(30));
+        grantThenRemoveUser(user, Duration.ofMinutes(30));
 
         assertDenied(service().authorize(request(user, container())), DenialReason.USER_INACTIVE);
     }
@@ -2635,6 +2635,24 @@ public class DbAccessPolicyTest {
         TempWriteMutationCoordinator.withoutAuditing(database::openConnection, repository)
             .grant(TempWriteTestSupport.grantRequest(
                 key, TempWriteGrant.NO_ROW_REVISION, duration, "policy test", endpoint));
+    }
+
+    /**
+     * A grant left behind by a user whose rows were then removed
+     * <p>
+     * Since P5-F a grant is issued only to a user that exists, so a grant without its user is no longer
+     * made by granting to nobody. The user is made, granted to and then removed with SQL - a deletion that
+     * bypassed DBAC, which is how such a row arises now.
+     */
+    private void grantThenRemoveUser(@NotNull String userId, @NotNull Duration duration) throws Exception {
+        activeUser(userId);
+        grant(userId, duration);
+        try (Connection connection = database.openConnection()) {
+            Assertions.assertEquals(1,
+                TempWriteTestSupport.countCurrent(connection, new TempWritePermissionKey(userId, PROJECT, CONNECTION)),
+                "FIXTURE: the grant must exist before its user is removed");
+            PolicyTestSupport.deleteUser(connection, userId);
+        }
     }
 
     private void revoke(@NotNull String userId) throws Exception {

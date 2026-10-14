@@ -76,12 +76,17 @@ public class LockIdentityCharacterizationTest {
 
     private final TempWriteGrantRepository repository = new TempWriteGrantRepository();
     private final List<TempWritePermissionKey> touched = Collections.synchronizedList(new ArrayList<>());
+    /** Users made for the keys granted on: a grant is issued only to a user that exists (P5-F) */
+    private final List<String> users = Collections.synchronizedList(new ArrayList<>());
 
     @BeforeAll
     public static void prepare() throws Exception {
         CEAppStarter.startServerIfNotStarted();
         EnforcementTestSupport.requirePostgres(KeyLockTestSupport.MONITOR);
         KeyLockTestSupport.installDbacSchema(PG_DBAC_SCHEMA);
+        try (Connection connection = KeyLockTestSupport.openPostgres(PG_DBAC_SCHEMA)) {
+            FenceTestSupport.installUserTables(connection);
+        }
         KeyLockTestSupport.createSchema(PG_CB_SCHEMA);
         try (Connection connection = KeyLockTestSupport.openPostgres(PG_CB_SCHEMA)) {
             for (String ddl : cbTableDdl()) {
@@ -114,9 +119,13 @@ public class LockIdentityCharacterizationTest {
                 for (TempWritePermissionKey key : new ArrayList<>(touched)) {
                     TempWriteTestSupport.deleteKey(connection, key);
                 }
+                for (String user : new ArrayList<>(users)) {
+                    PolicyTestSupport.deleteUser(connection, user);
+                }
             }
         }
         touched.clear();
+        users.clear();
     }
 
     @NotNull
@@ -242,9 +251,20 @@ public class LockIdentityCharacterizationTest {
 
     // ---------------------------------------------------------------- helpers
 
+    /**
+     * Records the key for cleanup and makes its user exist on both engines, exactly as spelled
+     */
     @NotNull
-    private TempWritePermissionKey remember(@NotNull TempWritePermissionKey key) {
+    private TempWritePermissionKey remember(@NotNull TempWritePermissionKey key) throws SQLException {
         touched.add(key);
+        if (!users.contains(key.userId())) {
+            users.add(key.userId());
+            for (MetadataConnectionSource source : grantSources().values()) {
+                try (Connection connection = source.openConnection()) {
+                    PolicyTestSupport.putUser(connection, key.userId(), true);
+                }
+            }
+        }
         return key;
     }
 

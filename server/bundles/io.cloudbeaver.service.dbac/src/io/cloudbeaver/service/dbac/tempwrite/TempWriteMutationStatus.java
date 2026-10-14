@@ -31,5 +31,14 @@ public enum TempWriteMutationStatus {
     CONFLICT_SUPERSEDED,
 
     /** Transient contention outlasted the retry limit, so the request failed unchanged. */
-    RETRY_EXHAUSTED
+    RETRY_EXHAUSTED,
+
+    /**
+     * The user-incarnation fence refused the grant, so the request failed unchanged.
+     * <p>
+     * Either the user does not exist, or the user's lock could not be taken to find out. A grant is
+     * issued only to a user that exists while the grant holds that user's read lock, so a deletion
+     * cannot commit between the check and the grant.
+     */
+    USER_FENCE_REFUSED
 }

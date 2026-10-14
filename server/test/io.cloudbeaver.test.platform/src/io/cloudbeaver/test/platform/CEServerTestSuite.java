@@ -30,6 +30,7 @@ import io.cloudbeaver.test.platform.dbac.BoundedBorrowTest;
 import io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest;
 import io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest;
 import io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest;
+import io.cloudbeaver.test.platform.dbac.DbacFenceMigrationTest;
 import io.cloudbeaver.test.platform.dbac.DbacPlatformContractTest;
 import io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest;
 import io.cloudbeaver.test.platform.dbac.DbacSchemaRecoveryTest;
@@ -51,6 +52,7 @@ import io.cloudbeaver.test.platform.dbac.TempWriteModelTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest;
 import io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest;
+import io.cloudbeaver.test.platform.dbac.UserRecreationTest;
 import io.cloudbeaver.test.platform.sql.*;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -102,7 +104,9 @@ import org.junit.platform.suite.api.Suite;
         MetadataDisposalTest.class,
         MetadataShutdownTest.class,
         MetadataDeadlineTest.class,
-        MetadataLeasePostgresTest.class
+        MetadataLeasePostgresTest.class,
+        DbacFenceMigrationTest.class,
+        UserRecreationTest.class
     }
 )
 public class CEServerTestSuite {

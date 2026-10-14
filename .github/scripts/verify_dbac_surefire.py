@@ -55,6 +55,8 @@ REQUIRED_VALUE = "true"
 # a real PostgreSQL target's locks, and characterize PostgreSQL's identity comparison.
 # MetadataLeasePostgresTest runs the P5-1a lease template on a real pgjdbc connection: the query timeout
 # belongs to the statement there, a timed-out statement is cancelled, and an abort really closes.
+# The P5-F classes run the version 4 quarantine on PostgreSQL - version-only recovery and two concurrent
+# upgrades among it - and the grant fence's user lookup and timeouts against a PostgreSQL metadata schema.
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
@@ -66,6 +68,8 @@ POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest",
     "io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest",
     "io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest",
+    "io.cloudbeaver.test.platform.dbac.DbacFenceMigrationTest",
+    "io.cloudbeaver.test.platform.dbac.UserRecreationTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -81,7 +85,7 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.DbacScriptTranslationTest": 9,
     "io.cloudbeaver.test.platform.dbac.DbacSchemaTest": 7,
     "io.cloudbeaver.test.platform.dbac.DbacScriptStatementsTest": 6,
-    "io.cloudbeaver.test.platform.dbac.TempWriteModelTest": 24,
+    "io.cloudbeaver.test.platform.dbac.TempWriteModelTest": 25,
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest": 33,
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest": 20,
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest": 50,
@@ -92,7 +96,7 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest": 2,
     "io.cloudbeaver.test.platform.dbac.EnforcementLifecycleTest": 18,
     "io.cloudbeaver.test.platform.dbac.DeploymentGuardTest": 11,
-    "io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest": 13,
+    "io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest": 18,
     "io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest": 14,
     "io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest": 3,
     "io.cloudbeaver.test.platform.dbac.MetadataLeaseTest": 21,
@@ -101,6 +105,8 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.MetadataShutdownTest": 22,
     "io.cloudbeaver.test.platform.dbac.MetadataDeadlineTest": 10,
     "io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest": 3,
+    "io.cloudbeaver.test.platform.dbac.DbacFenceMigrationTest": 15,
+    "io.cloudbeaver.test.platform.dbac.UserRecreationTest": 8,
 }
 
 for _postgres_class in POSTGRES_CLASSES:

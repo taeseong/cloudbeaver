@@ -96,6 +96,49 @@ public class TempWriteGrantRepository {
             + " VALUES(?,?,?,?,?,?,?,?,?,?,?)";
 
     /**
+     * The CloudBeaver user table
+     * <p>
+     * Owned by {@code io.cloudbeaver.service.security} and named here as a literal for the same reason
+     * the policy snapshot does: one table name is not worth a dependency in the wrong direction. If
+     * upstream renames it, the grant fence fails and every grant is refused.
+     */
+    private static final String USER_TABLE = "{table_prefix}CB_USER";
+
+    /** The grant fence: one row when the user exists, matched by the exact id */
+    private static final String SELECT_USER = "SELECT 1 FROM " + USER_TABLE + " WHERE USER_ID=?";
+
+    /**
+     * The deletion fence: how many of one user's grants are neither revoked nor expired
+     * <p>
+     * Expiry is compared by the metadata database against its own clock, the same comparison the
+     * authorization snapshot makes. Run through a metadata lease, in auto-commit, so the clock is the
+     * statement's and not that of some earlier transaction.
+     */
+    public static final String ACTIVE_GRANTS_OF_USER =
+        "SELECT COUNT(*) AS ACTIVE_GRANTS FROM " + CURRENT_TABLE
+            + " WHERE USER_ID=? AND REVOKED_AT IS NULL AND EXPIRES_AT > CURRENT_TIMESTAMP";
+
+    /** The column {@link #ACTIVE_GRANTS_OF_USER} returns its count in */
+    public static final String ACTIVE_GRANTS_COLUMN = "ACTIVE_GRANTS";
+
+    /**
+     * Whether a user with exactly this id exists
+     * <p>
+     * Existence only: an inactive user exists, and the authorization refuses it separately. The id is
+     * compared as the database compares it, without folding or trimming.
+     *
+     * @throws SQLException if the user table cannot be read
+     */
+    public boolean userExists(@NotNull Connection connection, @NotNull String userId) throws SQLException {
+        try (PreparedStatement dbStat = connection.prepareStatement(SELECT_USER)) {
+            dbStat.setString(1, userId);
+            try (ResultSet dbResult = dbStat.executeQuery()) {
+                return dbResult.next();
+            }
+        }
+    }
+
+    /**
      * Reads the current row of one key
      *
      * @return the row, or empty when this key has never been granted

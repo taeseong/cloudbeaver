@@ -627,12 +627,19 @@ public class DbacSchemaPostgresTest {
     }
 
     /**
-     * A concurrent insert must be absorbed without leaving the transaction aborted.
+     * A concurrent insert must be absorbed without leaving the transaction aborted - below the fence version.
      * <p>
      * The decisive assertion is the statement executed on the same connection afterwards: on PostgreSQL a
      * unique violation that was not undone through a savepoint leaves the transaction in
      * {@code 25P02 in_failed_sql_transaction}, and every later statement fails. This is the branch the
      * savepoint exists for, driven deterministically rather than left to a real race.
+     * <p>
+     * <b>Changed by P5-F.</b> Until version 3 the version recorded here was {@code CURRENT_SCHEMA_VERSION}
+     * and the concurrent row was absorbed. The fence version, 4, is recorded strictly instead: the
+     * transaction that records it also quarantines every legacy grant, so a row some other node inserted
+     * is never adopted - the start fails and the next start sees version 4. The absorption is therefore
+     * pinned at version 3, by a build that ships 3, which is where the savepoint path still applies; and
+     * the fence version is pinned as refused, with the transaction left usable all the same.
      */
     @Test
     public void concurrentVersionInsertIsAbsorbedWithoutBreakingTheTransaction() throws Exception {
@@ -643,12 +650,11 @@ public class DbacSchemaPostgresTest {
             schemaManager(connection, config, DbacTestSupport.realScriptSource()).updateSchema(MONITOR);
             DbacTestSupport.deleteVersionRow(connection);
 
+            int belowFence = DbacSchemaConstants.USER_FENCE_SINCE_VERSION - 1;
             raw.setAutoCommit(false);
-            Connection racing = DbacTestSupport.insertVersionRowConcurrently(
-                connection, other, schema, DbacSchemaConstants.CURRENT_SCHEMA_VERSION);
+            Connection racing = DbacTestSupport.insertVersionRowConcurrently(connection, other, schema, belowFence);
 
-            versionManager().updateCurrentSchemaVersion(
-                MONITOR, racing, schema, DbacSchemaConstants.CURRENT_SCHEMA_VERSION);
+            versionManager(belowFence).updateCurrentSchemaVersion(MONITOR, racing, schema, belowFence);
 
             Assertions.assertTrue(
                 DbacTestSupport.isUsable(raw, schema),
@@ -656,10 +662,35 @@ public class DbacSchemaPostgresTest {
             raw.commit();
             raw.setAutoCommit(true);
             Assertions.assertEquals(1, DbacTestSupport.countVersionRows(connection));
+
+            DbacTestSupport.deleteVersionRow(connection);
+            raw.setAutoCommit(false);
+            Connection racingFence = DbacTestSupport.insertVersionRowConcurrently(
+                connection, other, schema, DbacSchemaConstants.USER_FENCE_SINCE_VERSION);
+            Assertions.assertThrows(
+                DBException.class,
+                () -> versionManager().updateCurrentSchemaVersion(
+                    MONITOR, racingFence, schema, DbacSchemaConstants.USER_FENCE_SINCE_VERSION),
+                "The fence version must be recorded by this transaction alone, never adopted from a concurrent insert");
+            Assertions.assertTrue(
+                DbacTestSupport.isUsable(raw, schema),
+                "Even the refusal of the fence version must leave the transaction usable");
+            raw.rollback();
+            raw.setAutoCommit(true);
+            Assertions.assertEquals(
+                DbacSchemaConstants.USER_FENCE_SINCE_VERSION, DbacTestSupport.readVersion(connection).intValue(),
+                "The other node's row stands");
+            Assertions.assertEquals(1, DbacTestSupport.countVersionRows(connection));
         }
     }
 
-    /** A concurrent writer that recorded a different version must never be overwritten. */
+    /**
+     * A concurrent writer that recorded a different version must never be overwritten.
+     * <p>
+     * Since P5-F the current version is the fence version, which is refused whatever the concurrent row holds; the
+     * generic path that refuses a different winning version is pinned again below the fence version, by a build that
+     * ships 3.
+     */
     @Test
     public void concurrentVersionInsertWithADifferentVersionFailsClosed() throws Exception {
         String schema = freshSchema("dbac_pg_savepoint2");
@@ -676,7 +707,7 @@ public class DbacSchemaPostgresTest {
                 DBException.class,
                 () -> versionManager().updateCurrentSchemaVersion(
                     MONITOR, racing, schema, DbacSchemaConstants.CURRENT_SCHEMA_VERSION),
-                "Recording 1 over a concurrently written 7 must be refused");
+                "Recording the current version over a concurrently written 7 must be refused");
             Assertions.assertTrue(
                 DbacTestSupport.isUsable(raw, schema),
                 "Even the refusal must leave the transaction usable");
@@ -685,12 +716,35 @@ public class DbacSchemaPostgresTest {
             Assertions.assertEquals(
                 7, DbacTestSupport.readVersion(connection).intValue(),
                 "The other node's version must be left exactly as it was");
+
+            int belowFence = DbacSchemaConstants.USER_FENCE_SINCE_VERSION - 1;
+            DbacTestSupport.deleteVersionRow(connection);
+            raw.setAutoCommit(false);
+            Connection racingBelow = DbacTestSupport.insertVersionRowConcurrently(connection, other, schema, 7);
+            Assertions.assertThrows(
+                DBException.class,
+                () -> versionManager(belowFence).updateCurrentSchemaVersion(MONITOR, racingBelow, schema, belowFence),
+                "Recording " + belowFence + " over a concurrently written 7 must be refused");
+            Assertions.assertTrue(
+                DbacTestSupport.isUsable(raw, schema),
+                "Even the refusal below the fence version must leave the transaction usable");
+            raw.rollback();
+            raw.setAutoCommit(true);
+            Assertions.assertEquals(
+                7, DbacTestSupport.readVersion(connection).intValue(),
+                "The other node's version must be left exactly as it was, below the fence version too");
         }
     }
 
-    /** Any SQLSTATE other than 23505 must escape unchanged; it must not be read as a lost race. */
+    /**
+     * Any SQLSTATE other than 23505 must not be read as a lost race.
+     * <p>
+     * Below the fence version it escapes unchanged. At the fence version the fence refuses whatever fails while it records the
+     * version with a fixed message and no cause, after taking its own savepoint back, and logs only the failure's class - as a
+     * failed statement, not as a conflict with a concurrent writer.
+     */
     @Test
-    public void nonUniqueViolationOnVersionInsertIsPropagated() throws Exception {
+    public void nonUniqueViolationOnVersionInsertIsPropagated() throws Throwable {
         String schema = freshSchema("dbac_pg_sqlstate");
         try (Connection raw = connect()) {
             InternalDatabaseConfig config = configFor(schema);
@@ -699,15 +753,49 @@ public class DbacSchemaPostgresTest {
             DbacTestSupport.deleteVersionRow(connection);
 
             Connection failing = DbacTestSupport.failVersionInsertWith(connection, "08006");
-            SQLException thrown = Assertions.assertThrows(
-                SQLException.class,
-                () -> versionManager().updateCurrentSchemaVersion(
-                    MONITOR, failing, schema, DbacSchemaConstants.CURRENT_SCHEMA_VERSION),
-                "A connection failure must not be absorbed as a concurrent write");
-            Assertions.assertEquals(
-                "08006", thrown.getSQLState(), "The original exception must be propagated unchanged");
+            // Inside a transaction, as the migration runner records it: the fence version is recorded only
+            // in the transaction that also quarantines the legacy grants (P5-F).
+            raw.setAutoCommit(false);
+            AtomicReference<DBException> thrown = new AtomicReference<>();
+            LifecycleTestSupport.Captured captured;
+            try {
+                captured = LifecycleTestSupport.captureLogs(() -> thrown.set(Assertions.assertThrows(
+                    DBException.class,
+                    () -> versionManager().updateCurrentSchemaVersion(
+                        MONITOR, failing, schema, DbacSchemaConstants.CURRENT_SCHEMA_VERSION),
+                    "A connection failure must not be absorbed as a concurrent write")));
+            } finally {
+                raw.rollback();
+                raw.setAutoCommit(true);
+            }
+            Assertions.assertNull(thrown.get().getCause(), "The fence version is refused with no cause");
+            Assertions.assertTrue(
+                String.valueOf(thrown.get().getMessage()).contains("could not record schema version 4"),
+                "The fence version is refused with its fixed message, got: " + thrown.get().getMessage());
+            Assertions.assertFalse(
+                String.valueOf(thrown.get().getMessage()).contains("Injected"), "The refusal names nothing the driver said");
+            Assertions.assertTrue(
+                captured.dbacMessages().stream().anyMatch(message -> message.contains("detail=VERSION_STATEMENT_FAILED ")
+                    && message.contains("exception=java.sql.SQLException")),
+                "The failure is logged as a failed statement, by class: " + captured.dbacMessages());
+            Assertions.assertTrue(
+                captured.dbacMessages().stream().noneMatch(message -> message.contains("VERSION_ROW_CONFLICT")),
+                "A connection failure is not a lost race: " + captured.dbacMessages());
+            Assertions.assertFalse(
+                captured.text().contains("Injected version insert failure"), "Nothing logged carries what the driver said");
             Assertions.assertEquals(
                 0, DbacTestSupport.countVersionRows(connection), "No version may have been recorded");
+
+            // Below the fence version the auto-commit path is the one this test pinned before P5-F.
+            int belowFence = DbacSchemaConstants.USER_FENCE_SINCE_VERSION - 1;
+            SQLException belowThrown = Assertions.assertThrows(
+                SQLException.class,
+                () -> versionManager(belowFence).updateCurrentSchemaVersion(MONITOR, failing, schema, belowFence),
+                "A connection failure must not be absorbed as a concurrent write, in auto-commit either");
+            Assertions.assertEquals(
+                "08006", belowThrown.getSQLState(), "The original exception must be propagated unchanged in auto-commit");
+            Assertions.assertEquals(
+                0, DbacTestSupport.countVersionRows(connection), "No version may have been recorded in auto-commit");
         }
     }
 
@@ -731,6 +819,11 @@ public class DbacSchemaPostgresTest {
                 () -> versionManager().updateCurrentSchemaVersion(
                     MONITOR, broken, schema, DbacSchemaConstants.CURRENT_SCHEMA_VERSION),
                 "A failed savepoint rollback must never be reported as an accepted concurrent write");
+            // The fence takes the failed savepoint rollback further: it rolls the whole transaction back, and a connection that
+            // could be rolled back is neither closed nor handed back with the transaction aborted.
+            Assertions.assertFalse(raw.isClosed(), "A connection whose transaction could be rolled back must not be closed");
+            Assertions.assertTrue(
+                DbacTestSupport.isUsable(raw, schema), "After the full rollback the transaction must be usable again");
             raw.rollback();
             raw.setAutoCommit(true);
         }

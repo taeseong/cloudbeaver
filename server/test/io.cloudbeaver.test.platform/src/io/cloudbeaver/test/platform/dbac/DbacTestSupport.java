@@ -84,6 +84,21 @@ final class DbacTestSupport {
     /** SQLSTATE meaning the transaction was already unusable; a symptom, never a diagnosis. */
     static final String SQL_STATE_IN_FAILED_TRANSACTION = "25P02";
 
+    /**
+     * Whether a node failed because schema version 4 was recorded by another node first
+     * <p>
+     * Schema version 4 is recorded strictly (P5-F): the node that loses the version row - its compare-and-set
+     * finds the winner's row, or its insert collides with it - fails with this fixed-message
+     * {@code DBException} that carries no cause, and is never allowed to adopt the row. Before P5-F such a
+     * node absorbed the version insert and succeeded, so a race at version 4 now always has this loser. Any
+     * other failure - the quarantine breaking, say - is not this, and is judged by its first recorded error.
+     */
+    static boolean isFenceVersionRefusal(@NotNull Throwable error) {
+        return error instanceof DBException
+            && error.getCause() == null
+            && String.valueOf(error.getMessage()).contains("could not record schema version 4");
+    }
+
     @NotNull
     static SQLSchemaScriptSource realScriptSource() {
         return new ClassLoaderScriptSource(
@@ -202,8 +217,12 @@ final class DbacTestSupport {
     }
 
     /**
-     * Accepts a racing node's failure only when its <b>first</b> database error is a real object or lock
-     * conflict.
+     * Accepts a racing node's failure only when it is the fence-version refusal, or when its <b>first</b> database error is a
+     * real object or lock conflict.
+     * <p>
+     * The fence-version refusal ({@link #isFenceVersionRefusal}) is the expected loser of a race at schema version 4 and is
+     * accepted as itself, whatever the node recorded on the way - a conflict it already recovered from, or none at all. The
+     * caller still requires at most one failure, and a schema the next start finds at the current version.
      * <p>
      * The exception that reaches the caller is not a reliable diagnosis: on PostgreSQL the migration
      * runner retries a failed statement on the same connection, so what escapes is usually
@@ -219,6 +238,9 @@ final class DbacTestSupport {
         @NotNull Set<String> allowedSqlStates,
         @NotNull String context
     ) {
+        if (isFenceVersionRefusal(error)) {
+            return;
+        }
         SQLException cause = firstRecorded != null ? firstRecorded : findSqlException(error);
         Assertions.assertNotNull(
             cause,

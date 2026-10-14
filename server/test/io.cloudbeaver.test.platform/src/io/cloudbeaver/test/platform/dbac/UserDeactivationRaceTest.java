@@ -387,6 +387,14 @@ public class UserDeactivationRaceTest {
         });
         Assertions.assertTrue(worker.awaitDone(), label + ": the deletion did not finish");
         Assertions.assertInstanceOf(DBCException.class, worker.error, label + ": the failure must reach the caller");
+        // P5-F: a DBCException can also be the deletion fence's own refusal. The interrupt set before the call is
+        // cleared under the user lock, so the fence must have run once and the deletion reached its own DELETE.
+        Assertions.assertEquals(1, db.hooks().count("SELECT COUNT(*) AS ACTIVE_GRANTS"),
+            label + ": the deletion fence must run once, with the interrupt cleared under the user lock");
+        Assertions.assertTrue(db.hooks().count("DELETE FROM CB_USER") >= 1,
+            label + ": the deletion must get past the fence to its own DELETE");
+        Assertions.assertFalse(String.valueOf(worker.error.getMessage()).startsWith("DBAC "),
+            label + ": the failure must be the injected one, not a refusal by the fence");
         // upstream JDBCTransaction.close() restores auto-commit without a rollback; what it left is recorded, not judged
         System.out.println("[DBAC P4] " + label + " state after the failed upstream deletion: " + db.snapshot(user));
         assertReleasedAndRestored(label, user, worker);

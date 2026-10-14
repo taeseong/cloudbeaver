@@ -1,0 +1,36 @@
+-- DBAC schema version 4: the user-incarnation fence era begins.
+--
+-- This script changes nothing, on purpose. Version 4 adds no table, column or index. What it adds is a
+-- data step and two runtime fences, and none of them can be written as portable SQL here.
+--
+-- Why there is a version at all. CloudBeaver gives a user nothing that tells one incarnation of an id from
+-- the next: CB_USER is keyed by USER_ID alone and a deleted id can be created again - by an administrator,
+-- or automatically when an external user logs in. DBAC_TW_CURRENT has no foreign key to CB_USER, so a
+-- grant issued to a deleted user stayed behind, and the next user created under that id inherited it.
+-- From version 4 on that cannot happen:
+--   * a user cannot be deleted while holding a grant that is neither revoked nor expired, and
+--   * a grant is issued only to a user that exists, under that user's read lock, so a deletion cannot
+--     slip in between the check and the commit.
+-- Neither fence can repair what was written before it existed. So the transaction that records version 4
+-- also revokes every grant that is not already revoked - expired or not - and writes a REVOKED history
+-- event for each. DbacSchemaVersionManager does that in Java, in the migration runner's transaction:
+--   * the event id is a UUID, and generating one in SQL needs a dialect function, which a common script
+--     cannot use and a dialect-specific script is not allowed to be,
+--   * every row is revoked by compare-and-set on its revision, and the step fails unless each change hits
+--     exactly one row and nothing unrevoked is left at the end.
+-- If anything fails, the whole transaction rolls back, the version stays 3 and the server does not start.
+--
+-- What this means for an operator.
+--   * Every TEMP_WRITE grant that was not revoked is revoked by the upgrade and has to be granted again.
+--   * A version 3 build refuses to start on a version 4 database. There is no downgrade: the only way back
+--     is to restore a backup of the metadata database taken before the upgrade. The migration runner's own
+--     backup has not been verified for this module, so take one separately.
+--
+-- Notes for maintainers:
+--   * The script must exist and must not be empty. The migration runner skips a version whose update
+--     script is missing, without recording it, and DbacSchemaVersionManager refuses an incomplete chain.
+--   * It must stay stateless and run on both H2 and PostgreSQL, like dbac_schema_update_1.sql: PostgreSQL
+--     version-only recovery walks 0 to 4 and runs it too.
+--   * The runner splits this file on semicolons, so no comment here may contain one.
+
+SELECT 1;

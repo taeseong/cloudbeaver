@@ -24,7 +24,9 @@ import io.cloudbeaver.service.dbac.policy.enforcement.EnforcementKeyLocks;
 import io.cloudbeaver.service.dbac.tempwrite.MetadataConnectionSource;
 import io.cloudbeaver.service.dbac.tempwrite.MetadataDbClock;
 import io.cloudbeaver.service.dbac.tempwrite.MetadataDbTime;
+import io.cloudbeaver.service.dbac.tempwrite.TempWriteAuditSink;
 import io.cloudbeaver.service.dbac.tempwrite.TempWriteChangeType;
+import io.cloudbeaver.service.dbac.tempwrite.TempWriteConflictReason;
 import io.cloudbeaver.service.dbac.tempwrite.TempWriteGrant;
 import io.cloudbeaver.service.dbac.tempwrite.TempWriteGrantRepository;
 import io.cloudbeaver.service.dbac.tempwrite.TempWriteHistoryEvent;
@@ -85,6 +87,8 @@ public class GrantRevokeRaceTest {
 
     private final TempWriteGrantRepository repository = new TempWriteGrantRepository();
     private final List<TempWritePermissionKey> touched = Collections.synchronizedList(new ArrayList<>());
+    /** Users this test created on both engines, because a grant is issued only to a user that exists */
+    private final List<String> users = Collections.synchronizedList(new ArrayList<>());
 
     /** A metadata database a race runs against */
     private record Engine(@NotNull String name, @NotNull MetadataConnectionSource source) {
@@ -95,6 +99,9 @@ public class GrantRevokeRaceTest {
         CEAppStarter.startServerIfNotStarted();
         EnforcementTestSupport.requirePostgres(KeyLockTestSupport.MONITOR);
         KeyLockTestSupport.installDbacSchema(PG_SCHEMA);
+        try (Connection connection = KeyLockTestSupport.openPostgres(PG_SCHEMA)) {
+            FenceTestSupport.installUserTables(connection);
+        }
         fixtures = EnforcementTestSupport.fixtures("p4kl", KeyLockTestSupport.MONITOR);
     }
 
@@ -120,9 +127,13 @@ public class GrantRevokeRaceTest {
                 for (TempWritePermissionKey key : new ArrayList<>(touched)) {
                     TempWriteTestSupport.deleteKey(connection, key);
                 }
+                for (String user : new ArrayList<>(users)) {
+                    PolicyTestSupport.deleteUser(connection, user);
+                }
             }
         }
         touched.clear();
+        users.clear();
     }
 
     @NotNull
@@ -393,10 +404,15 @@ public class GrantRevokeRaceTest {
     }
 
     /**
-     * KL-5: grant and revoke take neither the user lock nor a connection's X or M
+     * KL-5: a grant holds the user's read lock and a revoke no user lock at all, and neither takes a connection's X or M
+     * <p>
+     * Changed by P5-F. P4 pinned "grant and revoke take no user lock". The grant fence makes a grant hold
+     * its user's read lock from before it opens a connection until it has committed, so a deletion - the
+     * user's write lock - cannot commit in between. A revoke still takes none: it only takes a permission
+     * away, which a deletion cannot make unsafe.
      */
     @Test
-    public void kl5GrantAndRevokeTakeNoUserOrConnectionLock() throws Exception {
+    public void kl5GrantHoldsTheUserReadLockRevokeNoneAndNeitherXOrM() throws Exception {
         Engine engine = engines().get(0);
         TempWritePermissionKey key = key("kl5");
         Pause pause = new Pause();
@@ -409,14 +425,38 @@ public class GrantRevokeRaceTest {
         Worker<TempWriteMutationResult> grant = Worker.start("dbac-kl5-grant",
             () -> coordinator(engine, hooks).grant(grantRequest(key, TempWriteGrant.NO_ROW_REVISION, "kl5")));
         boolean userWritable;
+        boolean userReadable;
         try {
             pause.awaitReached("KL-5 the grant's write");
+            // The read probe first: a write probe left queued behind the grant would hold back a fair reader.
+            userReadable = KeyLockTestSupport.userReadableElsewhere(key.userId());
             userWritable = KeyLockTestSupport.userWritableElsewhere(key.userId());
         } finally {
             pause.release();
         }
-        grant.get("KL-5 grant");
-        Assertions.assertTrue(userWritable, "KL-5: a grant in flight must not hold the user's lock");
+        Assertions.assertEquals(TempWriteMutationStatus.COMMITTED, grant.get("KL-5 grant").status(), "KL-5: the grant commits");
+        Assertions.assertFalse(userWritable, "KL-5: a grant in flight must hold the user against a deletion");
+        Assertions.assertTrue(userReadable, "KL-5: a grant in flight holds only the user's read lock - another reader gets in");
+        Assertions.assertTrue(KeyLockTestSupport.userWritableElsewhere(key.userId()), "KL-5: the grant gives the user back");
+
+        Pause revokePause = new Pause();
+        Hooks revokeHooks = new Hooks();
+        revokeHooks.before = sql -> {
+            if (KeyLockTestSupport.isWrite(sql)) {
+                revokePause.hit();
+            }
+        };
+        Worker<TempWriteMutationResult> revoke = Worker.start("dbac-kl5-revoke",
+            () -> coordinator(engine, revokeHooks).revoke(revokeRequest(key, TempWriteGrant.FIRST_REVISION)));
+        boolean userWritableDuringRevoke;
+        try {
+            revokePause.awaitReached("KL-5 the revoke's write");
+            userWritableDuringRevoke = KeyLockTestSupport.userWritableElsewhere(key.userId());
+        } finally {
+            revokePause.release();
+        }
+        Assertions.assertEquals(TempWriteMutationStatus.COMMITTED, revoke.get("KL-5 revoke").status(), "KL-5: the revoke commits");
+        Assertions.assertTrue(userWritableDuringRevoke, "KL-5: a revoke in flight must not hold the user's lock");
 
         // closed by fixtures.afterEach()
         EnforcementTestSupport.Target target = fixtures.readOnlyTarget(fixtures.user);
@@ -627,6 +667,261 @@ public class GrantRevokeRaceTest {
         }
     }
 
+    // ---------------------------------------------------------------- GF: the grant fence (P5-F)
+
+    /** A short {@code T_k}, so a refused wait ends well within a test */
+    private static final Duration SHORT_TK = Duration.ofSeconds(1);
+
+    /**
+     * A thread that holds a user's write lock - a deletion or deactivation in progress - until closed
+     */
+    private static final class UserWriter implements AutoCloseable {
+        private final CountDownLatch holding = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+        private final Worker<Object> worker;
+
+        UserWriter(@NotNull String userId) throws InterruptedException {
+            worker = Worker.start("dbac-gf-user-writer", () -> {
+                try (EnforcementKeyLocks.Held ignored = EnforcementKeyLocks.global().lockUserForWrite(userId)) {
+                    holding.countDown();
+                    release.await(KeyLockTestSupport.TIMEOUT_SECONDS * 4, TimeUnit.SECONDS);
+                }
+                return null;
+            });
+            Assertions.assertTrue(holding.await(KeyLockTestSupport.TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                "FIXTURE: the user writer never took the user");
+        }
+
+        @Override
+        public void close() throws InterruptedException {
+            release.countDown();
+            Assertions.assertTrue(worker.awaitDone(), "FIXTURE: the user writer did not finish");
+        }
+    }
+
+    /**
+     * GF-2: a grant that cannot have its user's read lock within {@code T_k} is refused before any connection, and writes nothing
+     */
+    @Test
+    public void gf2AUserLockTimeoutRefusesWithNoAttempt() throws Exception {
+        List<String> violations = new ArrayList<>();
+        for (Engine engine : engines()) {
+            String label = "GF-2 [" + engine.name() + "]";
+            TempWritePermissionKey key = key("gf2");
+            Hooks hooks = new Hooks();
+            TempWriteMutationResult result;
+            try (UserWriter ignored = new UserWriter(key.userId())) {
+                result = outcome(violations, label, () -> coordinator(engine, hooks, shortKeyLockTimeout())
+                    .grant(grantRequest(key, TempWriteGrant.NO_ROW_REVISION, "gf2")));
+            }
+            expectFenceRefusal(violations, label, result, TempWriteConflictReason.USER_LOCK_TIMEOUT, 0);
+            expect(violations, label + ": no metadata connection", 0, hooks.opened.get());
+            expectNothingWritten(violations, label, engine, key);
+        }
+        Assertions.assertEquals(List.of(), violations, "GF-2");
+    }
+
+    /**
+     * GF-3: a grant interrupted while it waits for its user is refused before any connection, writes nothing, and keeps the interrupt
+     */
+    @Test
+    public void gf3AnInterruptWhileWaitingForTheUserRefusesAndIsRestored() throws Exception {
+        List<String> violations = new ArrayList<>();
+        DbAccessPolicyConfig longest = keyLockTimeout(EnforcementKeyLocks.MAX_READ_TIMEOUT);
+        for (Engine engine : engines()) {
+            String label = "GF-3 [" + engine.name() + "]";
+            TempWritePermissionKey key = key("gf3");
+            Hooks hooks = new Hooks();
+            Worker<TempWriteMutationResult> grant;
+            boolean parked;
+            try (UserWriter ignored = new UserWriter(key.userId())) {
+                grant = Worker.start("dbac-gf3-grant",
+                    () -> coordinator(engine, hooks, longest).grant(grantRequest(key, TempWriteGrant.NO_ROW_REVISION, "gf3")));
+                parked = KeyLockTestSupport.awaitParked(grant.thread);
+                grant.thread.interrupt();
+                Assertions.assertTrue(grant.awaitDone(), label + ": the interrupted grant did not return");
+            }
+            expect(violations, label + ": the grant waits for the user", true, parked);
+            if (grant.error != null) {
+                violations.add(label + ": the grant threw " + grant.error.getClass().getName());
+                continue;
+            }
+            expectFenceRefusal(violations, label, grant.result, TempWriteConflictReason.USER_LOCK_INTERRUPTED, 0);
+            expect(violations, label + ": the interrupt is set again on return", true, grant.interruptedOnReturn);
+            expect(violations, label + ": no metadata connection", 0, hooks.opened.get());
+            expectNothingWritten(violations, label, engine, key);
+        }
+        Assertions.assertEquals(List.of(), violations, "GF-3");
+    }
+
+    /**
+     * GF-4: a grant whose user does not exist is refused by its first attempt, in one connection, with nothing written or committed
+     */
+    @Test
+    public void gf4AMissingUserRefusesInTheFirstAttemptWithoutRetry() throws Exception {
+        List<String> violations = new ArrayList<>();
+        for (Engine engine : engines()) {
+            String label = "GF-4 [" + engine.name() + "]";
+            TempWritePermissionKey key = keyWithoutUser("gf4");
+            Hooks hooks = new Hooks();
+            AtomicInteger commits = new AtomicInteger();
+            hooks.afterCommit = commits::incrementAndGet;
+            TempWriteMutationResult result = outcome(violations, label,
+                () -> coordinator(engine, hooks).grant(grantRequest(key, TempWriteGrant.NO_ROW_REVISION, "gf4")));
+            expectFenceRefusal(violations, label, result, TempWriteConflictReason.USER_MISSING, 1);
+            expect(violations, label + ": one connection - the refusal is not retried", 1, hooks.opened.get());
+            expect(violations, label + ": no write statement", 0L, hooks.statements().stream().filter(KeyLockTestSupport::isWrite).count());
+            expect(violations, label + ": no commit", 0, commits.get());
+            expectNothingWritten(violations, label, engine, key);
+        }
+        Assertions.assertEquals(List.of(), violations, "GF-4");
+    }
+
+    /**
+     * GF-5: a revoke takes no user lock - it completes while a deletion or deactivation holds the user
+     */
+    @Test
+    public void gf5ARevokeCompletesWhileTheUserIsHeld() throws Exception {
+        List<String> violations = new ArrayList<>();
+        for (Engine engine : engines()) {
+            String label = "GF-5 [" + engine.name() + "]";
+            TempWritePermissionKey key = key("gf5");
+            commitGrant(engine, key, TempWriteGrant.NO_ROW_REVISION);
+            Worker<TempWriteMutationResult> revoke;
+            boolean finished;
+            try (UserWriter ignored = new UserWriter(key.userId())) {
+                revoke = Worker.start("dbac-gf5-revoke",
+                    () -> coordinator(engine, new Hooks()).revoke(revokeRequest(key, TempWriteGrant.FIRST_REVISION)));
+                finished = revoke.awaitDone();
+            }
+            Assertions.assertTrue(revoke.awaitDone(), label + ": the revoke did not finish");
+            expect(violations, label + ": the revoke finishes while the user is held", true, finished);
+            expect(violations, label + ": the revoke commits", TempWriteMutationStatus.COMMITTED,
+                revoke.result == null ? null : revoke.result.status());
+            expect(violations, label + ": the grant is revoked", true, revoked(engine, key));
+        }
+        Assertions.assertEquals(List.of(), violations, "GF-5");
+    }
+
+    /**
+     * GF-6: the existing constructors wait the default {@code T_k}, the configured one waits the configuration's
+     * <p>
+     * The wait is also measured, as a second opinion.
+     */
+    @Test
+    public void gf6TheConfiguredKeyLockTimeoutIsTheOneWaited() throws Exception {
+        List<String> violations = new ArrayList<>();
+        Engine engine = engines().get(0);
+        MetadataConnectionSource source = engine.source();
+        expect(violations, "GF-6: withoutAuditing waits the default T_k", DbAccessPolicyConfig.DEFAULT_KEY_LOCK_TIMEOUT,
+            TempWriteMutationCoordinator.withoutAuditing(source, repository).keyLockTimeout());
+        expect(violations, "GF-6: the auditing constructor waits the default T_k", DbAccessPolicyConfig.DEFAULT_KEY_LOCK_TIMEOUT,
+            new TempWriteMutationCoordinator(source, repository, TempWriteAuditSink.NONE).keyLockTimeout());
+        expect(violations, "GF-6: the configured constructor waits the configured T_k", SHORT_TK,
+            new TempWriteMutationCoordinator(source, repository, TempWriteAuditSink.NONE, shortKeyLockTimeout()).keyLockTimeout());
+
+        TempWritePermissionKey key = key("gf6");
+        long margin = TimeUnit.MILLISECONDS.toNanos(100);
+        try (UserWriter ignored = new UserWriter(key.userId())) {
+            long start = System.nanoTime();
+            TempWriteMutationResult configured = outcome(violations, "GF-6 configured",
+                () -> coordinator(engine, new Hooks(), shortKeyLockTimeout())
+                    .grant(grantRequest(key, TempWriteGrant.NO_ROW_REVISION, "gf6 configured")));
+            long configuredNanos = System.nanoTime() - start;
+            start = System.nanoTime();
+            TempWriteMutationResult defaulted = outcome(violations, "GF-6 default", () -> coordinator(engine, new Hooks())
+                .grant(grantRequest(key, TempWriteGrant.NO_ROW_REVISION, "gf6 default")));
+            final long defaultNanos = System.nanoTime() - start;
+            expect(violations, "GF-6: the configured coordinator gives up", TempWriteConflictReason.USER_LOCK_TIMEOUT,
+                configured == null ? null : configured.conflictReason());
+            expect(violations, "GF-6: after about the configured T_k", true,
+                configuredNanos >= SHORT_TK.toNanos() - margin
+                    && configuredNanos < DbAccessPolicyConfig.DEFAULT_KEY_LOCK_TIMEOUT.toNanos() - margin);
+            expect(violations, "GF-6: the default coordinator gives up", TempWriteConflictReason.USER_LOCK_TIMEOUT,
+                defaulted == null ? null : defaulted.conflictReason());
+            expect(violations, "GF-6: after about the default T_k", true,
+                defaultNanos >= DbAccessPolicyConfig.DEFAULT_KEY_LOCK_TIMEOUT.toNanos() - margin);
+        }
+        Assertions.assertEquals(List.of(), violations, "GF-6");
+    }
+
+    /** A mutation */
+    @FunctionalInterface
+    private interface MutationCall {
+        @NotNull
+        TempWriteMutationResult run() throws SQLException;
+    }
+
+    /** The mutation's result, or null with its failure recorded as a violation */
+    @org.jkiss.code.Nullable
+    private static TempWriteMutationResult outcome(@NotNull List<String> violations, @NotNull String label, @NotNull MutationCall call) {
+        try {
+            return call.run();
+        } catch (SQLException | RuntimeException e) {
+            violations.add(label + ": the mutation threw " + e.getClass().getName());
+            return null;
+        }
+    }
+
+    @NotNull
+    private static DbAccessPolicyConfig shortKeyLockTimeout() {
+        return keyLockTimeout(SHORT_TK);
+    }
+
+    @NotNull
+    private static DbAccessPolicyConfig keyLockTimeout(@NotNull Duration keyLockTimeout) {
+        return new DbAccessPolicyConfig(
+            DbAccessPolicyConfig.DEFAULT_CLOCK_SKEW_THRESHOLD,
+            DbAccessPolicyConfig.DEFAULT_MAX_GRANT_DURATION,
+            DbAccessPolicyConfig.DEFAULT_EXPIRY_GUARD_MARGIN,
+            DbAccessPolicyConfig.DEFAULT_AUDIT_TIMEOUT,
+            keyLockTimeout);
+    }
+
+    /** A refusal by the user fence: the status, the reason, the attempts, and no row, revision or grant id */
+    private static void expectFenceRefusal(
+        @NotNull List<String> violations,
+        @NotNull String label,
+        @org.jkiss.code.Nullable TempWriteMutationResult result,
+        @NotNull TempWriteConflictReason reason,
+        int attempts
+    ) {
+        if (result == null) {
+            violations.add(label + ": no result");
+            return;
+        }
+        expect(violations, label + ": status", TempWriteMutationStatus.USER_FENCE_REFUSED, result.status());
+        expect(violations, label + ": reason", reason, result.conflictReason());
+        expect(violations, label + ": attempts", attempts, result.attempts());
+        expect(violations, label + ": rows", 0, result.affectedRows());
+        expect(violations, label + ": revision", null, result.revision());
+        expect(violations, label + ": grant id", null, result.grantId());
+        expect(violations, label + ": refused", true, result.isRefused());
+    }
+
+    private static void expectNothingWritten(
+        @NotNull List<String> violations,
+        @NotNull String label,
+        @NotNull Engine engine,
+        @NotNull TempWritePermissionKey key
+    ) throws SQLException {
+        try (Connection connection = engine.source().openConnection()) {
+            expect(violations, label + ": no grant row", 0, TempWriteTestSupport.countCurrent(connection, key));
+            expect(violations, label + ": no history", List.of(), TempWriteTestSupport.historyOf(connection, key));
+        }
+    }
+
+    private static void expect(
+        @NotNull List<String> violations,
+        @NotNull String what,
+        @org.jkiss.code.Nullable Object expected,
+        @org.jkiss.code.Nullable Object actual
+    ) {
+        if (!java.util.Objects.equals(expected, actual)) {
+            violations.add(what + ": expected " + expected + ", got " + actual);
+        }
+    }
+
     // ---------------------------------------------------------------- KR
 
     /**
@@ -811,12 +1106,35 @@ public class GrantRevokeRaceTest {
     }
 
     @NotNull
-    private TempWritePermissionKey key(@NotNull String tag) {
+    private TempWritePermissionKey key(@NotNull String tag) throws SQLException {
         return remember(new TempWritePermissionKey("dbac-p4-" + tag + "-" + Long.toHexString(System.nanoTime()), PROJECT, CONNECTION));
     }
 
+    /**
+     * Records the key for cleanup and makes its user exist on both engines
+     * <p>
+     * A grant is issued only to a user that exists (P5-F), so a key whose grant a race needs has a user row
+     * behind it. Written with SQL, never through the code under test.
+     */
     @NotNull
-    private TempWritePermissionKey remember(@NotNull TempWritePermissionKey key) {
+    private TempWritePermissionKey remember(@NotNull TempWritePermissionKey key) throws SQLException {
+        touched.add(key);
+        if (!users.contains(key.userId())) {
+            users.add(key.userId());
+            for (Engine engine : engines()) {
+                try (Connection connection = engine.source().openConnection()) {
+                    PolicyTestSupport.putUser(connection, key.userId(), true);
+                }
+            }
+        }
+        return key;
+    }
+
+    /** A key whose user exists nowhere, recorded for cleanup */
+    @NotNull
+    private TempWritePermissionKey keyWithoutUser(@NotNull String tag) {
+        TempWritePermissionKey key = new TempWritePermissionKey(
+            "dbac-p5f-" + tag + "-" + Long.toHexString(System.nanoTime()), PROJECT, CONNECTION);
         touched.add(key);
         return key;
     }
@@ -824,6 +1142,12 @@ public class GrantRevokeRaceTest {
     @NotNull
     private TempWriteMutationCoordinator coordinator(@NotNull Engine engine, @NotNull Hooks hooks) {
         return TempWriteMutationCoordinator.withoutAuditing(KeyLockTestSupport.hooked(engine.source(), hooks), repository);
+    }
+
+    @NotNull
+    private TempWriteMutationCoordinator coordinator(@NotNull Engine engine, @NotNull Hooks hooks, @NotNull DbAccessPolicyConfig config) {
+        return new TempWriteMutationCoordinator(
+            KeyLockTestSupport.hooked(engine.source(), hooks), repository, TempWriteAuditSink.NONE, config);
     }
 
     private void commitGrant(@NotNull Engine engine, @NotNull TempWritePermissionKey key, long startRevision) throws SQLException {

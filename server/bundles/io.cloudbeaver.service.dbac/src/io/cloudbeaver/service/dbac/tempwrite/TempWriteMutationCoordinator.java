@@ -16,7 +16,9 @@
  */
 package io.cloudbeaver.service.dbac.tempwrite;
 
+import io.cloudbeaver.service.dbac.db.DbacSchemaConstants;
 import io.cloudbeaver.service.dbac.policy.DbAccessKey;
+import io.cloudbeaver.service.dbac.policy.DbAccessPolicyConfig;
 import io.cloudbeaver.service.dbac.policy.enforcement.EnforcementKeyLocks;
 import org.jkiss.code.NotNull;
 import org.jkiss.code.Nullable;
@@ -24,6 +26,7 @@ import org.jkiss.dbeaver.Log;
 
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -68,6 +71,16 @@ import java.util.UUID;
  * gave up would leave the grant in place. Inside one server it also serializes writers of a key, so the
  * compare-and-set below decides between them deterministically; it remains what protects the stored
  * state from anything that writes without the lock.
+ * <p>
+ * <b>The user fence.</b> A grant - a supersede included - is issued only to a user that exists. After
+ * the key's write lock it takes the user's read lock, waiting at most {@code T_k}, and holds it until the
+ * attempt that decided has committed or rolled back; each attempt's transaction first confirms the user's
+ * row. A deletion needs the user's write lock, so it cannot commit between that check and the grant's
+ * commit, and a grant cannot be left to the next user created under the same id. The locks are taken in
+ * the order the enforcement points use, key then user, and given back user then key. A user lock that
+ * cannot be had in time, an interrupt while waiting for it, and a missing user are refusals with nothing
+ * written ({@link TempWriteMutationStatus#USER_FENCE_REFUSED}); the first two open no connection, and a
+ * missing user is not retried. A revoke takes no user lock: it only takes a permission away.
  */
 public class TempWriteMutationCoordinator {
 
@@ -106,11 +119,22 @@ public class TempWriteMutationCoordinator {
     /** Bound on how far a driver may nest or chain exceptions before the walk gives up. */
     private static final int MAX_EXCEPTION_CHAIN_DEPTH = 16;
 
+    /**
+     * The schema version whose fence era this grant fence belongs to
+     * <p>
+     * The grant fence is half of what {@link DbacSchemaConstants#USER_FENCE_SINCE_VERSION} promises,
+     * the deletion fence the other half and the version 4 quarantine the base. Referring to the one
+     * constant keeps the three from being shipped apart.
+     */
+    public static final int GRANT_FENCE_SINCE_VERSION = DbacSchemaConstants.USER_FENCE_SINCE_VERSION;
+
     private static final Log log = Log.getLog(TempWriteMutationCoordinator.class);
 
     private final MetadataConnectionSource connectionSource;
     private final TempWriteGrantRepository repository;
     private final TempWriteAuditSink auditSink;
+    /** {@code T_k}: how long a grant waits for its user's read lock */
+    private final Duration keyLockTimeout;
 
     /**
      * Builds a coordinator that records nothing, which every caller has to ask for by name
@@ -130,7 +154,7 @@ public class TempWriteMutationCoordinator {
     }
 
     /**
-     * Builds a coordinator that audits every committed transition in the transition's own transaction
+     * Builds a coordinator that audits every committed transition in the transition's own transaction, waiting the default {@code T_k}
      *
      * @param auditSink called after the row and its history are written and before the commit, so a
      *     failure to audit rolls the transition back instead of leaving it unrecorded
@@ -140,9 +164,37 @@ public class TempWriteMutationCoordinator {
         @NotNull TempWriteGrantRepository repository,
         @NotNull TempWriteAuditSink auditSink
     ) {
+        this(connectionSource, repository, auditSink, DbAccessPolicyConfig.defaults());
+    }
+
+    /**
+     * Builds a coordinator that waits for a user's read lock as long as {@code config} allows
+     * <p>
+     * A caller serving requests - the future administration API - is to pass the configuration of the
+     * ready policy service, so a grant waits for a user exactly as long as an enforcement point does.
+     * Another configuration changes only how long a grant waits, never whether it is safe: that comes
+     * from the lock order and the existence check, which no configuration can turn off.
+     *
+     * @param config where {@code T_k}, {@link DbAccessPolicyConfig#keyLockTimeout()}, is taken from
+     */
+    public TempWriteMutationCoordinator(
+        @NotNull MetadataConnectionSource connectionSource,
+        @NotNull TempWriteGrantRepository repository,
+        @NotNull TempWriteAuditSink auditSink,
+        @NotNull DbAccessPolicyConfig config
+    ) {
         this.connectionSource = connectionSource;
         this.repository = repository;
         this.auditSink = auditSink;
+        this.keyLockTimeout = config.keyLockTimeout();
+    }
+
+    /**
+     * {@code T_k}: how long {@link #grant} waits for the user's read lock before it refuses
+     */
+    @NotNull
+    public Duration keyLockTimeout() {
+        return keyLockTimeout;
     }
 
     /**
@@ -151,7 +203,8 @@ public class TempWriteMutationCoordinator {
      * Inserts at revision 1 when the key has no row, otherwise replaces the row conditionally on the
      * revision. Replacing a grant that was still active also records a {@code SUPERSEDED} event for
      * it, in the same transaction as the {@code GRANTED} event of the new one, so the two are never
-     * seen apart.
+     * seen apart. Issued only to a user that exists, under that user's read lock - see the user fence
+     * above.
      *
      * @return what happened; a refusal is a value, not an exception
      * @throws SQLException if the metadata database fails for a reason that is not contention
@@ -159,17 +212,32 @@ public class TempWriteMutationCoordinator {
     @NotNull
     public TempWriteMutationResult grant(@NotNull TempWriteGrantRequest request) throws SQLException {
         try (EnforcementKeyLocks.Held ignored = EnforcementKeyLocks.global().lockGrantForWrite(accessKeyOf(request.key()))) {
-            int attempt = 0;
-            while (true) {
-                attempt++;
-                Optional<TempWriteMutationResult> outcome = attemptGrant(request, attempt);
-                if (outcome.isPresent()) {
-                    return outcome.get();
-                }
-                if (attempt > MAX_TRANSIENT_RETRIES) {
-                    log.warn("TEMP_WRITE grant gave up after " + attempt + " attempts on unchanged revision "
-                        + request.observedRevisionAtRequestStart());
-                    return TempWriteMutationResult.retryExhausted(attempt);
+            EnforcementKeyLocks.Held user;
+            try {
+                user = EnforcementKeyLocks.global().tryLockUserForRead(request.key().userId(), keyLockTimeout);
+            } catch (InterruptedException e) {
+                // The wait cleared the flag; the caller still gets the interrupt it asked for.
+                Thread.currentThread().interrupt();
+                log.warn("TEMP_WRITE grant refused by the user fence: interrupted while waiting for the user");
+                return TempWriteMutationResult.userLockInterrupted();
+            }
+            if (user == null) {
+                log.warn("TEMP_WRITE grant refused by the user fence: the user was not free within " + keyLockTimeout.toMillis() + " ms");
+                return TempWriteMutationResult.userLockTimeout();
+            }
+            try (EnforcementKeyLocks.Held ignoredUser = user) {
+                int attempt = 0;
+                while (true) {
+                    attempt++;
+                    Optional<TempWriteMutationResult> outcome = attemptGrant(request, attempt);
+                    if (outcome.isPresent()) {
+                        return outcome.get();
+                    }
+                    if (attempt > MAX_TRANSIENT_RETRIES) {
+                        log.warn("TEMP_WRITE grant gave up after " + attempt + " attempts on unchanged revision "
+                            + request.observedRevisionAtRequestStart());
+                        return TempWriteMutationResult.retryExhausted(attempt);
+                    }
                 }
             }
         }
@@ -218,6 +286,13 @@ public class TempWriteMutationCoordinator {
              MetadataTransaction txn = new MetadataTransaction(connection)
         ) {
             try {
+                // The user fence, inside the transaction that commits the grant and under the user's read lock:
+                // no deletion can commit between this check and the commit.
+                if (!repository.userExists(connection, request.key().userId())) {
+                    txn.rollback();
+                    log.warn("TEMP_WRITE grant refused by the user fence: the user does not exist");
+                    return Optional.of(TempWriteMutationResult.userMissing(attempt));
+                }
                 Optional<TempWriteGrant> current = repository.findCurrent(connection, request.key());
                 long observed = observedRevision(current);
                 if (observed != request.observedRevisionAtRequestStart()) {

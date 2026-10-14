@@ -31,6 +31,13 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.EnumMap;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * The TEMP_WRITE model refuses values that must never reach storage
@@ -239,6 +246,72 @@ public class TempWriteModelTest {
             () -> new TempWriteMutationResult(
                 TempWriteMutationStatus.RETRY_EXHAUSTED, 0, null, null, null, 1),
             "disagree");
+    }
+
+    /**
+     * GF-1: every combination of status, reason, attempts, rows and identity is accepted exactly when the result model allows it
+     * <p>
+     * The rule, written out once here and compared with the constructor for all of them: a status has its
+     * own reasons - none for a commit or a no-op, one for each conflict, the three user-fence reasons for a
+     * fence refusal; a refusal changes no row and names no revision or grant; and no attempt was made
+     * exactly when the user's lock was never had.
+     */
+    @Test
+    public void gf1TheResultModelAcceptsExactlyTheAllowedCombinations() {
+        final List<String> violations = new ArrayList<>();
+        Map<TempWriteMutationStatus, Set<TempWriteConflictReason>> reasons = new EnumMap<>(
+            TempWriteMutationStatus.class);
+        reasons.put(TempWriteMutationStatus.CONFLICT_SUPERSEDED, EnumSet.of(TempWriteConflictReason.REVISION_SUPERSEDED));
+        reasons.put(TempWriteMutationStatus.RETRY_EXHAUSTED, EnumSet.of(TempWriteConflictReason.TRANSIENT_RETRY_EXHAUSTED));
+        reasons.put(TempWriteMutationStatus.USER_FENCE_REFUSED, EnumSet.of(TempWriteConflictReason.USER_MISSING,
+            TempWriteConflictReason.USER_LOCK_TIMEOUT, TempWriteConflictReason.USER_LOCK_INTERRUPTED));
+        Set<TempWriteConflictReason> lockNeverHad = EnumSet.of(
+            TempWriteConflictReason.USER_LOCK_TIMEOUT, TempWriteConflictReason.USER_LOCK_INTERRUPTED);
+        List<TempWriteConflictReason> allReasons = new ArrayList<>(Arrays.asList(TempWriteConflictReason.values()));
+        allReasons.add(null);
+        int accepted = 0;
+        for (TempWriteMutationStatus status : TempWriteMutationStatus.values()) {
+            for (TempWriteConflictReason reason : allReasons) {
+                for (int attempts : new int[]{-1, 0, 1, 2}) {
+                    for (int rows : new int[]{0, 1}) {
+                        for (int identity = 0; identity < 4; identity++) {
+                            Long revision = (identity & 1) != 0 ? 1L : null;
+                            String grantId = (identity & 2) != 0 ? "g" : null;
+                            boolean identified = identity != 0;
+                            boolean paired = reason == null
+                                ? !reasons.containsKey(status)
+                                : reasons.getOrDefault(status, Set.of()).contains(reason);
+                            boolean refusalClean = reason == null || (rows == 0 && !identified);
+                            boolean attemptsAgree = attempts >= 0 && (attempts == 0) == lockNeverHad.contains(reason);
+                            boolean allowed = paired && refusalClean && attemptsAgree;
+                            String what = status + "/" + reason + "/attempts=" + attempts + "/rows=" + rows
+                                + "/revision=" + revision + "/grantId=" + grantId;
+                            TempWriteMutationResult built = null;
+                            Throwable refused = null;
+                            try {
+                                built = new TempWriteMutationResult(status, rows, revision, grantId, reason, attempts);
+                            } catch (RuntimeException e) {
+                                refused = e;
+                            }
+                            if (allowed && built == null) {
+                                violations.add(what + " must be accepted, got " + refused);
+                            } else if (!allowed && built != null) {
+                                violations.add(what + " must be refused");
+                            } else if (!allowed && !(refused instanceof IllegalArgumentException)) {
+                                violations.add(what + " must be refused with IllegalArgumentException, got " + refused);
+                            } else if (built != null) {
+                                accepted++;
+                                if (built.isRefused() != (reason != null)) {
+                                    violations.add(what + ": isRefused must be " + (reason != null));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Assertions.assertEquals(List.of(), violations, "GF-1");
+        Assertions.assertTrue(accepted > 0, "FIXTURE GF-1: no combination was accepted at all");
     }
 
     @Test

@@ -22,10 +22,11 @@ import org.jkiss.code.Nullable;
 /**
  * Outcome of one grant or revoke, as an explicit value rather than a null or a thrown exception
  * <p>
- * A refused mutation is a normal answer, not a failure: the conflict cases below all mean the
- * request was correct but arrived too late. A metadata database that is broken or unreachable is a
- * different thing entirely and propagates as an exception, because reporting it as "no change"
- * would let a caller mistake a dead store for an empty one.
+ * A refused mutation is a normal answer, not a failure: a conflict means the request was correct but
+ * arrived too late, and a user-fence refusal means the grant's user does not exist or could not be held
+ * against a deletion in time. A metadata database that is broken or unreachable is a different thing
+ * entirely and propagates as an exception, because reporting it as "no change" would let a caller
+ * mistake a dead store for an empty one.
  */
 public record TempWriteMutationResult(
     @NotNull TempWriteMutationStatus status,
@@ -36,23 +37,51 @@ public record TempWriteMutationResult(
     int attempts
 ) {
 
+    /**
+     * Refuses a combination the coordinator can never produce
+     * <p>
+     * A status has its own reasons: none for a commit or a no-op, one for each conflict, and the three
+     * user-fence reasons for a fence refusal. A refusal changed no row and names no revision or grant. And
+     * no attempt was made exactly when the user's lock was never had - a timeout or an interrupt while
+     * waiting for it; every other outcome is the result of at least one attempt.
+     */
     public TempWriteMutationResult {
-        if (attempts < 1) {
-            throw new IllegalArgumentException("A mutation makes at least one attempt, got " + attempts);
+        if (attempts < 0) {
+            throw new IllegalArgumentException("Attempts cannot be negative, got " + attempts);
         }
         if (affectedRows < 0) {
             throw new IllegalArgumentException("Affected rows cannot be negative, got " + affectedRows);
         }
-        boolean conflicted = status == TempWriteMutationStatus.CONFLICT_SUPERSEDED
-            || status == TempWriteMutationStatus.RETRY_EXHAUSTED;
-        if (conflicted == (conflictReason == null)) {
+        if (!agrees(status, conflictReason)) {
             throw new IllegalArgumentException(
                 "Status " + status + " and conflict reason " + conflictReason + " disagree");
         }
-        if (conflicted && affectedRows != 0) {
+        if (conflictReason != null && affectedRows != 0) {
             throw new IllegalArgumentException(
                 "A refused mutation cannot have changed " + affectedRows + " rows");
         }
+        if (conflictReason != null && (revision != null || grantId != null)) {
+            throw new IllegalArgumentException(
+                "A refused mutation names no revision or grant, got " + revision + " and " + grantId);
+        }
+        boolean lockNeverHad = conflictReason == TempWriteConflictReason.USER_LOCK_TIMEOUT
+            || conflictReason == TempWriteConflictReason.USER_LOCK_INTERRUPTED;
+        if ((attempts == 0) != lockNeverHad) {
+            throw new IllegalArgumentException(lockNeverHad
+                ? "A refusal before the user's lock makes no attempt, got " + attempts
+                : "Every outcome but a refusal before the user's lock makes at least one attempt");
+        }
+    }
+
+    private static boolean agrees(@NotNull TempWriteMutationStatus status, @Nullable TempWriteConflictReason reason) {
+        return switch (status) {
+            case COMMITTED, NO_OP -> reason == null;
+            case CONFLICT_SUPERSEDED -> reason == TempWriteConflictReason.REVISION_SUPERSEDED;
+            case RETRY_EXHAUSTED -> reason == TempWriteConflictReason.TRANSIENT_RETRY_EXHAUSTED;
+            case USER_FENCE_REFUSED -> reason == TempWriteConflictReason.USER_MISSING
+                || reason == TempWriteConflictReason.USER_LOCK_TIMEOUT
+                || reason == TempWriteConflictReason.USER_LOCK_INTERRUPTED;
+        };
     }
 
     /**
@@ -91,6 +120,36 @@ public record TempWriteMutationResult(
         return new TempWriteMutationResult(
             TempWriteMutationStatus.RETRY_EXHAUSTED, 0, null, null,
             TempWriteConflictReason.TRANSIENT_RETRY_EXHAUSTED, attempts);
+    }
+
+    /**
+     * Builds the result of a grant whose user did not exist, seen by the attempt that read it
+     */
+    @NotNull
+    static TempWriteMutationResult userMissing(int attempt) {
+        return new TempWriteMutationResult(
+            TempWriteMutationStatus.USER_FENCE_REFUSED, 0, null, null,
+            TempWriteConflictReason.USER_MISSING, attempt);
+    }
+
+    /**
+     * Builds the result of a grant that could not take its user's read lock in time
+     */
+    @NotNull
+    static TempWriteMutationResult userLockTimeout() {
+        return new TempWriteMutationResult(
+            TempWriteMutationStatus.USER_FENCE_REFUSED, 0, null, null,
+            TempWriteConflictReason.USER_LOCK_TIMEOUT, 0);
+    }
+
+    /**
+     * Builds the result of a grant interrupted while waiting for its user's read lock
+     */
+    @NotNull
+    static TempWriteMutationResult userLockInterrupted() {
+        return new TempWriteMutationResult(
+            TempWriteMutationStatus.USER_FENCE_REFUSED, 0, null, null,
+            TempWriteConflictReason.USER_LOCK_INTERRUPTED, 0);
     }
 
     /**

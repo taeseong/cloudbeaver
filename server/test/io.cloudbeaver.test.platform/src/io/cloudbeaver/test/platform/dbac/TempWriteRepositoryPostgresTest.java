@@ -127,6 +127,10 @@ public class TempWriteRepositoryPostgresTest {
                     config,
                     null).updateSchema(MONITOR);
             }
+            // A grant is issued only to a user that exists (P5-F), so the user tables live beside the DBAC ones.
+            try (Connection raw = connect()) {
+                FenceTestSupport.installUserTables(new InternalProxyConnection(raw, config));
+            }
         } catch (Exception e) {
             if (REQUIRED) {
                 throw new IllegalStateException(
@@ -789,8 +793,14 @@ public class TempWriteRepositoryPostgresTest {
         }
     }
 
+    /**
+     * The key of {@code user}, whose user row is made here: a grant is issued only to a user that exists (P5-F)
+     */
     @NotNull
-    private static TempWritePermissionKey key(@NotNull String user) {
+    private static TempWritePermissionKey key(@NotNull String user) throws SQLException {
+        try (Connection connection = open()) {
+            PolicyTestSupport.putUser(connection, user, true);
+        }
         return new TempWritePermissionKey(user, PROJECT, CONNECTION);
     }
 
