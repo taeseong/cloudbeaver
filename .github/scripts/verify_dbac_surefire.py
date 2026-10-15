@@ -61,6 +61,8 @@ REQUIRED_VALUE = "true"
 # production close handler empties the taint registry (TR-2) and keeps a registry failure to itself (TR-10).
 # AuditFailClosedTest writes pre-execution audit rows into a PostgreSQL metadata schema as well as H2: committed
 # and visible before the writer returns, a statement timeout from the audit budget, nothing past the budget kept.
+# EnforcementGateTest runs the gate on a lifecycle of its own over a PostgreSQL metadata schema as well as H2: no
+# metadata connection while it waits for a lock, the rollback before the audit row, the allowed row before the operation.
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
@@ -76,6 +78,7 @@ POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.UserRecreationTest",
     "io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest",
     "io.cloudbeaver.test.platform.dbac.AuditFailClosedTest",
+    "io.cloudbeaver.test.platform.dbac.EnforcementGateTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -115,6 +118,7 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.UserRecreationTest": 8,
     "io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest": 14,
     "io.cloudbeaver.test.platform.dbac.AuditFailClosedTest": 12,
+    "io.cloudbeaver.test.platform.dbac.EnforcementGateTest": 35,
 }
 
 for _postgres_class in POSTGRES_CLASSES:

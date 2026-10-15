@@ -39,6 +39,7 @@ import io.cloudbeaver.test.platform.dbac.DbacSchemaTest;
 import io.cloudbeaver.test.platform.dbac.DbacScriptStatementsTest;
 import io.cloudbeaver.test.platform.dbac.DbacScriptTranslationTest;
 import io.cloudbeaver.test.platform.dbac.DeploymentGuardTest;
+import io.cloudbeaver.test.platform.dbac.EnforcementGateTest;
 import io.cloudbeaver.test.platform.dbac.EnforcementLifecycleTest;
 import io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest;
 import io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest;
@@ -110,7 +111,8 @@ import org.junit.platform.suite.api.Suite;
         DbacFenceMigrationTest.class,
         UserRecreationTest.class,
         TaintRegistryLifecycleTest.class,
-        AuditFailClosedTest.class
+        AuditFailClosedTest.class,
+        EnforcementGateTest.class
     }
 )
 public class CEServerTestSuite {

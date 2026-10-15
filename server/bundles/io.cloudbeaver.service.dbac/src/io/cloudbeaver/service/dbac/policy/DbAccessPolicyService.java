@@ -320,6 +320,79 @@ public final class DbAccessPolicyService {
     }
 
     /**
+     * The key a request is about - resolved, not decided
+     * <p>
+     * Steps 2 and 3 of {@link #authorize} and nothing more: the category must be write-gated, and
+     * identity and container must resolve to a key exactly as authorize resolves them, so a request
+     * without one fails here with the reason authorize would give. No metadata connection is opened,
+     * nothing is permitted and nothing is decided. A rollback is not a write the enforcement gate
+     * runs, so its category is refused here as unsupported, where authorize lets it through
+     * unjudged.
+     * <p>
+     * The enforcement gate locks this key before it authorizes, and refuses the attempt when the
+     * decision then turns out to be about any other key. A container or identity that changed in
+     * between is therefore a refusal, never a decision about something the lock did not cover.
+     *
+     * @return a key, or the reason there is none; never null, never an exception for an ordinary input
+     */
+    @NotNull
+    public KeyResolution resolveKey(@NotNull WriteAuthorizationRequest request) {
+        if (request == null) {
+            throw new IllegalArgumentException("An authorization request is required");
+        }
+        DbOperationCategory category = request.operationCategory();
+        if (category == null) {
+            throw new IllegalArgumentException("An authorization request must say what is being attempted");
+        }
+        try {
+            if (!category.requiresWriteAuthorization()) {
+                return new KeyResolution(null, DenialReason.OPERATION_UNSUPPORTED);
+            }
+            ContainerIdentityResolver.Resolved resolved =
+                ContainerIdentityResolver.resolve(request.userId(), request.container());
+            return resolved.ok() ? new KeyResolution(resolved.key(), null) : new KeyResolution(null, resolved.failure());
+        } catch (RuntimeException | Error e) {
+            // As authorize: nothing unexpected may become a key, and nothing escapes.
+            logFailure(EVENT_AUTHORIZATION_FAILED, "DBAC key resolution failed unexpectedly", null, e);
+            return new KeyResolution(null, DenialReason.PERMISSION_STORE_UNAVAILABLE);
+        }
+    }
+
+    /**
+     * What {@link #resolveKey} found: a key, or the reason there is none
+     * <p>
+     * Only the service makes one, so a key cannot be handed to the enforcement gate from anywhere
+     * else.
+     */
+    public static final class KeyResolution {
+        @Nullable
+        private final DbAccessKey key;
+        @Nullable
+        private final DenialReason failure;
+
+        private KeyResolution(@Nullable DbAccessKey key, @Nullable DenialReason failure) {
+            this.key = key;
+            this.failure = failure;
+        }
+
+        /**
+         * The key, or null when there is none
+         */
+        @Nullable
+        public DbAccessKey key() {
+            return key;
+        }
+
+        /**
+         * Why there is no key, or null when there is one
+         */
+        @Nullable
+        public DenialReason failure() {
+            return failure;
+        }
+    }
+
+    /**
      * Whether this node's clock has drifted too far from the database's
      * <p>
      * Expiry does not depend on this - the database decided that already. What the guard protects is
