@@ -636,7 +636,12 @@ public class MetadataLeaseTest {
     }
 
     /**
-     * ML-7: the only places DBAC production code sets a query timeout are the lease's two, setting and restoring
+     * ML-7: DBAC production code sets a query timeout only in the lease, to set and restore it, and in the deployment guard
+     * <p>
+     * On H2 a query timeout belongs to the session and outlives the statement, so on a pooled metadata connection
+     * only the lease may set one, and it puts it back. The deployment guard's two (P6-0, R23) bound the advisory
+     * lock attempt and the look-up of who holds the lock. Those run only on PostgreSQL, where the timeout belongs to
+     * the statement, and only on connections the guard owns and aborts rather than hands back to the pool.
      */
     @Test
     public void ml7OnlyTheLeaseSetsAQueryTimeout() throws IOException {
@@ -651,8 +656,9 @@ public class MetadataLeaseTest {
                 }
             }
         }
-        Assertions.assertEquals(Map.of("MetadataLease.java", 2), found,
-            "ML-7: setQueryTimeout may appear only in the lease template, once to set and once to restore");
+        Assertions.assertEquals(Map.of("MetadataLease.java", 2, "DeploymentGuard.java", 2), found,
+            "ML-7: setQueryTimeout may appear only in the lease template, once to set and once to restore,"
+                + " and in the deployment guard's two PostgreSQL lock statements");
     }
 
     // ---------------------------------------------------------------- LS: the state table

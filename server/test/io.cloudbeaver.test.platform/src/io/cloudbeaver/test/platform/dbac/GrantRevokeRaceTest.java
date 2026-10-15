@@ -979,25 +979,29 @@ public class GrantRevokeRaceTest {
     }
 
     /**
-     * KR-3: every lock is fair and kept once made; a queued writer holds back a new timed reader
+     * KR-3: every lock is fair and stays the key's lock while it is used; a queued writer holds back a new timed reader
+     * <p>
+     * Since P6-0 (S4) a lock leaves the registry once nothing holds or waits for it; KeyLockRegistryTest checks that.
      */
     @Test
-    public void kr3LocksAreFairAndKept() throws Exception {
+    public void kr3LocksAreFairAndSharedWhileUsed() throws Exception {
         DbAccessKey key = new DbAccessKey("dbac-p4-kr3-" + System.nanoTime(), PROJECT, CONNECTION);
         String user = key.userId();
         Assertions.assertTrue(KeyLockTestSupport.grantReadable(key), "FIXTURE: KR-3 the key is free");
         Assertions.assertTrue(KeyLockTestSupport.userReadable(user), "FIXTURE: KR-3 the user is free");
-        ReentrantReadWriteLock grantLock = lockFor(key);
-        ReentrantReadWriteLock userLock = lockFor(user);
-        Assertions.assertNotNull(grantLock, "KR-3: the registry must keep the key's lock after it was released");
-        Assertions.assertNotNull(userLock, "KR-3: the registry must keep the user's lock after it was released");
-        Assertions.assertTrue(grantLock.isFair(), "KR-3: the key's lock must be fair");
-        Assertions.assertTrue(userLock.isFair(), "KR-3: the user's lock must be fair");
-        Assertions.assertTrue(KeyLockTestSupport.grantReadable(key), "FIXTURE: KR-3 the key is free again");
-        Assertions.assertSame(grantLock, lockFor(key), "KR-3: the same key must keep the same lock");
-        Assertions.assertSame(userLock, lockFor(user), "KR-3: the same user must keep the same lock");
-        for (ReentrantReadWriteLock lock : allLocks()) {
-            Assertions.assertTrue(lock.isFair(), "KR-3: every lock in the registry must be fair");
+        try (Reader grantReader = Reader.ofGrant(key); Reader userReader = Reader.ofUser(user)) {
+            ReentrantReadWriteLock grantLock = lockFor(key);
+            ReentrantReadWriteLock userLock = lockFor(user);
+            Assertions.assertNotNull(grantLock, "KR-3: the registry must have the key's lock while it is held");
+            Assertions.assertNotNull(userLock, "KR-3: the registry must have the user's lock while it is held");
+            Assertions.assertTrue(grantLock.isFair(), "KR-3: the key's lock must be fair");
+            Assertions.assertTrue(userLock.isFair(), "KR-3: the user's lock must be fair");
+            Assertions.assertTrue(KeyLockTestSupport.grantReadable(key), "FIXTURE: KR-3 a second reader gets the key");
+            Assertions.assertSame(grantLock, lockFor(key), "KR-3: the same key must keep the same lock while it is held");
+            Assertions.assertSame(userLock, lockFor(user), "KR-3: the same user must keep the same lock while it is held");
+            for (ReentrantReadWriteLock lock : allLocks()) {
+                Assertions.assertTrue(lock.isFair(), "KR-3: every lock in the registry must be fair");
+            }
         }
 
         CountDownLatch release = new CountDownLatch(1);
@@ -1040,8 +1044,10 @@ public class GrantRevokeRaceTest {
         boolean timedOut;
         Worker<EnforcementKeyLocks.Held> interrupted;
         boolean interruptedWaited;
+        ReentrantReadWriteLock lock;
         try {
             Assertions.assertTrue(writing.await(KeyLockTestSupport.TIMEOUT_SECONDS, TimeUnit.SECONDS), "FIXTURE: KR-4 writer");
+            lock = lockFor(key);
             timedOut = !KeyLockTestSupport.grantReadable(key);
             interrupted = Worker.start("dbac-kr4-interrupted",
                 () -> EnforcementKeyLocks.global().tryLockGrantForRead(key, Duration.ofSeconds(20)));
@@ -1057,8 +1063,8 @@ public class GrantRevokeRaceTest {
         Assertions.assertInstanceOf(InterruptedException.class, interrupted.error,
             "KR-4: an interrupted timed read throws InterruptedException");
         Assertions.assertNull(interrupted.result, "KR-4: an interrupted timed read holds nothing");
-        ReentrantReadWriteLock lock = lockFor(key);
-        Assertions.assertNotNull(lock, "KR-4: the lock must still be in the registry");
+        Assertions.assertNotNull(lock, "KR-4: the registry must have had the key's lock while the writer held it");
+        Assertions.assertNull(lockFor(key), "KR-4: nothing may keep the key's lock in the registry once all have left");
         Assertions.assertEquals(0, lock.getReadLockCount(), "KR-4: no read hold may be left behind");
         Assertions.assertFalse(lock.isWriteLocked(), "KR-4: no write hold may be left behind");
         Assertions.assertFalse(lock.hasQueuedThreads(), "KR-4: no waiter may be left behind");
@@ -1074,16 +1080,13 @@ public class GrantRevokeRaceTest {
         return worker;
     }
 
-    /** The registry's lock for a key or user, found by reflection, or null when the registry keeps none */
+    /** The registry's lock for a key or user, found by reflection, or null when the registry has none */
     @org.jkiss.code.Nullable
     private static ReentrantReadWriteLock lockFor(@NotNull Object identity) throws IllegalAccessException {
-        for (Field field : EnforcementKeyLocks.class.getDeclaredFields()) {
-            if (Map.class.isAssignableFrom(field.getType())) {
-                field.setAccessible(true);
-                Object lock = ((Map<?, ?>) field.get(EnforcementKeyLocks.global())).get(identity);
-                if (lock instanceof ReentrantReadWriteLock readWriteLock) {
-                    return readWriteLock;
-                }
+        for (Map<?, ?> map : registryMaps()) {
+            ReentrantReadWriteLock lock = lockOf(map.get(identity));
+            if (lock != null) {
+                return lock;
             }
         }
         return null;
@@ -1092,17 +1095,54 @@ public class GrantRevokeRaceTest {
     @NotNull
     private static List<ReentrantReadWriteLock> allLocks() throws IllegalAccessException {
         List<ReentrantReadWriteLock> locks = new ArrayList<>();
-        for (Field field : EnforcementKeyLocks.class.getDeclaredFields()) {
-            if (Map.class.isAssignableFrom(field.getType())) {
-                field.setAccessible(true);
-                for (Object lock : ((Map<?, ?>) field.get(EnforcementKeyLocks.global())).values()) {
-                    if (lock instanceof ReentrantReadWriteLock readWriteLock) {
-                        locks.add(readWriteLock);
-                    }
+        for (Map<?, ?> map : registryMaps()) {
+            for (Object value : map.values()) {
+                ReentrantReadWriteLock lock = lockOf(value);
+                if (lock != null) {
+                    locks.add(lock);
                 }
             }
         }
         return locks;
+    }
+
+    /** The registry's maps: its fields, or the fields of the objects it keeps each family in */
+    @NotNull
+    private static List<Map<?, ?>> registryMaps() throws IllegalAccessException {
+        List<Map<?, ?>> maps = new ArrayList<>();
+        for (Field field : EnforcementKeyLocks.class.getDeclaredFields()) {
+            if (Modifier.isStatic(field.getModifiers())) {
+                continue;
+            }
+            field.setAccessible(true);
+            Object value = field.get(EnforcementKeyLocks.global());
+            if (value instanceof Map<?, ?> map) {
+                maps.add(map);
+                continue;
+            }
+            for (Field inner : field.getType().getDeclaredFields()) {
+                if (Map.class.isAssignableFrom(inner.getType())) {
+                    inner.setAccessible(true);
+                    maps.add((Map<?, ?>) inner.get(value));
+                }
+            }
+        }
+        return maps;
+    }
+
+    /** The lock a registry value holds: the value itself, or the lock of the entry that holds it */
+    @org.jkiss.code.Nullable
+    private static ReentrantReadWriteLock lockOf(@org.jkiss.code.Nullable Object value) throws IllegalAccessException {
+        if (value == null || value instanceof ReentrantReadWriteLock) {
+            return (ReentrantReadWriteLock) value;
+        }
+        for (Field field : value.getClass().getDeclaredFields()) {
+            if (field.getType() == ReentrantReadWriteLock.class) {
+                field.setAccessible(true);
+                return (ReentrantReadWriteLock) field.get(value);
+            }
+        }
+        return null;
     }
 
     @NotNull

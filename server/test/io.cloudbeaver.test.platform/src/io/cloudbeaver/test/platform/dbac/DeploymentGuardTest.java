@@ -48,13 +48,18 @@ import java.sql.Driver;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLTimeoutException;
 import java.sql.Statement;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -66,6 +71,11 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@code -Ddbac.test.postgres.required=true} an unreachable PostgreSQL fails the class instead of
  * skipping it. DG-12 (the guard runs before the global write lock on every write-gated sequence)
  * needs the P6 gate and is not here.
+ * <p>
+ * DG-14 - DG-20 (P6-0, R23): a lock session whose connection stops answering is not taken for lost while the
+ * backend the guard remembered still holds the exact DBAC lock; only a remembered backend that no longer holds it
+ * lets the guard take the lock again or, when another session has it, fail the service. DG-21 (P6-0 H-1): the
+ * remembered backend is its pid together with when it started, so a reused pid is not taken for the owner.
  */
 public class DeploymentGuardTest {
 
@@ -495,6 +505,552 @@ public class DeploymentGuardTest {
         }
     }
 
+    // ---------------------------------------------------------------- R23: the remembered backend
+
+    /**
+     * DG-14: a lock connection that stops answering while its backend still holds the lock is kept, and the caller proceeds
+     * <p>
+     * {@code isValid} reports false, but the backend that took the lock at admission still holds it: nothing is
+     * replaced, nothing revoked, and each check opens one connection to look and closes it again - also for eight
+     * checks at once. Releasing the lease then frees the lock.
+     */
+    @Test
+    public void dg14ASilentLockSessionThatStillHoldsTheLockIsKept() throws Exception {
+        requirePostgres();
+        List<String> violations = new ArrayList<>();
+        ControlledSource source = new ControlledSource();
+        RecordingRevocation revocation = new RecordingRevocation();
+        DeploymentGuard.Admitted admitted = admit(source, revocation);
+        int owner = source.pids.get(0);
+        try {
+            source.invalid.add(0);
+            for (int i = 0; i < 3; i++) {
+                if (!admitted.admission().assertSingleProcess()) {
+                    violations.add("check " + i + ": a silent session whose backend holds the lock must let the caller proceed");
+                }
+            }
+            expectEquals(violations, "owner checks made", 3, source.checks.get());
+            List<Boolean> answers = concurrentChecks(admitted, 8);
+            expectEquals(violations, "eight concurrent checks", Collections.nCopies(8, Boolean.TRUE), answers);
+            expectEquals(violations, "revocations", List.of(), revocation.codes);
+            expectEquals(violations, "lock holders", List.of(owner), lockHolders());
+            if (source.handed.get(0).isClosed()) {
+                violations.add("the silent lock connection must be kept");
+            }
+            for (int i = 1; i < source.handed.size(); i++) {
+                if (!source.handed.get(i).isClosed()) {
+                    violations.add("the connection opened for check " + i + " must be closed");
+                }
+            }
+            expectEquals(violations, "connections opened: one at admission and one per check", 12, source.handed.size());
+        } finally {
+            admitted.leaseRelease().run();
+        }
+        expectEquals(violations, "lock holders after the release", List.of(), lockHolders());
+        Assertions.assertEquals(List.of(), violations, "DG-14");
+    }
+
+    /**
+     * DG-15: a dead lock session is replaced by a new one, which is remembered from then on - once, under concurrent checks
+     */
+    @Test
+    public void dg15ADeadLockSessionIsReplacedAndTheNewOneIsRemembered() throws Exception {
+        requirePostgres();
+        List<String> violations = new ArrayList<>();
+        ControlledSource source = new ControlledSource();
+        RecordingRevocation revocation = new RecordingRevocation();
+        DeploymentGuard.Admitted admitted = admit(source, revocation);
+        try {
+            terminate(source.pids.get(0));
+            if (!admitted.admission().assertSingleProcess()) {
+                violations.add("a dead session whose lock is free must be replaced and the caller proceed");
+            }
+            expectEquals(violations, "connections after the replacement", 2, source.handed.size());
+            expectEquals(violations, "lock holders after the replacement", List.of(pidAt(source, 1)), lockHolders());
+
+            source.invalid.add(1);
+            if (!admitted.admission().assertSingleProcess()) {
+                violations.add("the replacing session is the remembered owner: silent but holding, the caller proceeds");
+            }
+            expectEquals(violations, "lock holders while the new owner is silent", List.of(pidAt(source, 1)), lockHolders());
+            expectEquals(violations, "connections: the silent new owner is not replaced", 3, source.handed.size());
+
+            if (source.pids.size() > 1) {
+                terminate(source.pids.get(1));
+            }
+            List<Boolean> answers = concurrentChecks(admitted, 8);
+            expectEquals(violations, "eight concurrent checks after the second death", Collections.nCopies(8, Boolean.TRUE), answers);
+            expectEquals(violations, "connections: replaced exactly once more", 4, source.handed.size());
+            expectEquals(violations, "lock holders after the concurrent replacement", List.of(pidAt(source, 3)), lockHolders());
+            expectEquals(violations, "revocations", List.of(), revocation.codes);
+        } finally {
+            admitted.leaseRelease().run();
+        }
+        expectEquals(violations, "lock holders after the release", List.of(), lockHolders());
+        Assertions.assertEquals(List.of(), violations, "DG-15");
+    }
+
+    /**
+     * DG-16: when the remembered backend no longer holds the lock and another session does, the service fails exactly once
+     * <p>
+     * Once with the backend dead, once with it alive but silent and without the lock. Either way the caller is
+     * denied, the service is failed with ADVISORY_LOCK_LOST once, and later checks deny without opening anything.
+     */
+    @Test
+    public void dg16ALockTakenElsewhereFailsTheServiceOnce() throws Exception {
+        requirePostgres();
+        List<String> violations = new ArrayList<>();
+        for (boolean dead : new boolean[]{true, false}) {
+            String what = dead ? "the owner died: " : "the owner is silent and let the lock go: ";
+            ControlledSource source = new ControlledSource();
+            RecordingRevocation revocation = new RecordingRevocation();
+            DeploymentGuard.Admitted admitted = admit(source, revocation);
+            try (Connection other = open()) {
+                try {
+                    if (dead) {
+                        terminate(source.pids.get(0));
+                    } else {
+                        unlock(source.raw.get(0));
+                        source.invalid.add(0);
+                    }
+                    Assertions.assertTrue(waitForLock(other), "FIXTURE: the competing session could not take the lock");
+                    if (admitted.admission().assertSingleProcess()) {
+                        violations.add(what + "a lock held elsewhere must deny the caller");
+                    }
+                    expectEquals(violations, what + "revocations", List.of(FailureCode.ADVISORY_LOCK_LOST), revocation.codes);
+                    int opened = source.handed.size();
+                    if (admitted.admission().assertSingleProcess()) {
+                        violations.add(what + "a lost lease keeps denying");
+                    }
+                    expectEquals(violations, what + "connections opened after the loss", opened, source.handed.size());
+                    expectEquals(violations, what + "revocations after a second check", 1, revocation.codes.size());
+                    for (int i = 0; i < source.handed.size(); i++) {
+                        if (!source.handed.get(i).isClosed()) {
+                            violations.add(what + "connection " + i + " must be closed once the lease is lost");
+                        }
+                    }
+                } finally {
+                    unlock(other);
+                }
+            } finally {
+                admitted.leaseRelease().run();
+            }
+        }
+        Assertions.assertEquals(List.of(), violations, "DG-16");
+    }
+
+    /**
+     * DG-17: only the exact DBAC lock counts - not another advisory lock of the same backend, nor the same key in share mode
+     * <p>
+     * The remembered backend gives the DBAC lock up and takes another key, and the same two halves as a pair of
+     * int keys, while another session takes the DBAC lock: denied. Then the backend holds the DBAC key in share
+     * mode only: denied too.
+     */
+    @Test
+    public void dg17OnlyTheExactLockCountsAsHeld() throws Exception {
+        requirePostgres();
+        List<String> violations = new ArrayList<>();
+        long key = DeploymentGuard.ADVISORY_LOCK_KEY;
+        ControlledSource source = new ControlledSource();
+        RecordingRevocation revocation = new RecordingRevocation();
+        DeploymentGuard.Admitted admitted = admit(source, revocation);
+        try (Connection other = open()) {
+            try {
+                Connection owner = source.raw.get(0);
+                execute(owner, "SELECT pg_advisory_unlock(" + key + ")");
+                execute(owner, "SELECT pg_advisory_lock(" + (key + 1) + ")");
+                execute(owner, "SELECT pg_advisory_lock(" + (int) (key >>> 32) + ", " + (int) key + ")");
+                Assertions.assertTrue(tryLock(other), "FIXTURE: the competing session could not take the DBAC lock");
+                Assertions.assertEquals(2, advisoryLocksOf(source.pids.get(0)), "FIXTURE: the owner must hold two other advisory locks");
+                source.invalid.add(0);
+                if (admitted.admission().assertSingleProcess()) {
+                    violations.add("another advisory lock of the remembered backend must not count as the DBAC lock");
+                }
+                expectEquals(violations, "revocations, other locks", List.of(FailureCode.ADVISORY_LOCK_LOST), revocation.codes);
+            } finally {
+                unlock(other);
+            }
+        } finally {
+            admitted.leaseRelease().run();
+        }
+
+        ControlledSource shared = new ControlledSource();
+        RecordingRevocation sharedRevocation = new RecordingRevocation();
+        DeploymentGuard.Admitted sharedAdmitted = admit(shared, sharedRevocation);
+        try {
+            Connection owner = shared.raw.get(0);
+            execute(owner, "SELECT pg_advisory_unlock(" + key + ")");
+            execute(owner, "SELECT pg_advisory_lock_shared(" + key + ")");
+            shared.invalid.add(0);
+            if (sharedAdmitted.admission().assertSingleProcess()) {
+                violations.add("the DBAC key held in share mode must not count as the DBAC lock");
+            }
+            expectEquals(violations, "revocations, share mode", List.of(FailureCode.ADVISORY_LOCK_LOST), sharedRevocation.codes);
+        } finally {
+            sharedAdmitted.leaseRelease().run();
+        }
+        expectEquals(violations, "lock holders after both", List.of(), lockHolders());
+        Assertions.assertEquals(List.of(), violations, "DG-17");
+    }
+
+    /**
+     * DG-18: a remembered backend that is only waiting for the DBAC lock does not hold it, and the check does not wait for it
+     */
+    @Test
+    public void dg18AnOwnerOnlyWaitingForTheLockDoesNotHoldIt() throws Exception {
+        requirePostgres();
+        List<String> violations = new ArrayList<>();
+        ControlledSource source = new ControlledSource();
+        RecordingRevocation revocation = new RecordingRevocation();
+        DeploymentGuard.Admitted admitted = admit(source, revocation);
+        KeyLockTestSupport.Worker<Object> waiting = null;
+        try (Connection other = open()) {
+            try {
+                Connection owner = source.raw.get(0);
+                final int ownerPid = source.pids.get(0);
+                unlock(owner);
+                Assertions.assertTrue(tryLock(other), "FIXTURE: the competing session could not take the DBAC lock");
+                waiting = KeyLockTestSupport.Worker.start("dbac-dg18-owner-waits", () -> {
+                    execute(owner, "SELECT pg_advisory_lock(" + DeploymentGuard.ADVISORY_LOCK_KEY + ")");
+                    return null;
+                });
+                Assertions.assertTrue(awaitWaitingFor(ownerPid), "FIXTURE: the owner must be waiting for the DBAC lock");
+                source.invalid.add(0);
+                KeyLockTestSupport.Worker<Boolean> check = KeyLockTestSupport.Worker.start("dbac-dg18-check",
+                    () -> admitted.admission().assertSingleProcess());
+                if (!check.done.await(10, TimeUnit.SECONDS)) {
+                    violations.add("the check must not wait for the busy owner session");
+                } else if (!Boolean.FALSE.equals(check.result) || check.error != null) {
+                    violations.add("an owner only waiting for the lock must deny the caller, got " + check.result + " / " + check.error);
+                }
+                expectEquals(violations, "revocations", List.of(FailureCode.ADVISORY_LOCK_LOST), revocation.codes);
+            } finally {
+                unlock(other);
+            }
+        } finally {
+            if (waiting != null) {
+                Assertions.assertTrue(waiting.awaitDone(), "FIXTURE: the owner's wait did not end");
+            }
+            admitted.leaseRelease().run();
+        }
+        expectEquals(violations, "lock holders after the case", List.of(), lockHolders());
+        Assertions.assertEquals(List.of(), violations, "DG-18");
+    }
+
+    /**
+     * DG-19: an owner check that fails or runs out of time denies the caller, revokes nothing and keeps the lease; its log names no detail
+     */
+    @Test
+    public void dg19AFailedOrHungOwnerCheckDeniesWithoutRevoking() throws Throwable {
+        requirePostgres();
+        List<String> violations = new ArrayList<>();
+        ControlledSource source = new ControlledSource();
+        RecordingRevocation revocation = new RecordingRevocation();
+        DeploymentGuard.Admitted admitted = admit(source, revocation);
+        int owner = source.pids.get(0);
+        try {
+            source.invalid.add(0);
+            boolean[] answers = new boolean[2];
+            long[] hungMillis = new long[1];
+            final Captured captured = LifecycleTestSupport.captureLogs(() -> {
+                source.fault = CheckFault.THROWS;
+                answers[0] = admitted.admission().assertSingleProcess();
+                source.fault = CheckFault.HANGS;
+                long start = System.nanoTime();
+                answers[1] = admitted.admission().assertSingleProcess();
+                hungMillis[0] = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+                source.fault = CheckFault.NONE;
+            });
+            if (answers[0]) {
+                violations.add("an owner check that throws must deny the caller");
+            }
+            if (answers[1]) {
+                violations.add("an owner check that runs out of time must deny the caller");
+            }
+            if (hungMillis[0] > 9_000) {
+                violations.add("an owner check that hangs must be cut off by its timeout, took " + hungMillis[0] + "ms");
+            }
+            if (source.timeouts.isEmpty() || source.timeouts.stream().anyMatch(seconds -> seconds < 1 || seconds > 5)) {
+                violations.add("every owner check needs a query timeout of 1-5 seconds, got " + source.timeouts);
+            }
+            expectEquals(violations, "revocations", List.of(), revocation.codes);
+            expectEquals(violations, "lock holders", List.of(owner), lockHolders());
+            if (!admitted.admission().assertSingleProcess()) {
+                violations.add("once the check works again, the silent owner that holds the lock lets the caller proceed");
+            }
+            violations.addAll(LifecycleTestSupport.logContractViolations(captured, List.of(
+                LifecycleTestSupport.SECRET_MARKER, "pg.internal.example", "pg_locks", "owner check refused", "ran out of time",
+                "jdbc:postgresql:")));
+            if (captured.dbacMessages().stream().noneMatch(m -> m.contains("event=DBAC_ADVISORY_LOCK_FAILED"))) {
+                violations.add("a failed owner check must be logged as DBAC_ADVISORY_LOCK_FAILED, got " + captured.dbacMessages());
+            }
+        } finally {
+            admitted.leaseRelease().run();
+        }
+        Assertions.assertEquals(List.of(), violations, "DG-19");
+    }
+
+    /**
+     * DG-20: releasing the lease frees the remembered owner's lock and ends its session - the first owner, or the one that replaced it
+     */
+    @Test
+    public void dg20ReleasingTheLeaseFreesTheRememberedOwnersLock() throws Exception {
+        requirePostgres();
+        List<String> violations = new ArrayList<>();
+        for (boolean replaced : new boolean[]{false, true}) {
+            String what = replaced ? "after a replacement: " : "the first owner: ";
+            ControlledSource source = new ControlledSource();
+            DeploymentGuard.Admitted admitted = admit(source, new RecordingRevocation());
+            int owner;
+            try {
+                if (replaced) {
+                    terminate(source.pids.get(0));
+                }
+                source.invalid.add(0);
+                if (!admitted.admission().assertSingleProcess()) {
+                    violations.add(what + "the check must let the caller proceed");
+                }
+                owner = pidAt(source, replaced ? 1 : 0);
+                if (!lockHolders().equals(List.of(owner))) {
+                    violations.add(what + "the remembered owner must hold the lock, holders " + lockHolders());
+                }
+            } finally {
+                admitted.leaseRelease().run();
+            }
+            if (advisoryLocksOf(owner) != 0 || !lockHolders().isEmpty()) {
+                violations.add(what + "the released owner must hold no advisory lock, holders " + lockHolders());
+            }
+            if (!sessionEnded(owner)) {
+                violations.add(what + "the released owner's session must end");
+            }
+        }
+        Assertions.assertEquals(List.of(), violations, "DG-20");
+    }
+
+    /**
+     * DG-21: the owner is a backend's pid together with when that backend started - a reused pid is not the owner
+     * <p>
+     * PID reuse is made, not waited for. Owner A takes the lock and dies, backend B takes the lock, and the lease is
+     * made to remember B's pid with A's start - what a recycled pid looks like. The guard must deny, fail the service
+     * exactly once and keep denying, without taking a new lease. The case also checks what the identity is made of:
+     * the lease remembers the pid and the start that the lock statement itself reported, and the exact pair lets a
+     * silent owner through; reacquisition replaces both together; a lock statement that reports no start refuses
+     * admission and reacquisition and keeps no lock; an owner look-up whose answer is missing, doubled, ambiguous or
+     * about a backend of unknown start denies without revoking.
+     */
+    @Test
+    public void dg21AReusedPidIsNotTheOwner() throws Exception {
+        requirePostgres();
+        List<String> violations = new ArrayList<>();
+        ControlledSource source = new ControlledSource();
+        RecordingRevocation revocation = new RecordingRevocation();
+        DeploymentGuard.Admitted admitted = admit(source, revocation);
+        try {
+            int pidA = source.pids.get(0);
+            OffsetDateTime startA = backendStartOf(pidA);
+            expectEquals(violations, "the owner remembered at admission", java.util.Arrays.asList(pidA, startA), ownerOf(admitted));
+            source.invalid.add(0);
+            if (!admitted.admission().assertSingleProcess()) {
+                violations.add("the exact pid and start, silent but holding the lock, must let the caller proceed");
+            }
+            terminate(pidA);
+            try (Connection b = open()) {
+                try {
+                    Assertions.assertTrue(waitForLock(b), "FIXTURE: backend B could not take the lock");
+                    int pidB = pid(b);
+                    setOwner(admitted, pidB, startA);
+                    final int opened = source.handed.size();
+                    int allowed = 0;
+                    for (int i = 0; i < 3; i++) {
+                        allowed += admitted.admission().assertSingleProcess() ? 1 : 0;
+                    }
+                    expectEquals(violations, "callers let through once the pid was reused", 0, allowed);
+                    expectEquals(violations, "revocations after the pid was reused", List.of(FailureCode.ADVISORY_LOCK_LOST),
+                        revocation.codes);
+                    expectEquals(violations, "connections opened: one look, no new lease", opened + 1, source.handed.size());
+                    expectEquals(violations, "lock holders after the pid was reused", List.of(pidB), lockHolders());
+                } finally {
+                    unlock(b);
+                }
+            }
+        } finally {
+            admitted.leaseRelease().run();
+        }
+
+        ControlledSource second = new ControlledSource();
+        RecordingRevocation secondRevocation = new RecordingRevocation();
+        DeploymentGuard.Admitted reacquiring = admit(second, secondRevocation);
+        try {
+            terminate(second.pids.get(0));
+            second.lockWithoutStart = true;
+            if (reacquiring.admission().assertSingleProcess()) {
+                violations.add("a reacquisition whose lock statement reports no backend start must deny");
+            }
+            if (second.pids.size() > 1 && !sessionEnded(second.pids.get(1))) {
+                violations.add("the session of a reacquisition without a start must be ended");
+            }
+            expectEquals(violations, "lock holders after a reacquisition without a start", List.of(), lockHolders());
+            second.lockWithoutStart = false;
+            if (!reacquiring.admission().assertSingleProcess()) {
+                violations.add("a reacquisition that reports its start must let the caller proceed");
+            }
+            int pidNew = pidAt(second, second.pids.size() - 1);
+            expectEquals(violations, "the owner after reacquisition", java.util.Arrays.asList(pidNew, backendStartOf(pidNew)),
+                ownerOf(reacquiring));
+            expectEquals(violations, "lock holders after reacquisition", List.of(pidNew), lockHolders());
+            expectEquals(violations, "revocations around the reacquisition", List.of(), secondRevocation.codes);
+        } finally {
+            reacquiring.leaseRelease().run();
+        }
+
+        ControlledSource startless = new ControlledSource();
+        startless.lockWithoutStart = true;
+        DeploymentGuard.Result refused = new DeploymentGuard(environment(DeploymentGuard.MODE_SINGLE_PROCESS, false))
+            .admit(postgresTarget(startless, 100), new RecordingRevocation());
+        if (!(refused instanceof DeploymentGuard.Refused refusal && refusal.code() == FailureCode.ADVISORY_LOCK_UNAVAILABLE)) {
+            violations.add("an admission whose lock statement reports no backend start must be refused, got " + refused);
+            if (refused instanceof DeploymentGuard.Admitted wronglyAdmitted) {
+                wronglyAdmitted.leaseRelease().run();
+            }
+        }
+        if (!startless.handed.isEmpty() && (!startless.handed.get(0).isClosed() || !sessionEnded(startless.pids.get(0)))) {
+            violations.add("the refused admission's connection must be closed and its session ended");
+        }
+        expectEquals(violations, "lock holders after a refused admission", List.of(), lockHolders());
+
+        ControlledSource looked = new ControlledSource();
+        RecordingRevocation lookedRevocation = new RecordingRevocation();
+        DeploymentGuard.Admitted looking = admit(looked, lookedRevocation);
+        try {
+            looked.invalid.add(0);
+            for (CheckFault answer : List.of(CheckFault.NO_ROW, CheckFault.TWO_ROWS, CheckFault.COUNT_TWO, CheckFault.UNKNOWN_START)) {
+                looked.fault = answer;
+                if (looking.admission().assertSingleProcess()) {
+                    violations.add("an owner look-up answering " + answer + " must deny the caller");
+                }
+            }
+            looked.fault = CheckFault.NONE;
+            expectEquals(violations, "revocations after unusable owner answers", List.of(), lookedRevocation.codes);
+            if (!looking.admission().assertSingleProcess()) {
+                violations.add("once the look-up answers again, the silent owner that holds the lock lets the caller proceed");
+            }
+        } finally {
+            looking.leaseRelease().run();
+        }
+        expectEquals(violations, "lock holders after the case", List.of(), lockHolders());
+        Assertions.assertEquals(List.of(), violations, "DG-21");
+    }
+
+    /** When the backend with this pid started, as PostgreSQL reports it, or null when there is none */
+    @Nullable
+    private static OffsetDateTime backendStartOf(int pid) throws SQLException {
+        try (Connection connection = open();
+             PreparedStatement statement = connection.prepareStatement("SELECT backend_start FROM pg_stat_activity WHERE pid = ?")) {
+            statement.setInt(1, pid);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() ? result.getObject(1, OffsetDateTime.class) : null;
+            }
+        }
+    }
+
+    /**
+     * The owner the lease remembers, read by reflection: [pid, backend start], with a null start where the lease keeps none
+     */
+    @NotNull
+    private static List<Object> ownerOf(@NotNull DeploymentGuard.Admitted admitted) throws ReflectiveOperationException {
+        Object lease = leaseOf(admitted);
+        java.lang.reflect.Field field = lease.getClass().getDeclaredField("owner");
+        field.setAccessible(true);
+        if (field.getType() == int.class) {
+            return java.util.Arrays.asList(field.getInt(lease), null);
+        }
+        Object owner = field.get(lease);
+        List<Object> parts = new ArrayList<>();
+        for (java.lang.reflect.RecordComponent component : owner.getClass().getRecordComponents()) {
+            java.lang.reflect.Method accessor = component.getAccessor();
+            accessor.setAccessible(true);
+            parts.add(accessor.invoke(owner));
+        }
+        return parts;
+    }
+
+    /**
+     * Makes the lease remember {@code pid} with {@code start} - the state a recycled pid leaves behind; only a case can make it
+     */
+    private static void setOwner(
+        @NotNull DeploymentGuard.Admitted admitted,
+        int pid,
+        @NotNull OffsetDateTime start
+    ) throws ReflectiveOperationException {
+        Object lease = leaseOf(admitted);
+        java.lang.reflect.Field field = lease.getClass().getDeclaredField("owner");
+        field.setAccessible(true);
+        if (field.getType() == int.class) {
+            field.setInt(lease, pid);
+            return;
+        }
+        java.lang.reflect.Constructor<?> constructor = field.getType().getDeclaredConstructor(int.class, OffsetDateTime.class);
+        constructor.setAccessible(true);
+        field.set(lease, constructor.newInstance(pid, start));
+    }
+
+    @NotNull
+    private static Object leaseOf(@NotNull DeploymentGuard.Admitted admitted) throws ReflectiveOperationException {
+        Object admission = admitted.admission();
+        java.lang.reflect.Field field = admission.getClass().getDeclaredField("lease");
+        field.setAccessible(true);
+        return field.get(admission);
+    }
+
+    @NotNull
+    private static DeploymentGuard.Admitted admit(@NotNull ControlledSource source, @NotNull RecordingRevocation revocation) {
+        DeploymentGuard.Result result = new DeploymentGuard(environment(DeploymentGuard.MODE_SINGLE_PROCESS, false))
+            .admit(postgresTarget(source, 100), revocation);
+        DeploymentGuard.Admitted admitted = Assertions.assertInstanceOf(DeploymentGuard.Admitted.class, result,
+            "FIXTURE: a free advisory lock must be admitted");
+        Assertions.assertEquals(1, source.handed.size(), "FIXTURE: admission must open one lock connection");
+        return admitted;
+    }
+
+    /** The pid of the {@code index}th connection the source opened, or -1 when it opened fewer */
+    private static int pidAt(@NotNull ControlledSource source, int index) {
+        return index < source.pids.size() ? source.pids.get(index) : -1;
+    }
+
+    @NotNull
+    private static List<Boolean> concurrentChecks(@NotNull DeploymentGuard.Admitted admitted, int threads) throws InterruptedException {
+        CyclicBarrier barrier = new CyclicBarrier(threads);
+        List<Boolean> answers = Collections.synchronizedList(new ArrayList<>());
+        List<Thread> started = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            Thread thread = new Thread(() -> {
+                try {
+                    barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    answers.add(admitted.admission().assertSingleProcess());
+                } catch (Exception e) {
+                    answers.add(null);
+                }
+            }, "dbac-dg-check-" + i);
+            started.add(thread);
+            thread.start();
+        }
+        for (Thread thread : started) {
+            thread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+        }
+        return new ArrayList<>(answers);
+    }
+
+    private static void expectEquals(
+        @NotNull List<String> violations,
+        @NotNull String what,
+        @Nullable Object expected,
+        @Nullable Object actual
+    ) {
+        if (!java.util.Objects.equals(expected, actual)) {
+            violations.add(what + ": expected " + expected + ", got " + actual);
+        }
+    }
+
     // ---------------------------------------------------------------- G1, G2, G3
 
     /**
@@ -850,6 +1406,235 @@ public class DeploymentGuardTest {
             opened.add(connection);
             return connection;
         }
+    }
+
+    /** How an owner check on a connection the guard opens later goes */
+    private enum CheckFault {
+        NONE,
+        /** It fails at once, with a message full of things a log must not repeat */
+        THROWS,
+        /** It runs until its query timeout, or for twenty seconds when it has none, and then fails */
+        HANGS,
+        /** It answers with no row */
+        NO_ROW,
+        /** It answers with two rows of nothing held */
+        TWO_ROWS,
+        /** It answers that the backend holds the lock twice */
+        COUNT_TWO,
+        /** It answers that the backend holds the lock, and that nothing tells when that backend started */
+        UNKNOWN_START;
+
+        /** The rows of a made-up answer, or null when the real look-up runs */
+        @Nullable
+        long[][] rows() {
+            return switch (this) {
+                case NO_ROW -> new long[0][];
+                case TWO_ROWS -> new long[][]{{0, 0, 0}, {0, 0, 0}};
+                case COUNT_TWO -> new long[][]{{2, 2, 0}};
+                case UNKNOWN_START -> new long[][]{{1, 0, 1}};
+                default -> null;
+            };
+        }
+    }
+
+    /**
+     * Opens raw PostgreSQL connections for the guard, as {@link RecordingSource} does, wrapped so a case can make one
+     * of them report itself invalid while its session lives on, and can make the guard's owner checks fail or hang
+     */
+    private static final class ControlledSource implements DeploymentGuard.LockConnectionSource {
+        final List<Connection> raw = Collections.synchronizedList(new ArrayList<>());
+        final List<Connection> handed = Collections.synchronizedList(new ArrayList<>());
+        final List<Integer> pids = Collections.synchronizedList(new ArrayList<>());
+        /** The connections, by the order they were opened in, whose {@code isValid} answers false */
+        final Set<Integer> invalid = ConcurrentHashMap.newKeySet();
+        /** The query timeout, in seconds, each owner check was given */
+        final List<Integer> timeouts = Collections.synchronizedList(new ArrayList<>());
+        final AtomicInteger checks = new AtomicInteger();
+        volatile CheckFault fault = CheckFault.NONE;
+        /** Whether the lock statement's third column - when its backend started - reads as missing */
+        volatile boolean lockWithoutStart;
+
+        @NotNull
+        @Override
+        public synchronized Connection open() throws SQLException {
+            Connection connection = DeploymentGuardTest.open();
+            int index = raw.size();
+            raw.add(connection);
+            pids.add(pid(connection));
+            Connection proxy = MetadataTestSupport.proxy(Connection.class, (self, method, args) -> switch (method.getName()) {
+                case "isValid" -> !invalid.contains(index) && connection.isValid((Integer) args[0]);
+                case "prepareStatement" -> prepare(connection, (String) args[0]);
+                case "hashCode" -> System.identityHashCode(self);
+                case "equals" -> self == args[0];
+                default -> invokeOn(connection, method, args);
+            });
+            handed.add(proxy);
+            return proxy;
+        }
+
+        @NotNull
+        private PreparedStatement prepare(@NotNull Connection connection, @NotNull String sql) throws SQLException {
+            if (sql.contains("pg_try_advisory_lock") && lockWithoutStart) {
+                PreparedStatement lock = connection.prepareStatement(sql);
+                return MetadataTestSupport.proxy(PreparedStatement.class, (self, method, args) -> switch (method.getName()) {
+                    case "executeQuery" -> withoutThirdColumn(lock.executeQuery());
+                    case "hashCode" -> System.identityHashCode(self);
+                    case "equals" -> self == args[0];
+                    default -> invokeOn(lock, method, args);
+                });
+            }
+            if (!sql.contains("pg_locks")) {
+                return connection.prepareStatement(sql);
+            }
+            checks.incrementAndGet();
+            CheckFault now = fault;
+            if (now == CheckFault.THROWS) {
+                throw new SQLException("FATAL: owner check refused at pg.internal.example for " + LifecycleTestSupport.SECRET_MARKER
+                    + " in SELECT ... FROM pg_locks", "08006");
+            }
+            long[][] madeUp = now.rows();
+            PreparedStatement real = now == CheckFault.HANGS || madeUp != null ? null : connection.prepareStatement(sql);
+            int[] timeout = {0};
+            return MetadataTestSupport.proxy(PreparedStatement.class, (self, method, args) -> {
+                switch (method.getName()) {
+                    case "setQueryTimeout" -> {
+                        timeout[0] = (Integer) args[0];
+                        timeouts.add(timeout[0]);
+                    }
+                    case "executeQuery" -> {
+                        if (madeUp != null) {
+                            return answer(madeUp);
+                        }
+                        if (real == null) {
+                            Thread.sleep(TimeUnit.SECONDS.toMillis(timeout[0] > 0 ? timeout[0] : 20));
+                            throw new SQLTimeoutException("FIXTURE: the owner check ran out of time at pg.internal.example");
+                        }
+                    }
+                    case "hashCode" -> {
+                        return System.identityHashCode(self);
+                    }
+                    case "equals" -> {
+                        return self == args[0];
+                    }
+                    default -> {
+                    }
+                }
+                if (real == null) {
+                    return method.getReturnType() == boolean.class ? Boolean.FALSE : null;
+                }
+                return invokeOn(real, method, args);
+            });
+        }
+    }
+
+    /** The real lock result, except that its third column reads as SQL NULL */
+    @NotNull
+    private static ResultSet withoutThirdColumn(@NotNull ResultSet result) {
+        boolean[] lastWasThird = {false};
+        return MetadataTestSupport.proxy(ResultSet.class, (self, method, args) -> {
+            String name = method.getName();
+            if (name.startsWith("get") && args != null && args.length > 0 && Integer.valueOf(3).equals(args[0])) {
+                lastWasThird[0] = true;
+                return zeroOf(method.getReturnType());
+            }
+            if (name.equals("wasNull") && lastWasThird[0]) {
+                return true;
+            }
+            if (name.startsWith("get")) {
+                lastWasThird[0] = false;
+            }
+            return switch (name) {
+                case "hashCode" -> System.identityHashCode(self);
+                case "equals" -> self == args[0];
+                default -> invokeOn(result, method, args);
+            };
+        });
+    }
+
+    /** What a getter of this type returns for SQL NULL */
+    @Nullable
+    private static Object zeroOf(@NotNull Class<?> type) {
+        if (type == boolean.class) {
+            return Boolean.FALSE;
+        }
+        if (type == int.class) {
+            return 0;
+        }
+        if (type == long.class) {
+            return 0L;
+        }
+        if (type == double.class) {
+            return 0.0d;
+        }
+        return null;
+    }
+
+    /** A made-up owner look-up answer: these rows of numbers, read by column */
+    @NotNull
+    private static ResultSet answer(@NotNull long[][] rows) {
+        int[] at = {-1};
+        return MetadataTestSupport.proxy(ResultSet.class, (self, method, args) -> switch (method.getName()) {
+            case "next" -> ++at[0] < rows.length;
+            case "getLong" -> rows[at[0]][(Integer) args[0] - 1];
+            case "getInt" -> (int) rows[at[0]][(Integer) args[0] - 1];
+            case "wasNull", "isClosed" -> false;
+            case "close" -> null;
+            case "hashCode" -> System.identityHashCode(self);
+            case "equals" -> self == args[0];
+            default -> throw new SQLException("FIXTURE: a made-up answer has no " + method.getName());
+        });
+    }
+
+    @Nullable
+    private static Object invokeOn(
+        @NotNull Object target,
+        @NotNull java.lang.reflect.Method method,
+        @Nullable Object[] args
+    ) throws Throwable {
+        try {
+            return method.invoke(target, args);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            throw e.getTargetException();
+        }
+    }
+
+    private static void execute(@NotNull Connection connection, @NotNull String sql) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.executeQuery(sql).close();
+        }
+    }
+
+    /** How many advisory locks the backend holds in this database, of any key and mode */
+    private static int advisoryLocksOf(int pid) throws SQLException {
+        try (Connection connection = open();
+             PreparedStatement statement = connection.prepareStatement(
+                 "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid = ?")) {
+            statement.setInt(1, pid);
+            try (ResultSet result = statement.executeQuery()) {
+                result.next();
+                return result.getInt(1);
+            }
+        }
+    }
+
+    /** Whether the backend shows up waiting - not granted - for an advisory lock, waiting for it to do so */
+    private static boolean awaitWaitingFor(int pid) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        try (Connection connection = open();
+             PreparedStatement statement = connection.prepareStatement(
+                 "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND pid = ?")) {
+            statement.setInt(1, pid);
+            while (System.nanoTime() < deadline) {
+                try (ResultSet result = statement.executeQuery()) {
+                    result.next();
+                    if (result.getInt(1) == 1) {
+                        return true;
+                    }
+                }
+                Thread.sleep(20);
+            }
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------- PostgreSQL

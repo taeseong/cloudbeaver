@@ -30,6 +30,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.OffsetDateTime;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
@@ -58,7 +59,8 @@ import java.util.function.Supplier;
  *     with 2.1.214, {@code h2_embedded_v3} with 2.4.240;</li>
  *     <li>G5 H2: the URL is an embedded local file that H2 locks against a second process (or an
  *     in-memory database in test mode). PostgreSQL: a session-level advisory lock is taken on a
- *     connection that is kept for as long as the service runs.</li>
+ *     connection that is kept for as long as the service runs, and the backend that took it - its pid
+ *     and when it started - is remembered.</li>
  * </ul>
  * A network filesystem cannot be told from a local path and is not supported; the guard does not
  * try to detect it. Neither is a PostgreSQL metadata database reached through a transaction- or
@@ -131,10 +133,15 @@ public final class DeploymentGuard {
         /**
          * Confirms the deployment is still the one that was admitted
          * <p>
-         * The deployment property must still hold its startup value, and on PostgreSQL the lock
-         * session must still be alive; if it is not, the lock is taken again on a new connection,
-         * exactly once per loss. A lock another process took in the meantime, or a changed property,
-         * fails the policy service through its {@link Revocation}.
+         * The deployment property must still hold its startup value, and on PostgreSQL the lock must
+         * still be held. A lock connection that answers is enough. One that does not is not taken for
+         * lost: a new connection looks up whether the remembered backend - its pid and when it started,
+         * since a pid alone can be reused - still holds the exact DBAC lock - granted, exclusive, this
+         * key, this database - and if it does the caller proceeds. If it
+         * does not, the lock is taken again on that new connection, which is remembered from then on,
+         * exactly once per loss. A lock another session holds by then, or a changed property, fails the
+         * policy service through its {@link Revocation}. A look-up that fails or runs out of time denies
+         * the caller and leaves the lease as it was.
          *
          * @return whether the caller may proceed
          */
@@ -240,6 +247,8 @@ public final class DeploymentGuard {
     private static final String EVENT_LOCK_RELEASE_FAILED = "DBAC_ADVISORY_LOCK_RELEASE_FAILED";
     /** Logged when the deployment could not be checked again */
     private static final String EVENT_CHECK_FAILED = "DBAC_DEPLOYMENT_CHECK_FAILED";
+    /** Logged, as a warning, when the lock connection did not answer but the remembered backend still holds the lock */
+    private static final String EVENT_LOCK_OWNER_ALIVE = "DBAC_ADVISORY_LOCK_OWNER_ALIVE";
 
     private static final String H2_PREFIX = "jdbc:h2:";
     private static final String POSTGRES_PREFIX = "jdbc:postgresql:";
@@ -254,6 +263,28 @@ public final class DeploymentGuard {
     private static final String FILE_LOCK = "FILE_LOCK";
     private static final String FILE_LOCK_FILE = "FILE";
     private static final int LOCK_CHECK_TIMEOUT_SECONDS = 1;
+    /** The query timeout of every statement that takes the lock or looks up who holds it */
+    private static final int LOCK_STATEMENT_TIMEOUT_SECONDS = 2;
+    /**
+     * Takes the lock and names the backend that took it - its pid and when it started - in one statement on the
+     * connection that keeps it. The lock is tried exactly once, in a one-row subquery.
+     */
+    private static final String TRY_LOCK = "SELECT attempt.taken, pg_backend_pid(),"
+        + " (SELECT backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid())"
+        + " FROM (SELECT pg_try_advisory_lock(?) AS taken) attempt";
+    /**
+     * Looks up the DBAC lock rows of one pid: granted, exclusive, the single-bigint form of the exact key
+     * ({@code objsubid} 1, the key's high and low halves), in this database - another advisory lock of the
+     * backend, this key in share mode or as a pair of int keys, or a wait for it are not such rows. Of those
+     * rows it counts all, the ones whose backend started exactly when the remembered one did, and the ones whose
+     * backend's start cannot be read.
+     */
+    private static final String OWNER_HOLDS = "SELECT count(*), count(*) FILTER (WHERE a.backend_start = ?),"
+        + " count(*) FILTER (WHERE a.backend_start IS NULL)"
+        + " FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid"
+        + " WHERE l.locktype = 'advisory' AND l.granted AND l.mode = 'ExclusiveLock' AND l.objsubid = 1"
+        + " AND l.classid::bigint = ? AND l.objid::bigint = ?"
+        + " AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND l.pid = ?";
 
     /** The release of a deployment that holds nothing */
     private static final Runnable NOTHING_TO_RELEASE = () -> {
@@ -327,19 +358,19 @@ public final class DeploymentGuard {
             logFailure(EVENT_LOCK_FAILED, "DBAC could not open the advisory lock connection", e);
             return refuse(FailureCode.ADVISORY_LOCK_UNAVAILABLE);
         }
-        boolean locked;
+        Owner owner;
         try {
-            locked = tryLock(connection);
+            owner = tryLock(connection);
         } catch (SQLException | RuntimeException e) {
             logFailure(EVENT_LOCK_FAILED, "DBAC could not take the advisory lock", e);
             release(connection, false);
             return refuse(FailureCode.ADVISORY_LOCK_UNAVAILABLE);
         }
-        if (!locked) {
+        if (owner == null) {
             release(connection, false);
             return refuse(FailureCode.ADVISORY_LOCK_HELD);
         }
-        return admitted(mode, testMode, new LeaseOwner(target.connections(), connection), revocation);
+        return admitted(mode, testMode, new LeaseOwner(target.connections(), connection, owner), revocation);
     }
 
     @NotNull
@@ -484,11 +515,69 @@ public final class DeploymentGuard {
         return new Refused(code);
     }
 
-    private static boolean tryLock(@NotNull Connection connection) throws SQLException {
-        try (PreparedStatement statement = connection.prepareStatement("SELECT pg_try_advisory_lock(?)")) {
+    /**
+     * The backend that took the lock: its pid and when it started, together
+     * <p>
+     * A pid alone names a backend only while it lives - once it has ended, the operating system may give the same
+     * pid to another backend, of this process or of another one. The start tells the two apart.
+     */
+    private record Owner(int pid, @NotNull OffsetDateTime backendStart) {
+    }
+
+    /**
+     * Tries the lock on {@code connection}
+     *
+     * @return the backend that took it, or null when another session holds it
+     * @throws SQLException when the statement fails, runs out of time, or does not name the backend and its start -
+     *     the lock may then have been taken, and only aborting the connection is sure to let it go
+     */
+    @Nullable
+    private static Owner tryLock(@NotNull Connection connection) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(TRY_LOCK)) {
+            statement.setQueryTimeout(LOCK_STATEMENT_TIMEOUT_SECONDS);
             statement.setLong(1, ADVISORY_LOCK_KEY);
             try (ResultSet result = statement.executeQuery()) {
-                return result.next() && result.getBoolean(1);
+                if (!result.next()) {
+                    throw new SQLException("The advisory lock attempt returned no row");
+                }
+                boolean taken = result.getBoolean(1);
+                int backend = result.getInt(2);
+                OffsetDateTime started = result.getObject(3, OffsetDateTime.class);
+                if (backend <= 0 || started == null || result.next()) {
+                    throw new SQLException("The advisory lock attempt did not name its backend");
+                }
+                return taken ? new Owner(backend, started) : null;
+            }
+        }
+    }
+
+    /**
+     * Whether {@code owner} - that pid, started at that moment - holds the DBAC lock, looked up on {@code connection}
+     * <p>
+     * The same pid holding the lock with another start is a reused pid, and does not count.
+     *
+     * @throws SQLException when the look-up fails or runs out of time, or its answer is not one row of counts that
+     *     can only mean one thing: the pid holds the lock at most once, and a backend whose start cannot be read is
+     *     neither the owner nor a stranger
+     */
+    private static boolean holds(@NotNull Connection connection, @NotNull Owner owner) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(OWNER_HOLDS)) {
+            statement.setQueryTimeout(LOCK_STATEMENT_TIMEOUT_SECONDS);
+            statement.setObject(1, owner.backendStart());
+            statement.setLong(2, ADVISORY_LOCK_KEY >>> 32);
+            statement.setLong(3, ADVISORY_LOCK_KEY & 0xFFFFFFFFL);
+            statement.setInt(4, owner.pid());
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next()) {
+                    throw new SQLException("The advisory lock owner look-up returned no row");
+                }
+                long held = result.getLong(1);
+                long owned = result.getLong(2);
+                long unknown = result.getLong(3);
+                if (result.next() || held < 0 || held > 1 || owned < 0 || owned > held || unknown != 0) {
+                    throw new SQLException("The advisory lock owner look-up was ambiguous");
+                }
+                return owned == 1;
             }
         }
     }
@@ -526,6 +615,14 @@ public final class DeploymentGuard {
             log.error(summary + " [event=" + eventCode
                 + " EVENT_ID=" + UUID.randomUUID()
                 + " exception=" + failure.getClass().getName() + "]");
+        } catch (RuntimeException | Error ignored) {
+            // Deliberately nothing: the decision must not depend on whether it could be logged.
+        }
+    }
+
+    private static void logWarning(@NotNull String eventCode, @NotNull String summary) {
+        try {
+            log.warn(summary + " [event=" + eventCode + " EVENT_ID=" + UUID.randomUUID() + "]");
         } catch (RuntimeException | Error ignored) {
             // Deliberately nothing: the decision must not depend on whether it could be logged.
         }
@@ -582,7 +679,8 @@ public final class DeploymentGuard {
     }
 
     /**
-     * Owns the advisory lock connection; G, the lock that serializes replacing and releasing it
+     * Owns the advisory lock connection and remembers the backend that took the lock on it; G, the lock that
+     * serializes replacing and releasing it
      * <p>
      * G is never held while another lock is requested. The connection is replaced at most once per
      * loss - a check that waited for G finds it already replaced - and never after {@link #close()},
@@ -593,17 +691,22 @@ public final class DeploymentGuard {
         private final LockConnectionSource source;
         @Nullable
         private volatile Connection current;
+        /** The backend that took the lock on {@link #current}, pid and start in one object; replaced whole with it, under G */
+        @NotNull
+        private Owner owner;
         private boolean closed;
 
-        private LeaseOwner(@NotNull LockConnectionSource source, @NotNull Connection connection) {
+        private LeaseOwner(@NotNull LockConnectionSource source, @NotNull Connection connection, @NotNull Owner owner) {
             this.source = source;
             this.current = connection;
+            this.owner = owner;
         }
 
         /**
-         * Whether the lock is held, taking it again on a new connection - new lock first, old connection after
+         * Whether the lock is held: by the connection that answers, or by the remembered backend; otherwise taken
+         * again on a new connection - new lock first, old connection after
          *
-         * @param lost told once, when another session holds the lock
+         * @param lost told once, when the remembered backend no longer holds the lock and another session does
          */
         private boolean ensureHeld(@NotNull Consumer<FailureCode> lost) {
             Connection seen = current;
@@ -625,24 +728,41 @@ public final class DeploymentGuard {
                     logFailure(EVENT_LOCK_FAILED, "DBAC could not reopen the advisory lock connection", e);
                     return false;
                 }
-                boolean locked;
+                boolean ownerHolds;
                 try {
-                    locked = tryLock(fresh);
+                    ownerHolds = holds(fresh, owner);
+                } catch (SQLException | RuntimeException e) {
+                    logFailure(EVENT_LOCK_FAILED, "DBAC could not look up who holds the advisory lock", e);
+                    release(fresh, false);
+                    return false;
+                }
+                if (ownerHolds) {
+                    // The connection did not answer, but the session that took the lock still has it: nothing was lost.
+                    release(fresh, false);
+                    logWarning(EVENT_LOCK_OWNER_ALIVE,
+                        "DBAC kept the advisory lock: its connection did not answer, but its session still holds the lock");
+                    return true;
+                }
+                Owner taken;
+                try {
+                    taken = tryLock(fresh);
                 } catch (SQLException | RuntimeException e) {
                     logFailure(EVENT_LOCK_FAILED, "DBAC could not take the advisory lock again", e);
                     release(fresh, false);
                     return false;
                 }
-                if (locked) {
+                // The remembered backend holds nothing to unlock, and its session may be busy: it is only aborted.
+                if (taken != null) {
                     current = fresh;
+                    owner = taken;
                     if (seen != null) {
-                        release(seen, true);
+                        release(seen, false);
                     }
                     return true;
                 }
                 release(fresh, false);
                 if (seen != null) {
-                    release(seen, true);
+                    release(seen, false);
                 }
                 current = null;
                 closed = true;

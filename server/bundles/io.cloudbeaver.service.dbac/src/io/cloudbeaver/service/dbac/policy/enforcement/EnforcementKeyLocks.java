@@ -37,10 +37,10 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *     <li><b>U</b> - one per user id, compared as the exact string. Deactivation, deletion and team
  *     deletion take its write lock.</li>
  * </ul>
- * An enforcement point will take the read locks - K, then U - before it authorizes and keep them until
+ * An enforcement point takes the read locks - K, then U - before it authorizes and keeps them until
  * the platform operation has returned, so a revoke or a deactivation cannot commit while a write it
- * would forbid is in flight, and nothing authorized after it can see the old state. That reader is not
- * wired yet; {@link #tryLockGrantForRead} and {@link #tryLockUserForRead} have no production caller.
+ * would forbid is in flight, and nothing authorized after it can see the old state. The enforcement gate
+ * does that; no production entry point calls the gate yet. A grant also reads U while it holds K.
  * <p>
  * <b>One registry.</b> {@link #global()} is the only instance and nothing else can make one, so a writer
  * and a reader cannot end up on different registries. It has no lifecycle: a lock holds no resource, so
@@ -51,11 +51,15 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * exact strings, and a lock that treated two of them as one would only serialize more, but a lock that
  * treated one of them as two would let a writer and a reader of the same row miss each other.
  * <p>
- * <b>Kept, not removed.</b> A lock, once made, stays for the life of the registry (C17 D2). Removing an
- * idle one is not safe without a reference count: a thread that has looked a lock up but not yet locked
- * it would be left holding a lock that is no longer the key's. P4 has only administrative writers, so the
- * number of keys is bounded by grants and user changes; the policy must be revisited before readers
- * make entries for every key that a write is attempted on (S4).
+ * <b>Kept only while used (S4).</b> Each key maps to an entry: its lock and the number of holds and waits
+ * that took it. A reference is taken in the same map operation that finds or makes the entry, before
+ * anything waits on its lock, and given back exactly once on every way out - when a hold is closed, after
+ * its lock is unlocked, or at once when a timed read times out, is interrupted or fails. The last reference
+ * given back removes the entry, and only if the key still maps to that very entry. Both steps run inside
+ * the map's own lock for the key, so an entry that anything holds or waits for is never removed, and a
+ * request that comes after a removal makes a new entry that nothing else can still be using: a writer and
+ * a reader of one key always meet on one lock. The registry therefore holds as many entries as there are
+ * keys in use, however many keys were ever used.
  * <p>
  * <b>Writers wait without a limit.</b> A writer that gave up would leave the grant or the user in place -
  * failing open - so {@link #lockGrantForWrite} and {@link #lockUserForWrite} use {@link Lock#lock()}. An
@@ -74,8 +78,8 @@ public final class EnforcementKeyLocks {
 
     private static final EnforcementKeyLocks GLOBAL = new EnforcementKeyLocks();
 
-    private final ConcurrentHashMap<DbAccessKey, ReentrantReadWriteLock> grantLocks = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, ReentrantReadWriteLock> userLocks = new ConcurrentHashMap<>();
+    private final Family<DbAccessKey> grants = new Family<>();
+    private final Family<String> users = new Family<>();
 
     private EnforcementKeyLocks() {
     }
@@ -95,7 +99,7 @@ public final class EnforcementKeyLocks {
      */
     @NotNull
     public Held lockGrantForWrite(@NotNull DbAccessKey key) {
-        return lockForWrite(grantLock(key).writeLock());
+        return grants.lockForWrite(requireKey(key));
     }
 
     /**
@@ -105,7 +109,7 @@ public final class EnforcementKeyLocks {
      */
     @NotNull
     public Held lockUserForWrite(@NotNull String userId) {
-        return lockForWrite(userLock(userId).writeLock());
+        return users.lockForWrite(requireUser(userId));
     }
 
     /**
@@ -118,7 +122,7 @@ public final class EnforcementKeyLocks {
     @Nullable
     public Held tryLockGrantForRead(@NotNull DbAccessKey key, @NotNull Duration timeout) throws InterruptedException {
         long nanos = timeoutNanos(timeout);
-        return tryLockForRead(grantLock(key).readLock(), nanos);
+        return grants.tryLockForRead(requireKey(key), nanos);
     }
 
     /**
@@ -131,23 +135,23 @@ public final class EnforcementKeyLocks {
     @Nullable
     public Held tryLockUserForRead(@NotNull String userId, @NotNull Duration timeout) throws InterruptedException {
         long nanos = timeoutNanos(timeout);
-        return tryLockForRead(userLock(userId).readLock(), nanos);
+        return users.tryLockForRead(requireUser(userId), nanos);
     }
 
     @NotNull
-    private ReentrantReadWriteLock grantLock(@Nullable DbAccessKey key) {
+    private static DbAccessKey requireKey(@Nullable DbAccessKey key) {
         if (key == null) {
             throw new IllegalArgumentException("A grant key lock needs a key");
         }
-        return grantLocks.computeIfAbsent(key, ignored -> new ReentrantReadWriteLock(true));
+        return key;
     }
 
     @NotNull
-    private ReentrantReadWriteLock userLock(@Nullable String userId) {
+    private static String requireUser(@Nullable String userId) {
         if (userId == null) {
             throw new IllegalArgumentException("A user lock needs a user id");
         }
-        return userLocks.computeIfAbsent(userId, ignored -> new ReentrantReadWriteLock(true));
+        return userId;
     }
 
     private static long timeoutNanos(@Nullable Duration timeout) {
@@ -158,22 +162,6 @@ public final class EnforcementKeyLocks {
         return timeout.toNanos();
     }
 
-    @NotNull
-    private static Held lockForWrite(@NotNull Lock writeLock) {
-        writeLock.lock();
-        // Set before the call or while waiting: cleared now that the lock is held, given back on release.
-        boolean interrupted = Thread.interrupted();
-        return new WriteHold(writeLock, interrupted);
-    }
-
-    @Nullable
-    private static Held tryLockForRead(@NotNull Lock readLock, long nanos) throws InterruptedException {
-        if (!readLock.tryLock(nanos, TimeUnit.NANOSECONDS)) {
-            return null;
-        }
-        return new ReadHold(readLock);
-    }
-
     /**
      * A lock held until closed, on the thread that took it; closing it again does nothing
      */
@@ -182,12 +170,90 @@ public final class EnforcementKeyLocks {
         void close();
     }
 
-    private static final class WriteHold implements Held {
+    /**
+     * One key's lock and how many holds and waits took it
+     * <p>
+     * {@link #references} is read and changed only inside its family's map operation for the key, which runs
+     * under the map's lock for that key.
+     */
+    private static final class Entry {
+        private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock(true);
+        private int references;
+    }
+
+    /**
+     * The entries of one family of keys
+     */
+    private static final class Family<K> {
+        private final ConcurrentHashMap<K, Entry> entries = new ConcurrentHashMap<>();
+
+        /** The key's entry, made when there is none, with a reference taken in the same step */
+        @NotNull
+        private Entry reference(@NotNull K key) {
+            return entries.compute(key, (ignored, current) -> {
+                Entry entry = current == null ? new Entry() : current;
+                entry.references++;
+                return entry;
+            });
+        }
+
+        /** Gives one reference back; the last one removes the entry, if the key still maps to it */
+        private void dereference(@NotNull K key, @NotNull Entry entry) {
+            entries.compute(key, (ignored, current) -> {
+                entry.references--;
+                return current == entry && entry.references == 0 ? null : current;
+            });
+        }
+
+        @NotNull
+        private Held lockForWrite(@NotNull K key) {
+            Entry entry = reference(key);
+            Lock writeLock = entry.lock.writeLock();
+            boolean locked = false;
+            try {
+                writeLock.lock();
+                locked = true;
+            } finally {
+                if (!locked) {
+                    dereference(key, entry);
+                }
+            }
+            // Set before the call or while waiting: cleared now that the lock is held, given back on release.
+            boolean interrupted = Thread.interrupted();
+            return new Hold<>(this, key, entry, writeLock, interrupted);
+        }
+
+        @Nullable
+        private Held tryLockForRead(@NotNull K key, long nanos) throws InterruptedException {
+            Entry entry = reference(key);
+            Lock readLock = entry.lock.readLock();
+            boolean locked = false;
+            try {
+                locked = readLock.tryLock(nanos, TimeUnit.NANOSECONDS);
+            } finally {
+                if (!locked) {
+                    dereference(key, entry);
+                }
+            }
+            return locked ? new Hold<>(this, key, entry, readLock, false) : null;
+        }
+    }
+
+    /**
+     * One hold of a lock: unlocks it, then gives its reference back, once
+     */
+    private static final class Hold<K> implements Held {
+        private final Family<K> family;
+        private final K key;
+        private final Entry entry;
         private final Lock lock;
         private final boolean interrupted;
         private boolean closed;
 
-        private WriteHold(@NotNull Lock lock, boolean interrupted) {
+        private Hold(@NotNull Family<K> family, @NotNull K key, @NotNull Entry entry, @NotNull Lock lock, boolean interrupted) {
+            this.family = family;
+            this.key = key;
+            this.entry = entry;
             this.lock = lock;
             this.interrupted = interrupted;
         }
@@ -200,29 +266,13 @@ public final class EnforcementKeyLocks {
             closed = true;
             try {
                 lock.unlock();
+                // Not in a finally: a lock that could not be unlocked is still held, and its entry stays with it.
+                family.dereference(key, entry);
             } finally {
                 if (interrupted) {
                     Thread.currentThread().interrupt();
                 }
             }
-        }
-    }
-
-    private static final class ReadHold implements Held {
-        private final Lock lock;
-        private boolean closed;
-
-        private ReadHold(@NotNull Lock lock) {
-            this.lock = lock;
-        }
-
-        @Override
-        public void close() {
-            if (closed) {
-                return;
-            }
-            closed = true;
-            lock.unlock();
         }
     }
 }

@@ -44,7 +44,9 @@ import io.cloudbeaver.test.platform.dbac.EnforcementLifecycleTest;
 import io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest;
 import io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest;
 import io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest;
+import io.cloudbeaver.test.platform.dbac.KeyLockRegistryTest;
 import io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest;
+import io.cloudbeaver.test.platform.dbac.MetadataCapacityTest;
 import io.cloudbeaver.test.platform.dbac.MetadataDeadlineTest;
 import io.cloudbeaver.test.platform.dbac.MetadataDisposalTest;
 import io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest;
@@ -112,7 +114,9 @@ import org.junit.platform.suite.api.Suite;
         UserRecreationTest.class,
         TaintRegistryLifecycleTest.class,
         AuditFailClosedTest.class,
-        EnforcementGateTest.class
+        EnforcementGateTest.class,
+        KeyLockRegistryTest.class,
+        MetadataCapacityTest.class
     }
 )
 public class CEServerTestSuite {

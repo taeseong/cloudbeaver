@@ -50,7 +50,9 @@ REQUIRED_VALUE = "true"
 #
 # The Slice 4a contract and regression-guard classes are here because they run scenarios against a real
 # PostgreSQL target; a skip there would silently drop platform guarantees that enforcement relies on.
-# DeploymentGuardTest holds and loses a real PostgreSQL advisory lock (DG-4, DG-5, DG-6, DG-13).
+# DeploymentGuardTest holds and loses a real PostgreSQL advisory lock (DG-4, DG-5, DG-6, DG-13), and checks which
+# backend holds it when the lock connection stops answering (DG-14 - DG-20), by pid and backend start together so a
+# reused pid is not taken for the owner (DG-21).
 # The P4 lock classes run their grant-key races on PostgreSQL as well as H2, check user writers against
 # a real PostgreSQL target's locks, and characterize PostgreSQL's identity comparison.
 # MetadataLeasePostgresTest runs the P5-1a lease template on a real pgjdbc connection: the query timeout
@@ -104,7 +106,7 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest": 6,
     "io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest": 2,
     "io.cloudbeaver.test.platform.dbac.EnforcementLifecycleTest": 18,
-    "io.cloudbeaver.test.platform.dbac.DeploymentGuardTest": 11,
+    "io.cloudbeaver.test.platform.dbac.DeploymentGuardTest": 19,
     "io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest": 18,
     "io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest": 14,
     "io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest": 3,
@@ -119,6 +121,8 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest": 14,
     "io.cloudbeaver.test.platform.dbac.AuditFailClosedTest": 12,
     "io.cloudbeaver.test.platform.dbac.EnforcementGateTest": 35,
+    "io.cloudbeaver.test.platform.dbac.KeyLockRegistryTest": 12,
+    "io.cloudbeaver.test.platform.dbac.MetadataCapacityTest": 5,
 }
 
 for _postgres_class in POSTGRES_CLASSES:
