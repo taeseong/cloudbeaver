@@ -546,7 +546,7 @@ public class EnforcementGateTest {
     }
 
     /**
-     * GT-9: in production only the gate decides and records, and only the transaction adapter enters it
+     * GT-9: in production only the gate decides and records, and only the adapter enters it
      * <p>
      * Read from the bytecode of every server bundle. {@code authorize}, {@code openExpiryWindow},
      * {@code resolveKey} and the window's steps are called by the gate alone (and by the service delegating to its
@@ -556,8 +556,9 @@ public class EnforcementGateTest {
      * after an explicit rollback by that adapter alone; no production class makes a registry of its own. The gate
      * is made by nothing outside it, and called from outside only by the adapter, and only through
      * {@code global()}, {@code enter()}, {@code run()} and the two results - never {@code of(...)}. The adapter does
-     * call all three, and the transaction entry points reach DBAC through the adapter alone. The adapter refers to
-     * no decision, window, budget, writer, holder, key lock or deployment type.
+     * call all three, and the entry points - the transaction calls of {@code WebSQLContextInfo} and the Explain of
+     * {@code WebSQLProcessor} - reach DBAC through the adapter alone, each calling the adapter's entry for it. The
+     * adapter refers to no decision, window, budget, writer, holder, key lock or deployment type.
      */
     @Test
     public void gt9OnlyTheGateDecidesRecordsAndMarks() throws Throwable {
@@ -568,6 +569,7 @@ public class EnforcementGateTest {
         String gate = "io/cloudbeaver/service/dbac/policy/enforcement/EnforcementGate";
         String adapter = "io/cloudbeaver/service/sql/DbacEnforcedExecution";
         String entryPoints = "io/cloudbeaver/service/sql/WebSQLContextInfo";
+        String explainEntry = "io/cloudbeaver/service/sql/WebSQLProcessor";
         record Guard(String name, Set<String> targets, Set<String> allowedCallers) {
         }
 
@@ -590,6 +592,7 @@ public class EnforcementGateTest {
         int scanned = 0;
         Set<String> adapterCalls = new TreeSet<>();
         Set<String> entryPointCalls = new TreeSet<>();
+        Set<String> explainEntryCalls = new TreeSet<>();
         for (ClassFile one : productionClasses()) {
             scanned++;
             boolean isAdapter = ownerIs(one.name, adapter);
@@ -615,6 +618,9 @@ public class EnforcementGateTest {
                 if (ownerIs(one.name, entryPoints)) {
                     entryPointCalls.add(target);
                 }
+                if (ownerIs(one.name, explainEntry)) {
+                    explainEntryCalls.add(target);
+                }
             }
             if (isAdapter) {
                 for (String referenced : one.classRefs) {
@@ -626,7 +632,7 @@ public class EnforcementGateTest {
                     }
                 }
             }
-            if (ownerIs(one.name, entryPoints)) {
+            if (ownerIs(one.name, entryPoints) || ownerIs(one.name, explainEntry)) {
                 for (String referenced : one.classRefs) {
                     if (referenced.startsWith("io/cloudbeaver/service/dbac/")) {
                         violations.add("the entry points: " + one.name + " refers to " + referenced + " other than through the adapter");
@@ -644,6 +650,9 @@ public class EnforcementGateTest {
             if (!entryPointCalls.contains(needed)) {
                 violations.add("the entry points must call " + needed);
             }
+        }
+        if (!explainEntryCalls.contains(adapter + "#explain")) {
+            violations.add("the Explain entry point must call " + adapter + "#explain");
         }
         Assertions.assertTrue(scanned > 100, "FIXTURE GT-9: the server bundles' classes must be found, found " + scanned);
         Assertions.assertEquals(List.of(), violations, "GT-9");

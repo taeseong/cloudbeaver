@@ -69,7 +69,7 @@ import java.util.function.Supplier;
  * <p>
  * <b>What the gate does not know.</b> No platform type: the context is a {@link ContextRef} and the
  * platform's side of the attempt an {@link Execution} the caller implements. The one production caller is
- * {@code io.cloudbeaver.service.sql.DbacEnforcedExecution}, for the transaction entry points; Explain and the
+ * {@code io.cloudbeaver.service.sql.DbacEnforcedExecution}, for the transaction entry points and Explain; the
  * other mutation paths are not wired yet.
  * <p>
  * <b>Failures of its collaborators deny.</b> An exception or {@code Error} - a

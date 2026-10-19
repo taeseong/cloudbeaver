@@ -68,6 +68,8 @@ REQUIRED_VALUE = "true"
 # The P6-A classes drive the wired transaction entry points - commit, auto-commit on and the explicit rollback - on
 # real PostgreSQL target connections: what a separate client sees committed, the server backend a severed context
 # leaves, and a rollback the network never answers.
+# The P6-B classes drive the wired Explain entry point on real PostgreSQL target connections: a statement EXPLAIN ANALYZE
+# would run, counted by the sequence it draws from, a lost connection recovered and judged again, and the audit row.
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
@@ -86,6 +88,8 @@ POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.EnforcementGateTest",
     "io.cloudbeaver.test.platform.dbac.TransactionEnforcementEntryPointTest",
     "io.cloudbeaver.test.platform.dbac.TransactionEnforcementAdapterTest",
+    "io.cloudbeaver.test.platform.dbac.ExplainEnforcementEntryPointTest",
+    "io.cloudbeaver.test.platform.dbac.ExplainEnforcementAdapterTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -130,6 +134,8 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.MetadataCapacityTest": 5,
     "io.cloudbeaver.test.platform.dbac.TransactionEnforcementEntryPointTest": 12,
     "io.cloudbeaver.test.platform.dbac.TransactionEnforcementAdapterTest": 19,
+    "io.cloudbeaver.test.platform.dbac.ExplainEnforcementEntryPointTest": 2,
+    "io.cloudbeaver.test.platform.dbac.ExplainEnforcementAdapterTest": 17,
 }
 
 for _postgres_class in POSTGRES_CLASSES:

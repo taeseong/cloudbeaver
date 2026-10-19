@@ -895,34 +895,50 @@ public class WebSQLProcessor implements WebSessionProvider {
         @NotNull String sql,
         @NotNull Map<String, Object> configuration) throws DBWebException {
 
-        DBCQueryPlanner planner;
-        DBCExecutionContext executionContext = getExecutionContext();
-        if (executionContext != null) {
-            DBPDataSource dataSource = executionContext.getDataSource();
-            planner = GeneralUtils.adapt(dataSource, DBCQueryPlanner.class);
-        } else {
+        DBPDataSource dataSource = connection.getDataSource();
+        if (dataSource == null) {
             throw new DBWebException("Not connected to data source");
-        }
-
-        if (planner == null) {
-            throw new DBWebException("Datasource '" + executionContext.getDataSource() + "' doesn't support execution plan");
         }
 
         DBCPlan[] dbcPlan = new DBCPlan[1];
 
         try {
-            DBExecUtils.tryExecuteRecover(monitor, connection.getDataSource(), param -> {
-                try (DBCSession session = executionContext.openSession(monitor, DBCExecutionPurpose.USER, "Execute SQL")) {
+            // DBAC: every attempt - a retry after a lost connection too - finds its context afresh and is judged afresh;
+            // the planner is looked up and called only once the gate has allowed that attempt
+            DBExecUtils.tryExecuteRecover(monitor, dataSource, param -> {
+                dbcPlan[0] = DbacEnforcedExecution.explain(monitor, dbacSource(), session -> {
+                    DBCQueryPlanner planner = GeneralUtils.adapt(session.getDataSource(), DBCQueryPlanner.class);
+                    if (planner == null) {
+                        throw new DBWebException("Datasource '" + session.getDataSource() + "' doesn't support execution plan");
+                    }
                     DBCQueryPlannerConfiguration planConfig = new DBCQueryPlannerConfiguration();
                     planConfig.getParameters().putAll(configuration);
-                    dbcPlan[0] = planner.planQueryExecution(session, sql, planConfig);
-                }
+                    return planner.planQueryExecution(session, sql, planConfig);
+                });
             });
         } catch (DBException e) {
             throw new DBWebException("Error explaining execution plan", e);
         }
 
         return new WebSQLExecutionPlan(webSession, dbcPlan[0]);
+    }
+
+    /** DBAC: where a gated Explain attempt finds its context and its user - read afresh by every attempt */
+    @NotNull
+    private DbacEnforcedExecution.Source dbacSource() {
+        return new DbacEnforcedExecution.Source() {
+            @Nullable
+            @Override
+            public DBCExecutionContext executionContext() {
+                return connection.getDataSource() == null ? null : getExecutionContext();
+            }
+
+            @Nullable
+            @Override
+            public String userId() {
+                return webSession.getUserId();
+            }
+        };
     }
 
 

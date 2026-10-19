@@ -43,7 +43,7 @@ import java.sql.SQLException;
 import java.util.UUID;
 
 /**
- * DBAC enforcement of the transaction entry points: commit, auto-commit on, and the explicit rollback
+ * DBAC enforcement of the transaction entry points - commit, auto-commit on, the explicit rollback - and of Explain
  * <p>
  * The one production class that knows both the platform and the enforcement gate. Each call is made from inside the
  * entry point's async task, and finds everything it works on afresh there: the execution context comes from the
@@ -62,6 +62,10 @@ import java.util.UUID;
  * <p>
  * <b>Auto-commit on when JDBC already is</b> succeeds without the gate or the platform: there is no open
  * transaction, so nothing can be committed.
+ * <p>
+ * <b>Explain</b> takes the same way as a commit, once per attempt of the platform's recovery loop: every attempt
+ * enters the gate afresh, and the planner runs only inside the gate's {@code execute()}. In Slice 4a every Explain is
+ * write-gated - plain {@code EXPLAIN} as much as {@code EXPLAIN ANALYZE}, which runs the statement.
  * <p>
  * <b>The explicit rollback</b> is recovery. It takes X and M, and nothing of the policy: no gate, grant key or user
  * lock, metadata database or audit row, so it works while the policy service is failed or stopping and while a
@@ -255,6 +259,87 @@ public final class DbacEnforcedExecution {
                 return Done.block();
             }
             return Done.of(Boolean.TRUE);
+        }
+    }
+
+    // ---------------------------------------------------------------- explain
+
+    /**
+     * The planner call of one Explain attempt, on the session this class opened for it on the judged generation
+     * <p>
+     * Package-private, as is {@link #explain}: only the processor's Explain entry point, in this package, plans
+     * through it.
+     */
+    @FunctionalInterface
+    interface ExplainCall<T> {
+        /**
+         * Plans the statement on {@code session}; called at most once, and only once the gate has allowed the attempt
+         */
+        @NotNull
+        T plan(@NotNull DBCSession session) throws DBException;
+    }
+
+    /**
+     * Plans one Explain attempt, if the gate allows it - in Slice 4a every Explain is write-gated
+     * <p>
+     * Called once per attempt from inside the platform's recovery loop, so a retry after a lost connection enters the
+     * gate again: a new entry, context, generation, decision, expiry window and audit row, nothing kept from the attempt
+     * before. The planner runs only inside the gate's {@code execute()}, on a session opened there. A refusal is a
+     * {@link Refusal}, which the recovery loop never retries; what the planner itself throws keeps its meaning, so a
+     * lost connection is still recovered by the platform - after this call has returned and every lock is free.
+     *
+     * @return what the planner returned
+     * @throws Refusal when the attempt was refused, or planned on a connection that was replaced meanwhile
+     * @throws DBException what the planner threw
+     */
+    @NotNull
+    static <T> T explain(@NotNull DBRProgressMonitor monitor, @NotNull Source source, @NotNull ExplainCall<T> call) throws DBException {
+        EnforcementGate.Entry entry = EnforcementGate.global().enter();
+        DBCExecutionContext context = source.executionContext();
+        if (!(context instanceof JDBCExecutionContext jdbc)) {
+            throw refuse(context == null ? DenialReason.CONNECTION_UNKNOWN : DenialReason.ENDPOINT_UNSUPPORTED);
+        }
+        DBPExclusiveResource exclusive = jdbc.getOwnerInstance().getExclusiveLock();
+        Object instanceLock = exclusive.acquireExclusiveLock();
+        try {
+            synchronized (jdbc) {
+                Connection generation = generationOf(jdbc);
+                Boolean autoCommit = autoCommitOf(generation);
+                requireSameGeneration(jdbc, generation);
+                Explain<T> explain = new Explain<>(monitor, jdbc, generation, call);
+                return decide(entry, request(source, explain.ref, DbOperationCategory.EXPLAIN, autoCommit), explain);
+            }
+        } finally {
+            exclusive.releaseExclusiveLock(instanceLock);
+        }
+    }
+
+    /** The planner call, and the generation it must find unchanged afterwards */
+    private static final class Explain<T> extends Attempt<T> {
+        private final ExplainCall<T> call;
+
+        Explain(
+            @NotNull DBRProgressMonitor monitor,
+            @NotNull JDBCExecutionContext context,
+            @NotNull Connection generation,
+            @NotNull ExplainCall<T> call
+        ) {
+            super(monitor, context, generation);
+            this.call = call;
+        }
+
+        @NotNull
+        @Override
+        public Done<T> execute() throws DBException {
+            T plan;
+            try (DBCSession session = context.openSession(monitor, DBCExecutionPurpose.USER, "Execute SQL")) {
+                plan = call.plan(session);
+            }
+            if (context.getConnectionOrNull() != generation) {
+                blockAfterOperation(this, "EXPLAIN_GENERATION_CHANGED", null);
+                return Done.block();
+            }
+            return Done.of(plan);
         }
     }
 

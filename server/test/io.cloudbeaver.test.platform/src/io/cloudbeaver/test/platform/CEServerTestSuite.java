@@ -43,6 +43,8 @@ import io.cloudbeaver.test.platform.dbac.EnforcementGateTest;
 import io.cloudbeaver.test.platform.dbac.EnforcementLifecycleTest;
 import io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest;
 import io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest;
+import io.cloudbeaver.test.platform.dbac.ExplainEnforcementAdapterTest;
+import io.cloudbeaver.test.platform.dbac.ExplainEnforcementEntryPointTest;
 import io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest;
 import io.cloudbeaver.test.platform.dbac.KeyLockRegistryTest;
 import io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest;
@@ -120,7 +122,9 @@ import org.junit.platform.suite.api.Suite;
         KeyLockRegistryTest.class,
         MetadataCapacityTest.class,
         TransactionEnforcementEntryPointTest.class,
-        TransactionEnforcementAdapterTest.class
+        TransactionEnforcementAdapterTest.class,
+        ExplainEnforcementEntryPointTest.class,
+        ExplainEnforcementAdapterTest.class
     }
 )
 public class CEServerTestSuite {
