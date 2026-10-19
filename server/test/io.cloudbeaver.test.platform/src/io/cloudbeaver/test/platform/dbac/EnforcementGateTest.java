@@ -546,13 +546,18 @@ public class EnforcementGateTest {
     }
 
     /**
-     * GT-9: in production only the gate decides, records and marks
+     * GT-9: in production only the gate decides and records, and only the transaction adapter enters it
      * <p>
      * Read from the bytecode of every server bundle. {@code authorize}, {@code openExpiryWindow},
      * {@code resolveKey} and the window's steps are called by the gate alone (and by the service delegating to its
-     * own window); the audit writer is made and called by the gate alone; the taint registry's state and marks are
-     * read and changed by the gate alone; nothing calls {@code releaseAfterExplicitRollback} yet; and nothing calls
-     * the gate yet - production entry points are a later slice, and only {@code global()} may serve them then.
+     * own window); the audit writer is made and called by the gate alone; the taint registry's state and the gate's
+     * own rollback are read and recorded by the gate alone, its marks by the gate and the transaction adapter
+     * {@code DbacEnforcedExecution} - after the platform was called or for an explicit rollback - and the release
+     * after an explicit rollback by that adapter alone; no production class makes a registry of its own. The gate
+     * is made by nothing outside it, and called from outside only by the adapter, and only through
+     * {@code global()}, {@code enter()}, {@code run()} and the two results - never {@code of(...)}. The adapter does
+     * call all three, and the transaction entry points reach DBAC through the adapter alone. The adapter refers to
+     * no decision, window, budget, writer, holder, key lock or deployment type.
      */
     @Test
     public void gt9OnlyTheGateDecidesRecordsAndMarks() throws Throwable {
@@ -561,8 +566,14 @@ public class EnforcementGateTest {
         String writer = "io/cloudbeaver/service/dbac/policy/enforcement/AccessAuditWriter";
         String registry = "io/cloudbeaver/service/dbac/policy/enforcement/TransactionTaintRegistry";
         String gate = "io/cloudbeaver/service/dbac/policy/enforcement/EnforcementGate";
+        String adapter = "io/cloudbeaver/service/sql/DbacEnforcedExecution";
+        String entryPoints = "io/cloudbeaver/service/sql/WebSQLContextInfo";
         record Guard(String name, Set<String> targets, Set<String> allowedCallers) {
         }
+
+        // What the adapter may call of the gate; anything else of the gate, from anywhere outside it, is a violation
+        Set<String> adapterEntry = Set.of(gate + "#global", gate + "#enter", gate + "$Entry#run", gate + "$Denied#reason",
+            gate + "$Executed#value");
 
         List<Guard> guards = List.of(
             new Guard("decisions", Set.of(service + "#authorize", service + "#openExpiryWindow", service + "#resolveKey",
@@ -570,16 +581,20 @@ public class EnforcementGateTest {
                 window + "#requireMarginBeforeExecute"), Set.of(gate, service)),
             new Guard("audit writer", Set.of(writer + "#<init>", writer + "#recordAllowedBeforeExecution", writer + "#recordDenied"),
                 Set.of(gate, writer)),
-            new Guard("taint marks", Set.of(registry + "#state", registry + "#markTainted", registry + "#markBlocked",
-                registry + "#rollbackSucceeded"), Set.of(gate, registry)),
-            new Guard("explicit release", Set.of(registry + "#releaseAfterExplicitRollback"), Set.of(registry)),
+            new Guard("taint state", Set.of(registry + "#state", registry + "#rollbackSucceeded"), Set.of(gate, registry)),
+            new Guard("taint marks", Set.of(registry + "#markTainted", registry + "#markBlocked"), Set.of(gate, registry, adapter)),
+            new Guard("explicit release", Set.of(registry + "#releaseAfterExplicitRollback"), Set.of(registry, adapter)),
+            new Guard("registries of their own", Set.of(registry + "#isolated", registry + "#<init>"), Set.of(registry)),
             new Guard("the gate", Set.of(gate + "#*"), Set.of(gate)));
         List<String> violations = new ArrayList<>();
         int scanned = 0;
+        Set<String> adapterCalls = new TreeSet<>();
+        Set<String> entryPointCalls = new TreeSet<>();
         for (ClassFile one : productionClasses()) {
             scanned++;
+            boolean isAdapter = ownerIs(one.name, adapter);
             for (Guard guard : guards) {
-                if (guard.allowedCallers().stream().anyMatch(allowed -> one.name.equals(allowed) || one.name.startsWith(allowed + "$"))) {
+                if (guard.allowedCallers().stream().anyMatch(allowed -> ownerIs(one.name, allowed))) {
                     continue;
                 }
                 for (String ref : one.methodRefs) {
@@ -587,10 +602,47 @@ public class EnforcementGateTest {
                     String owner = target.substring(0, target.indexOf('#'));
                     boolean hit = guard.targets().contains(target) || guard.targets().stream()
                         .anyMatch(wanted -> wanted.endsWith("#*") && ownerIs(owner, wanted.substring(0, wanted.length() - 2)));
-                    if (hit) {
+                    if (hit && !(isAdapter && adapterEntry.contains(target))) {
                         violations.add(guard.name() + ": " + one.name + " calls " + target);
                     }
                 }
+            }
+            for (String ref : one.methodRefs) {
+                String target = ref.substring(0, ref.lastIndexOf('#'));
+                if (isAdapter) {
+                    adapterCalls.add(target);
+                }
+                if (ownerIs(one.name, entryPoints)) {
+                    entryPointCalls.add(target);
+                }
+            }
+            if (isAdapter) {
+                for (String referenced : one.classRefs) {
+                    for (String forbidden : List.of("AuthorizationDecision", "DbAccessPolicyService", "MetadataBudget",
+                        "AccessAuditWriter", "PolicyServiceHolder", "EnforcementKeyLocks", "DeploymentGuard", "MetadataLease")) {
+                        if (referenced.endsWith("/" + forbidden) || referenced.contains("/" + forbidden + "$")) {
+                            violations.add("the adapter's surface: " + one.name + " refers to " + referenced);
+                        }
+                    }
+                }
+            }
+            if (ownerIs(one.name, entryPoints)) {
+                for (String referenced : one.classRefs) {
+                    if (referenced.startsWith("io/cloudbeaver/service/dbac/")) {
+                        violations.add("the entry points: " + one.name + " refers to " + referenced + " other than through the adapter");
+                    }
+                }
+            }
+        }
+        for (String needed : List.of(gate + "#global", gate + "#enter", gate + "$Entry#run", registry + "#markBlocked",
+            registry + "#releaseAfterExplicitRollback")) {
+            if (!adapterCalls.contains(needed)) {
+                violations.add("the adapter must call " + needed);
+            }
+        }
+        for (String needed : List.of(adapter + "#commit", adapter + "#autoCommitOn", adapter + "#rollback")) {
+            if (!entryPointCalls.contains(needed)) {
+                violations.add("the entry points must call " + needed);
             }
         }
         Assertions.assertTrue(scanned > 100, "FIXTURE GT-9: the server bundles' classes must be found, found " + scanned);
@@ -1408,6 +1460,9 @@ public class EnforcementGateTest {
 
     /**
      * GT-34: the entry-point test written for the next slice stays out of the suite and the verifier
+     * <p>
+     * Matched as a whole name, so P6-A's {@code TransactionEnforcementEntryPointTest} is not taken for it; that copy
+     * carries none of the Explain cases, which stay unregistered for P6-B.
      */
     @Test
     public void gt34TheEntryPointTestStaysUnregistered() throws IOException {
@@ -1415,9 +1470,15 @@ public class EnforcementGateTest {
         String suite = Files.readString(root.resolve(
             "server/test/io.cloudbeaver.test.platform/src/io/cloudbeaver/test/platform/CEServerTestSuite.java"), StandardCharsets.UTF_8);
         String verifier = Files.readString(root.resolve(".github/scripts/verify_dbac_surefire.py"), StandardCharsets.UTF_8);
-        Assertions.assertFalse(suite.contains("EnforcementEntryPointTest"), "GT-34: the suite must not register EnforcementEntryPointTest");
-        Assertions.assertFalse(verifier.contains("EnforcementEntryPointTest"),
-            "GT-34: the verifier must not count EnforcementEntryPointTest");
+        String copy = Files.readString(root.resolve(
+            "server/test/io.cloudbeaver.test.platform/src/io/cloudbeaver/test/platform/dbac/TransactionEnforcementEntryPointTest.java"),
+            StandardCharsets.UTF_8);
+        Pattern original = Pattern.compile("\\bEnforcementEntryPointTest\\b");
+        Assertions.assertFalse(original.matcher(suite).find(), "GT-34: the suite must not register EnforcementEntryPointTest");
+        Assertions.assertFalse(original.matcher(verifier).find(), "GT-34: the verifier must not count EnforcementEntryPointTest");
+        for (String explain : List.of("EXP-1", "EXP-2", "EnforcementTestSupport.explain(", "DbOperationCategory.EXPLAIN")) {
+            Assertions.assertFalse(copy.contains(explain), "GT-34: the registered P6-A copy must carry no Explain case: " + explain);
+        }
     }
 
     // ---------------------------------------------------------------- the lab

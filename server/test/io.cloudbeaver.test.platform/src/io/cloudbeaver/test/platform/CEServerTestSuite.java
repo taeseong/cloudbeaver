@@ -56,6 +56,8 @@ import io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteModelTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest;
+import io.cloudbeaver.test.platform.dbac.TransactionEnforcementAdapterTest;
+import io.cloudbeaver.test.platform.dbac.TransactionEnforcementEntryPointTest;
 import io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest;
 import io.cloudbeaver.test.platform.dbac.UserRecreationTest;
 import io.cloudbeaver.test.platform.sql.*;
@@ -116,7 +118,9 @@ import org.junit.platform.suite.api.Suite;
         AuditFailClosedTest.class,
         EnforcementGateTest.class,
         KeyLockRegistryTest.class,
-        MetadataCapacityTest.class
+        MetadataCapacityTest.class,
+        TransactionEnforcementEntryPointTest.class,
+        TransactionEnforcementAdapterTest.class
     }
 )
 public class CEServerTestSuite {

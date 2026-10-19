@@ -65,6 +65,9 @@ REQUIRED_VALUE = "true"
 # and visible before the writer returns, a statement timeout from the audit budget, nothing past the budget kept.
 # EnforcementGateTest runs the gate on a lifecycle of its own over a PostgreSQL metadata schema as well as H2: no
 # metadata connection while it waits for a lock, the rollback before the audit row, the allowed row before the operation.
+# The P6-A classes drive the wired transaction entry points - commit, auto-commit on and the explicit rollback - on
+# real PostgreSQL target connections: what a separate client sees committed, the server backend a severed context
+# leaves, and a rollback the network never answers.
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
@@ -81,6 +84,8 @@ POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest",
     "io.cloudbeaver.test.platform.dbac.AuditFailClosedTest",
     "io.cloudbeaver.test.platform.dbac.EnforcementGateTest",
+    "io.cloudbeaver.test.platform.dbac.TransactionEnforcementEntryPointTest",
+    "io.cloudbeaver.test.platform.dbac.TransactionEnforcementAdapterTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -123,6 +128,8 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.EnforcementGateTest": 35,
     "io.cloudbeaver.test.platform.dbac.KeyLockRegistryTest": 12,
     "io.cloudbeaver.test.platform.dbac.MetadataCapacityTest": 5,
+    "io.cloudbeaver.test.platform.dbac.TransactionEnforcementEntryPointTest": 12,
+    "io.cloudbeaver.test.platform.dbac.TransactionEnforcementAdapterTest": 19,
 }
 
 for _postgres_class in POSTGRES_CLASSES:
