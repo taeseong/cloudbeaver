@@ -612,6 +612,49 @@ base ref → default branch 순으로 clone합니다. 즉 **이 저장소의 CI 
   `dbeaver-common`의 재사용 workflow라 이 fork가 바꿀 수 없고, DBAC job에만 고정을 넣으면 두 job이
   서로 다른 플랫폼을 보게 되어 오히려 진단이 어려워집니다.
 
+### 8.4 RMController bulk setter `setProjectProperties` — fork PR #4 첫 CI
+
+**증상.** fork PR #4의 첫 CI run `39215550687`(head `faaba87d`)에서 `Check / Build Java`와
+`DBAC PostgreSQL / Build`가 `io.cloudbeaver.model` 컴파일에서 실패했습니다.
+
+```
+[ERROR] LocalResourceController.java:[76,8] io.cloudbeaver.model.rm.local.LocalResourceController
+        is not abstract and does not override abstract method
+        setProjectProperties(String,Map<String,Object>) in org.jkiss.dbeaver.model.rm.RMController
+```
+
+**원인.** `dbeaver` commit `c8fc6afd`(2026-09-27)가 `RMController`에
+`void setProjectProperties(@NotNull String projectId, @NotNull Map<String, Object> properties) throws DBException`를
+추가했습니다. CI가 받은 `dbeaver/devel`은 `a9c14c1c`이고, 이 문서의 로컬 검증 조합(`dbeaver` `8fe918f`)에는 이
+메서드가 없습니다. 두 조합의 `RMController` 차이는 이 메서드 하나뿐입니다.
+
+**대응.** `BaseLocalResourceController`에 같은 signature의 public method를 추가했습니다. project metadata file에
+대한 `doFileWriteOperation` 한 번 안에서 기존 `BaseProjectImpl.setProjectProperties`에 위임합니다.
+
+* **`@Override`는 의도적으로 붙이지 않았습니다.** 붙이면 이 메서드가 없는 이전 revision에서 컴파일되지 않습니다.
+* upstream `dbeaver/cloudbeaver` commit `ee37ee4bfd10`의 같은 hunk와 위임 방식은 같습니다. 차이는 `@Override`가
+  없는 것, null map을 project와 파일에 닿기 전에 거부하는 것, debug 로그를 남기지 않는 것입니다.
+* 같은 upstream commit의 `WebProjectImpl.setProjectProperties` override는 이식하지 않았습니다. compile drift와
+  관계없는 동작 변경이고, 그 경로(`DBPProject.setProjectProperties`)는 이전 revision에도 이미 있었습니다. 같은
+  commit의 `RMLockTest.testForceUnlock` 순서 안정화도 이식하지 않았습니다. 이번 전체 verify에서 `RMLockTest` 3개는
+  통과했지만, CI에서 flaky하면 이 변경을 먼저 보십시오.
+* upstream devel을 병합하면 이 hunk가 충돌합니다. fork의 DBeaver baseline이 이 메서드를 갖게 된 뒤에는 upstream
+  쪽(`@Override` 포함)을 택하면 됩니다.
+
+**검증 조합.** DBAC 코드와 testcase 수는 바뀌지 않았습니다.
+
+* 신규: `dbeaver` `a9c14c1c` / `dbeaver-common` `6c9a90f4` / `datadam-api` `2578ccae` — CI run 시작 시점의 `devel`
+* 이전: `dbeaver` `8fe918f5` / `dbeaver-common` `ff69b563` / `datadam-api` `c8645a8a` — Slice 4a 증거(9절)의 조합
+* 이전 조합 빌드는 9절과 같은 격리 clone `cloudbeaver-s1`에서 했습니다. 그 clone의 `server/`, `.github/`,
+  `project.deps` tracked 파일 840개가 HEAD `faaba87d`와 같음을 확인한 뒤, 수정본 파일 하나만 덮어썼습니다.
+
+| 조합 | cloudbeaver | 결과 |
+|---|---|---|
+| 신규 | HEAD `faaba87d` | CI와 같은 컴파일 오류 재현 (RED) |
+| 신규 | 수정본 | reactor 전체 `BUILD SUCCESS` (main·test 컴파일, test 실행 생략) |
+| 이전 | 수정본 | reactor 전체 `BUILD SUCCESS` (main·test 컴파일, test 실행 생략) |
+| 신규, PostgreSQL required mode 전체 verify | 수정본 | 686 PASS (failure·error·skip 0), verifier PostgreSQL 274 / DBAC 629 exit 0, LC-6 1296/0 |
+
 ---
 
 ## 9. Slice 4a 최종 증거
