@@ -1,5 +1,10 @@
 # DBAC — TEMP_WRITE grant의 물리 endpoint 식별 (DECIDED)
 
+> **Slice 4a 상태 (`ac443253842c9532f4ba7a0c4182f455ebfc9b1e`).** Explain/transaction enforcement spine만 연결됨.
+> 만료는 보수적 margin 기반이며 strict real-time 보장이 아님. 단일 프로세스 배포 전제이며 multi-node는 지원하지 않음.
+> 일반 SQL 실행, Data Editor, Import, DDL 같은 나머지 경로는 아직 gate에 연결되지 않았다. 계약 전체와 미결선 목록은
+> `docs/db-access-control-enforcement-4a.md`에 있다.
+
 Phase 3 Slice 3 독립 검토에서 **물리 endpoint 승계 우회**가 High로 확인되어 작성한 결정 기록이다.
 Phase 2 §5.1의 "스냅샷 3개"(`DRIVER_ID` / `HOST_SNAPSHOT` / `DATABASE_SNAPSHOT`)를 이 문서가 대체한다.
 
@@ -506,12 +511,15 @@ migration은 값을 만들지 않는다. 따라서 기존 row는 세 값이 NULL
 
 ---
 
-## 4.2 enforcement 연결 시 필수 acceptance criterion — authorization-to-execution TOCTOU (BLOCKING)
+## 4.2 enforcement 연결 시 필수 acceptance criterion — authorization-to-execution TOCTOU (REVISED — Slice 4a에서 안 B로 충족, 연결된 진입점 한정)
 
-**이번 Slice에서는 구현하지 않는다.** 그러나 enforcement를 연결하는 Slice는 아래를 **차단 조건**으로 만족해야
-하며, 만족하기 전에는 READ_ONLY enforcement 완료를 선언하지 않는다.
+> **Slice 4a 상태 (`ac443253842c9532f4ba7a0c4182f455ebfc9b1e`).** 이 절은 Slice 3 시점에 enforcement가 없을 때
+> 쓴 차단 조건이다. Slice 4a는 판정 대상인 **transaction 종료(commit, auto-commit true)와 Explain** 진입점에
+> 한해 아래 조건을 **안 B**로 충족했다. explicit rollback은 판정하지 않는 복구 경로이므로 이 조건의 대상이 아니다. 일반 SQL 실행, Data Editor, Import, DDL 같은 미결선 경로에는 아직 아무 조건도
+> 적용되지 않는다. 그 경로를 연결하는 Slice도 같은 조건을 차단 조건으로 만족해야 하며, 그 전에는 READ_ONLY
+> enforcement가 완료됐다고 선언하지 않는다. 전체 계약은 `docs/db-access-control-enforcement-4a.md`에 있다.
 
-이 Slice가 닫은 것은 "판정 시점에 두 fingerprint가 grant와 일치하는가"다. 닫지 **못한** 것은 **판정과 실행 사이의
+Slice 3이 닫은 것은 "판정 시점에 두 fingerprint가 grant와 일치하는가"다. 닫지 **못한** 것은 **판정과 실행 사이의
 간격**이다. `authorize()`가 ALLOW를 반환한 뒤 statement가 실제로 실행되기까지 다음이 일어날 수 있다.
 
 ```
@@ -520,29 +528,71 @@ t1  설정 변경 / reconnect / invalidate
 t2  JDBC statement 실행     <- t0의 결정이 더 이상 t2의 대상을 서술하지 않는다
 ```
 
-`DataSourceDescriptor.connect`는 접속마다 `resolvedConnectionInfo`를 새로 만들고(`:1114`),
-`WebSessionProjectImpl.updateConnection`은 연결을 끊지 않고 저장 설정을 제자리 수정한다(`:313-329`). 따라서
-t1은 정상 기능이며 예외 상황이 아니다.
+`DataSourceDescriptor.connect`는 접속할 때마다 `resolvedConnectionInfo`를 새로 만든다(`:1114`).
+`WebSessionProjectImpl.updateConnection`은 연결을 끊지 않고 저장된 설정을 제자리에서 수정한다(`:313-329`).
+따라서 t1은 예외 상황이 아니라 정상 기능이다.
 
 ### 충족 조건
 
-| # | 조건 |
-|---|---|
-| A1 | authorization이 확인한 **actual endpoint**와, statement가 실제로 사용하는 **execution context**가 동일함이 보장되어야 한다. 판정이 읽은 설정과 statement가 타는 연결이 같은 객체여야 한다 |
-| A2 | statement 생성 **직전**에 재검증하거나, endpoint 변경이 불가능한 동일 context에 결속(bind)해야 한다. "판정 후 곧" 정도로는 부족하다 |
-| A3 | `authorize()` 이후 reconnect 또는 configuration update가 발생하면 **이전 decision을 재사용하지 않는다.** DENY하거나 다시 판정한다 |
-| A4 | decision을 캐시하거나 세션에 저장하지 않는다. 이 Slice의 판정은 캐시가 없고(테스트로 고정), enforcement가 캐시를 도입하면 A3가 무의미해진다 |
-| A5 | 위 조건을 검증하는 자동 테스트가 존재해야 한다. 최소한 "ALLOW 직후 설정 변경 → 실행 차단"과 "ALLOW 직후 reconnect → 실행 차단"을 재현한다 |
+| # | 조건 | Slice 4a 충족 방식 |
+|---|---|---|
+| A1 | authorization이 확인한 **actual endpoint**와 statement가 실제로 사용하는 **execution context**가 같아야 한다. 판정이 읽은 설정과 statement가 타는 연결이 같은 객체여야 한다 | key와 container는 실제 context의 data source에서 읽는다(`ContainerIdentityResolver`, `DbacEnforcedExecution.request`). GraphQL 인자는 쓰지 않는다 |
+| A2 | statement 생성 **직전**에 재검증하거나, endpoint를 바꿀 수 없는 동일 context에 결속해야 한다. "판정 후 곧" 정도로는 부족하다 | instance lock X와 context monitor M을 쥔 채 generation을 읽고, gate가 판정한다. platform 호출은 같은 X/M 아래에서 gate의 `execute()` 안에서만 일어난다 |
+| A3 | `authorize()` 이후 reconnect나 configuration update가 일어나면 **이전 decision을 재사용하지 않는다.** DENY하거나 다시 판정한다 | generation 확인으로 처리한다(아래 A5). recovery와 retry는 attempt마다 판정을 처음부터 다시 한다 |
+| A4 | decision을 캐시하거나 세션에 저장하지 않는다 | 판정 캐시 없음. `EnforcementGate.Entry`는 한 번만 실행할 수 있다(`used` guard) |
+| A5 | **(REVISED — 안 B)** 다음을 재현하는 자동 테스트가 있어야 한다: 실제 JDBC connection generation이 바뀌면 이전 authorization을 쓰지 않는다. reconnect/recovery는 새 generation에서 판정 전체를 반복한다. declared configuration만 바뀐 경우의 의미는 아래와 같다 | §4.2.1 |
 
-### 아직 결정되지 않은 것
+### A5 정정 — 승인된 안 B
 
-A1을 만족하는 방법은 두 가지이고 어느 쪽도 이 Slice에서 결정하지 않았다.
+초판 A5는 "ALLOW 직후 **설정 변경** → 실행 차단"과 "ALLOW 직후 reconnect → 실행 차단"을 요구했다. 앞의 요구는
+**철회한다.** declared configuration 변경이 현재 operation을 반드시 막는 것은 아니다. 안 B의 의미는 다음과 같다.
 
-1. `DBCExecutionContext` / `DBCSession` 단위로 결속하여, 판정에 쓰인 context가 아니면 실행을 거부한다.
-2. statement 실행 직전에 `authorize()`를 다시 호출하고, 그 사이 endpoint가 바뀌었으면 DENY한다.
+* **실제 JDBC connection generation이 교체되면 이전 authorization을 쓰지 않는다.**
+  * platform 호출 **전**에 교체되면 `GRANT_STALE`로 거부하고 platform은 호출하지 않는다.
+  * platform 호출 **뒤**에 교체되면 성공으로 보고하지 않고, context를 sever하고 BLOCKED로 둔다(`CONNECTION_BLOCKED`).
+* **reconnect와 recovery는 새 generation에서 authorization 전체를 반복한다.** 이전 decision, expiry window, audit을
+  재사용하지 않는다.
+* **authorization 뒤 declared configuration만 바뀌고 실제 in-use connection이 그대로라면,** 현재 operation은 승인된
+  기존 physical endpoint에서 끝날 수 있다. 저장된 설정을 바꿔도 살아 있는 context가 새 endpoint로 옮겨 가지 않기
+  때문이다(CH-10). 판정이 승인한 것은 그 in-use connection이다.
+* **다음 attempt는** 판정 11단계에서 declared와 in-use 두 fingerprint를 모두 grant와 비교한다. fingerprint에 들어가는
+  endpoint 성분이 바뀌었다면 snapshot과 맞지 않으므로 `GRANT_STALE`로 거부된다. endpoint를 식별할 수 없게 바뀌었다면
+  5단계에서 `ENDPOINT_UNSUPPORTED`로 거부된다. fingerprint 밖의 설정 변경(3.1절)은 이 비교로 거부되지 않는다.
+* endpoint identity의 근거는 GraphQL 인자가 아니라 **실제 context의 container와 in-use connection**이다.
 
-전자는 CloudBeaver의 execution context 수명과 재연결 동작을 조사해야 하고, 후자는 metadata 조회 비용이
-statement마다 발생한다. **enforcement Slice의 첫 작업은 이 선택의 근거를 조사해 기록하는 것이다.**
+### 결정 (Slice 4a)
+
+초판이 열어 둔 두 방법 중 어느 하나를 그대로 고르지 않고, 둘을 결합했다.
+
+* **context/generation 결속.** 판정과 platform 호출을 같은 context, 같은 X/M, 같은 generation에 묶는다.
+* **attempt마다 판정.** statement마다 판정하는 대신, attempt마다 platform 호출 직전에 한 번 판정한다. 그 판정에는
+  metadata 한 statement, audit 한 row가 든다.
+
+이 결정은 연결된 진입점에만 적용된다. 일반 SQL 실행처럼 statement 여러 개를 실행하는 경로를 연결할 때는 판정 단위를
+그 Slice에서 다시 정해야 한다.
+
+### 4.2.1 Enforcement-time endpoint identity evidence
+
+| 근거 | 위치 | 보여 주는 것 |
+|---|---|---|
+| adapter | `server/bundles/io.cloudbeaver.server/src/io/cloudbeaver/service/sql/DbacEnforcedExecution.java` | 실제 context에서 container를 읽고, `executionContextId`를 실제 context id로 둔다. X+M 아래에서 generation을 읽고 재확인한다. gate의 최종 확인(`confirm`)과 platform 호출 뒤 사후 확인을 한다 |
+| 실제 container에서 key 읽기 | `.../dbac/policy/ContainerIdentityResolver.java` | key를 요청 인자가 아니라 해석된 container 객체에서 읽는다. project registry가 현재 그 container를 갖고 있는지 확인한다 |
+| declared와 in-use fingerprint | `.../dbac/policy/EndpointFingerprints.java` | 저장된 설정과 실제로 연결에 쓰인 설정 양쪽에서 endpoint를 식별한다. 식별할 수 없으면 `ENDPOINT_UNSUPPORTED` |
+| 판정 시점의 선형화 | `.../dbac/policy/PolicySnapshotRepository.java` | DB 시각, user 상태, grant, 회수, 만료, grant endpoint를 한 statement로 읽는다 |
+| generation 사전 확인 | TA-6, XA-5 | platform 호출 전 교체: `GRANT_STALE`, correction row, platform 0 |
+| generation 사후 확인 | TA-7, XA-14 | platform 호출 뒤 교체: 성공 0, BLOCKED, correction 0 |
+| generation 없음 | TA-5, XA-6 | `CONNECTION_UNKNOWN`. 판정하지 않고 다시 연결하지도 않는다 |
+| registry identity | TA-3, XA-13 | 실제 context 객체와 context id가 registry identity다 |
+| Explain recovery | XA-2 | connection-lost 뒤 lock이 모두 풀린 상태에서 retry한다. 새 generation, 새 판정, 새 audit을 만든다 |
+| retry 전 revoke | XA-3 | retry가 `GRANT_REVOKED`로 거부되고 planner는 호출되지 않는다 |
+| 거절은 retry 안 함 | XA-4, TA-16 | DBAC 거절은 recovery, invalidate, retry를 일으키지 않는다 |
+| 이전 decision 재사용 방지 (static) | TA-2, XA-17, GT-9 | task 생성 시점의 context capture가 없다. gate는 recovery 람다 안에서 attempt마다 진입한다. gate 진입은 adapter만 한다. `Entry`는 한 번만 실행된다 |
+| 이전 decision 재사용 방지 (mutant) | P6-B b01, b02, b03, b13 | gate를 한 번만 진입, context를 retry 밖에서 capture, decision 재사용, retry가 gate를 건너뜀 — 모두 kill됨 |
+| declared-only 변경 | `DbacPlatformContractTest` CH-10, `DbAccessPolicyTest`의 `liveConnectionAtAnotherEndpointIsDenied`, `grantMatchingOnlyTheLiveEndpointIsRefused` | 저장된 설정만 바뀌어도 살아 있는 context는 기존 endpoint를 유지한다. declared와 in-use가 어긋나면 다음 판정은 거부된다 |
+
+**공백.** declared configuration만 바뀌는 순간을 operation 도중에 barrier로 붙잡는 전용 테스트는 없다. 위 근거는
+platform 계약 테스트(CH-10), policy 테스트, adapter 구조(platform 호출 전에 declared 설정을 다시 읽지 않음)를 합친
+것이다.
 
 ---
 
@@ -580,6 +630,9 @@ Not write-gated, for the same reason as CONTAINER_READ.
   `SELECT` 안에 들어오므로 `SELECT`로 분류된다.
 * 이것이 최종 답은 아니다. allowlist된 집계 함수만으로 만든 grouping query는 읽기이므로, enforcement slice가
   그런 allowlist를 갖추면 재분류할 수 있다. **그때까지는 gate를 거치고, grant가 없으면 거부된다.**
+  * **Slice 4a 기준 정정.** category는 `WRITE_GATED`로 정의됐지만 `GROUPING`으로 gate를 부르는 production caller가
+    없다. grouping 경로는 **아직 미결선이며 지금은 거부되지 않는다.** 위 문장은 그 경로를 연결할 때의 요구 사항이다
+    (`docs/db-access-control-enforcement-4a.md` 1.2절, 14절).
 * `CONTAINER_READ`는 `NOT_WRITE_GATED`로 남긴다. 읽기를 막으면 이 프로젝트의 전제(§7: 권한 없음 → READ_ONLY,
   읽기는 허용)가 깨진다. 다만 **범위를 좁혀 명시**했다: 이 값은 navigator의 object tree 읽기이며,
   client가 보낸 filter 식을 실어 오는 데이터 읽기는 **이 범주가 아니다**.
@@ -611,6 +664,9 @@ Not write-gated, for the same reason as CONTAINER_READ.
                           불일치 또는 stored 불완전(v2 row) 시 DENY(GRANT_STALE)
 12 clock skew
 ```
+
+> Slice 4a(`ac443253842c9532f4ba7a0c4182f455ebfc9b1e`)에서 13단계가 추가됐다. 잔여 수명 `EXPIRES_AT − DB_NOW`가 양수가 아니면
+> `PERMISSION_STORE_UNAVAILABLE`이다. 그 판정을 감싸는 gate 순서는 `docs/db-access-control-enforcement-4a.md` §3에 있다.
 
 4·5는 metadata connection을 열지 않는다. 그러나 key는 이미 3에서 확정되었으므로 **버리지 않는다** —
 "어떤 사용자가 어떤 connection에 대해 범위 밖 write를 시도했다"는 것이 audit에 가장 필요한 사건이다.

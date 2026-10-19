@@ -1,5 +1,10 @@
 # DBAC 빌드/검증 진입점
 
+> **Slice 4a 상태 (`ac443253842c9532f4ba7a0c4182f455ebfc9b1e`).** Explain/transaction enforcement spine만 연결됨.
+> 만료는 보수적 margin 기반이며 strict real-time 보장이 아님. 단일 프로세스 배포 전제이며 multi-node는 지원하지 않음.
+> 이 문서의 통과 수치는 검증한 범위만 보여 줍니다. 일반 SQL 실행, Data Editor, Import, DDL 같은 나머지 경로는 아직
+> gate에 연결되지 않았습니다. Slice 4a 증거는 9절, 계약 전체는 `docs/db-access-control-enforcement-4a.md`에 있습니다.
+
 이 문서는 **어떻게 검증하는지**만 다룹니다. 설계 결정은
 `db-access-control-phase1-decision.md`와 `db-access-control-phase2-permission-model.md`에 있고
 그 두 문서는 변경하지 않습니다.
@@ -162,7 +167,9 @@ step은 Surefire XML을 읽어 다음을 확인하고, 하나라도 어긋나면
 - 리포트 파일이 존재하고 파싱 가능한 XML인가
 - `<properties>`에 `dbac.test.postgres.required=true`가 기록되었는가
   (즉 property가 forked test JVM에 실제로 도달했는가)
-- DBAC **11개 클래스**의 testcase 수가 정확한가 — 합계 **269**
+- DBAC **11개 클래스**의 testcase 수가 정확한가 — 합계 **269** (Slice 3 시점 값. 현재 값은 §9)
+
+  > 아래 표는 **Slice 3 시점의 고정값 snapshot**이다. Slice 4a 이후 verifier의 고정값은 §9에 있다.
 
   | 클래스 | 고정값 | PostgreSQL 필요 |
   |---|---:|---|
@@ -236,7 +243,8 @@ DBAC required-mode 자기검증, 드라이버 다운로드가 모두 그 안에 
 green이 됩니다. 데이터베이스 자체는 정상이므로 service health gate가 이 조합을 잡지 못합니다.
 
 이 구멍은 위의 Surefire 자기검증 step이 막습니다. 리포트의 `<properties>`에
-`dbac.test.postgres.required=true`가 없거나 PostgreSQL 3개 클래스의 testcase 합이 56이 아니면
+`dbac.test.postgres.required=true`가 없거나 PostgreSQL 3개 클래스의 testcase 합이 56이 아니면(Slice 3 시점 값. 현재
+값은 §9.1의 19개 클래스 / 274)
 step이 실패하므로,
 전달 경로가 사라지면 CI가 green이 될 수 없습니다. 따라서 **더 이상 로그를 손으로 확인할 필요는
 없습니다** — 다만 upstream 병합에서 `server/test/pom.xml`의 `${debugArgs}`가 사라졌다면, 그때는
@@ -603,3 +611,85 @@ base ref → default branch 순으로 clone합니다. 즉 **이 저장소의 CI 
 - fork 단독으로 SHA를 고정하는 방법은 검토했으나 채택하지 않았습니다. `Check / Build Java`는
   `dbeaver-common`의 재사용 workflow라 이 fork가 바꿀 수 없고, DBAC job에만 고정을 넣으면 두 job이
   서로 다른 플랫폼을 보게 되어 오히려 진단이 어려워집니다.
+
+---
+
+## 9. Slice 4a 최종 증거
+
+> 기준 commit: `ac443253842c9532f4ba7a0c4182f455ebfc9b1e`.
+>
+> 아래 값은 그 commit의 production·test 파일과 hash가 같은 입력으로 실행한 P6-B 최종 batch에서 얻었다(PostgreSQL
+> required mode, `server/product/aggregate` clean verify).
+>
+> frozen evidence는 작업 트리의 git-ignored 로컬 저장소에 있으며 commit되지 않는다.
+>
+> * `.omx/scratchpad/dbac-slice4a/s1/p6b/final-green-full/TEST-io.cloudbeaver.test.platform.CEServerTestSuite.xml`
+> * 입력 hash: 같은 디렉터리 상위의 `final-hashes.sha256`, `final-inputs-at-batch-start.sha256`, `final-inputs-at-batch-end.sha256`. 세 파일이 일치한다.
+>
+> §4의 Slice 3 snapshot 수치는 그 시점의 기록이므로 여기 값으로 덮어쓰지 않는다.
+
+| 항목 | 값 | 출처 |
+|---|---:|---|
+| full suite | 686 PASS (failure·error·skip 0) | P6-B `final-green-full` |
+| verifier PostgreSQL testcase | 274 | `verify_dbac_surefire.py`를 위 XML에 실행, exit 0 |
+| verifier DBAC testcase | 629 | 같음 |
+| `TransactionEnforcementEntryPointTest` | 12 | 같음 |
+| `TransactionEnforcementAdapterTest` | 19 | 같음 |
+| `ExplainEnforcementEntryPointTest` | 2 | 같음 |
+| `ExplainEnforcementAdapterTest` | 17 | 같음 |
+| `EnforcementGateTest` | 35 | 같음 |
+| P6-A mutants | 26/26 rejected | `.omx/scratchpad/dbac-slice4a/s1/p6a/final-kills.txt` (입력 = commit `5bc8259ef61dc69d2d9090560cc179ce642ddff7`) |
+| P6-B mutants | 18/18 rejected | `.omx/scratchpad/dbac-slice4a/s1/p6b/final-kills.txt` (입력 = commit `ac443253842c9532f4ba7a0c4182f455ebfc9b1e`) |
+| LC-6 lifecycle failure matrix | runs 1296, violations 0 | P6-B `final-green-full/build.log`의 `[DBAC P3] LC-6 failure matrix` |
+
+### 9.1 verifier 고정값 (Slice 4a, 36개 클래스)
+
+`EXPECTED_DBAC_TESTS` 합계는 **629**이고, 그중 PostgreSQL이 필요한 클래스는 **19개 / 274**다.
+
+| 클래스 | 고정값 | PostgreSQL 필요 |
+|---|---:|---|
+| `DbacSchemaPostgresTest` | 25 | O |
+| `DbacSchemaRecoveryTest` | 21 | |
+| `DbacScriptTranslationTest` | 9 | |
+| `DbacSchemaTest` | 7 | |
+| `DbacScriptStatementsTest` | 6 | |
+| `TempWriteModelTest` | 25 | |
+| `TempWriteRepositoryTest` | 33 | |
+| `TempWriteRepositoryPostgresTest` | 20 | O |
+| `DbAccessPolicyModelTest` | 50 | |
+| `DbAccessPolicyTest` | 79 | |
+| `DbAccessPolicyPostgresTest` | 15 | O |
+| `DbacPlatformContractTest` | 17 | O |
+| `EnforcementRegressionGuardTest` | 6 | O |
+| `ExceptionRedactionTest` | 2 | |
+| `EnforcementLifecycleTest` | 18 | |
+| `DeploymentGuardTest` | 19 | O |
+| `GrantRevokeRaceTest` | 18 | O |
+| `UserDeactivationRaceTest` | 14 | O |
+| `LockIdentityCharacterizationTest` | 3 | O |
+| `MetadataLeaseTest` | 21 | |
+| `BoundedBorrowTest` | 16 | |
+| `MetadataDisposalTest` | 19 | |
+| `MetadataShutdownTest` | 22 | |
+| `MetadataDeadlineTest` | 10 | |
+| `MetadataLeasePostgresTest` | 3 | O |
+| `DbacFenceMigrationTest` | 15 | O |
+| `UserRecreationTest` | 8 | O |
+| `TaintRegistryLifecycleTest` | 14 | O |
+| `AuditFailClosedTest` | 12 | O |
+| `EnforcementGateTest` | 35 | O |
+| `KeyLockRegistryTest` | 12 | |
+| `MetadataCapacityTest` | 5 | |
+| `TransactionEnforcementEntryPointTest` | 12 | O |
+| `TransactionEnforcementAdapterTest` | 19 | O |
+| `ExplainEnforcementEntryPointTest` | 2 | O |
+| `ExplainEnforcementAdapterTest` | 17 | O |
+| **합계** | **629** | **PostgreSQL 19개 클래스 / 274** |
+
+untracked 원본 `EnforcementEntryPointTest.java`(Slice 4a 초기 RED 집합)는 suite와 verifier 어디에도 등록되지 않는다.
+GT-34가 이를 확인한다.
+
+P6-B full report의 `<testsuite tests>` 속성은 667이고 `<testcase>` 요소는 686개다. 둘의 차이 19는 P6-0(616/635)과
+P6-A(648/667) run에서도 같았다. 그래서 verifier는 여전히 `<testcase>`를 직접 센다.
+
+문서만 바꾸는 commit은 testcase를 추가하지 않으므로 이 값을 바꾸지 않는다.
