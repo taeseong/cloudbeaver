@@ -27,6 +27,7 @@ import io.cloudbeaver.model.session.WebSession;
 import io.cloudbeaver.model.session.WebSessionProvider;
 import io.cloudbeaver.utils.WebEventUtils;
 import org.jkiss.code.NotNull;
+import org.jkiss.code.Nullable;
 import org.jkiss.dbeaver.DBException;
 import org.jkiss.dbeaver.Log;
 import org.jkiss.dbeaver.model.DBConstants;
@@ -212,11 +213,23 @@ public class WebSQLContextInfo implements WebSessionProvider {
     // Transactions
 
     public WebAsyncTaskInfo setAutoCommit(boolean autoCommit) {
-        DBCExecutionContext context = processor.getExecutionContext();
-        DBCTransactionManager txnManager = DBUtils.getTransactionManager(context);
         WebAsyncTaskProcessor<Boolean> runnable = new WebAsyncTaskProcessor<>() {
             @Override
             public void run(DBRProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
+                if (autoCommit) {
+                    // DBAC: turning auto-commit on commits the open transaction, so it is gated
+                    monitor.beginTask("Change connection auto-commit to true", 1);
+                    try {
+                        result = DbacEnforcedExecution.autoCommitOn(monitor, dbacSource());
+                    } catch (DBException e) {
+                        throw new InvocationTargetException(e);
+                    } finally {
+                        monitor.done();
+                    }
+                    return;
+                }
+                DBCExecutionContext context = processor.getExecutionContext();
+                DBCTransactionManager txnManager = DBUtils.getTransactionManager(context);
                 if (txnManager != null) {
                     monitor.beginTask("Change connection auto-commit to " + autoCommit, 1);
                     try {
@@ -234,6 +247,24 @@ public class WebSQLContextInfo implements WebSessionProvider {
         };
         return getWebSession().createAndRunAsyncTask("Set auto-commit", runnable);
 
+    }
+
+    /** DBAC: where a gated transaction call finds its context and its user - read afresh inside the call */
+    @NotNull
+    private DbacEnforcedExecution.Source dbacSource() {
+        return new DbacEnforcedExecution.Source() {
+            @Nullable
+            @Override
+            public DBCExecutionContext executionContext() {
+                return processor.getExecutionContext();
+            }
+
+            @Nullable
+            @Override
+            public String userId() {
+                return processor.getWebSession().getUserId();
+            }
+        };
     }
 
     public WebTransactionLogInfo getTransactionLogInfo() {
@@ -302,18 +333,17 @@ public class WebSQLContextInfo implements WebSessionProvider {
 
     @NotNull
     public WebAsyncTaskInfo commitTransaction() {
-        DBCExecutionContext context = processor.getExecutionContext();
-        DBCTransactionManager txnManager = DBUtils.getTransactionManager(context);
         WebAsyncTaskProcessor<String> runnable = new WebAsyncTaskProcessor<>() {
             @Override
             public void run(DBRProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
-                if (txnManager != null) {
-                    QMTransactionState txnInfo = QMUtils.getTransactionState(context);
-                    try (DBCSession session = context.openSession(monitor, DBCExecutionPurpose.UTIL, "Commit transaction")) {
-                        txnManager.commit(session);
-                    } catch (DBCException e) {
-                        throw new InvocationTargetException(e);
-                    }
+                // DBAC: the commit is gated; nothing is reported or announced unless it really committed
+                QMTransactionState txnInfo;
+                try {
+                    txnInfo = DbacEnforcedExecution.commit(monitor, dbacSource());
+                } catch (DBException e) {
+                    throw new InvocationTargetException(e);
+                }
+                if (txnInfo != null) {
                     result = """
                     Transaction has been committed
                     Query count: %s
@@ -342,18 +372,17 @@ public class WebSQLContextInfo implements WebSessionProvider {
 
     @NotNull
     public WebAsyncTaskInfo rollbackTransaction() {
-        DBCExecutionContext context = processor.getExecutionContext();
-        DBCTransactionManager txnManager = DBUtils.getTransactionManager(context);
         WebAsyncTaskProcessor<String> runnable = new WebAsyncTaskProcessor<>() {
             @Override
             public void run(DBRProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
-                if (txnManager != null) {
-                    QMTransactionState txnInfo = QMUtils.getTransactionState(context);
-                    try (DBCSession session = context.openSession(monitor, DBCExecutionPurpose.UTIL, "Rollback transaction")) {
-                        txnManager.rollback(session, null);
-                    } catch (DBCException e) {
-                        throw new InvocationTargetException(e);
-                    }
+                // DBAC: the rollback is recovery - never judged - and releases a blocked context once it worked
+                QMTransactionState txnInfo;
+                try {
+                    txnInfo = DbacEnforcedExecution.rollback(monitor, dbacSource());
+                } catch (DBException e) {
+                    throw new InvocationTargetException(e);
+                }
+                if (txnInfo != null) {
                     result = """
                     Transaction has been rolled back
                     Query count: %s

@@ -44,13 +44,52 @@ DEFAULT_REPORT = (
 REQUIRED_PROPERTY = "dbac.test.postgres.required"
 REQUIRED_VALUE = "true"
 
-# Every class that must reach a real PostgreSQL. Both abort through Assumptions when the database is
-# unusable and the required property is absent, so both have to be counted - checking only one would
-# leave the other free to skip while the summary still printed a PostgreSQL number.
+# Every class that must reach a real PostgreSQL. Each one aborts through Assumptions when the database
+# is unusable and the required property is absent, so every one has to be counted - checking only some
+# would leave the rest free to skip while the summary still printed a PostgreSQL number.
+#
+# The Slice 4a contract and regression-guard classes are here because they run scenarios against a real
+# PostgreSQL target; a skip there would silently drop platform guarantees that enforcement relies on.
+# DeploymentGuardTest holds and loses a real PostgreSQL advisory lock (DG-4, DG-5, DG-6, DG-13), and checks which
+# backend holds it when the lock connection stops answering (DG-14 - DG-20), by pid and backend start together so a
+# reused pid is not taken for the owner (DG-21).
+# The P4 lock classes run their grant-key races on PostgreSQL as well as H2, check user writers against
+# a real PostgreSQL target's locks, and characterize PostgreSQL's identity comparison.
+# MetadataLeasePostgresTest runs the P5-1a lease template on a real pgjdbc connection: the query timeout
+# belongs to the statement there, a timed-out statement is cancelled, and an abort really closes.
+# The P5-F classes run the version 4 quarantine on PostgreSQL - version-only recovery and two concurrent
+# upgrades among it - and the grant fence's user lookup and timeouts against a PostgreSQL metadata schema.
+# TaintRegistryLifecycleTest closes real PostgreSQL execution contexts through the query manager, to prove the
+# production close handler empties the taint registry (TR-2) and keeps a registry failure to itself (TR-10).
+# AuditFailClosedTest writes pre-execution audit rows into a PostgreSQL metadata schema as well as H2: committed
+# and visible before the writer returns, a statement timeout from the audit budget, nothing past the budget kept.
+# EnforcementGateTest runs the gate on a lifecycle of its own over a PostgreSQL metadata schema as well as H2: no
+# metadata connection while it waits for a lock, the rollback before the audit row, the allowed row before the operation.
+# The P6-A classes drive the wired transaction entry points - commit, auto-commit on and the explicit rollback - on
+# real PostgreSQL target connections: what a separate client sees committed, the server backend a severed context
+# leaves, and a rollback the network never answers.
+# The P6-B classes drive the wired Explain entry point on real PostgreSQL target connections: a statement EXPLAIN ANALYZE
+# would run, counted by the sequence it draws from, a lost connection recovered and judged again, and the audit row.
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
     "io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest",
+    "io.cloudbeaver.test.platform.dbac.DbacPlatformContractTest",
+    "io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest",
+    "io.cloudbeaver.test.platform.dbac.DeploymentGuardTest",
+    "io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest",
+    "io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest",
+    "io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest",
+    "io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest",
+    "io.cloudbeaver.test.platform.dbac.DbacFenceMigrationTest",
+    "io.cloudbeaver.test.platform.dbac.UserRecreationTest",
+    "io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest",
+    "io.cloudbeaver.test.platform.dbac.AuditFailClosedTest",
+    "io.cloudbeaver.test.platform.dbac.EnforcementGateTest",
+    "io.cloudbeaver.test.platform.dbac.TransactionEnforcementEntryPointTest",
+    "io.cloudbeaver.test.platform.dbac.TransactionEnforcementAdapterTest",
+    "io.cloudbeaver.test.platform.dbac.ExplainEnforcementEntryPointTest",
+    "io.cloudbeaver.test.platform.dbac.ExplainEnforcementAdapterTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -66,12 +105,37 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.DbacScriptTranslationTest": 9,
     "io.cloudbeaver.test.platform.dbac.DbacSchemaTest": 7,
     "io.cloudbeaver.test.platform.dbac.DbacScriptStatementsTest": 6,
-    "io.cloudbeaver.test.platform.dbac.TempWriteModelTest": 24,
-    "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest": 32,
-    "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest": 18,
-    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest": 47,
-    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest": 67,
-    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest": 13,
+    "io.cloudbeaver.test.platform.dbac.TempWriteModelTest": 25,
+    "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest": 33,
+    "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest": 20,
+    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest": 50,
+    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest": 79,
+    "io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest": 15,
+    "io.cloudbeaver.test.platform.dbac.DbacPlatformContractTest": 17,
+    "io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest": 6,
+    "io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest": 2,
+    "io.cloudbeaver.test.platform.dbac.EnforcementLifecycleTest": 18,
+    "io.cloudbeaver.test.platform.dbac.DeploymentGuardTest": 19,
+    "io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest": 18,
+    "io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest": 14,
+    "io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest": 3,
+    "io.cloudbeaver.test.platform.dbac.MetadataLeaseTest": 21,
+    "io.cloudbeaver.test.platform.dbac.BoundedBorrowTest": 16,
+    "io.cloudbeaver.test.platform.dbac.MetadataDisposalTest": 19,
+    "io.cloudbeaver.test.platform.dbac.MetadataShutdownTest": 22,
+    "io.cloudbeaver.test.platform.dbac.MetadataDeadlineTest": 10,
+    "io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest": 3,
+    "io.cloudbeaver.test.platform.dbac.DbacFenceMigrationTest": 15,
+    "io.cloudbeaver.test.platform.dbac.UserRecreationTest": 8,
+    "io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest": 14,
+    "io.cloudbeaver.test.platform.dbac.AuditFailClosedTest": 12,
+    "io.cloudbeaver.test.platform.dbac.EnforcementGateTest": 35,
+    "io.cloudbeaver.test.platform.dbac.KeyLockRegistryTest": 12,
+    "io.cloudbeaver.test.platform.dbac.MetadataCapacityTest": 5,
+    "io.cloudbeaver.test.platform.dbac.TransactionEnforcementEntryPointTest": 12,
+    "io.cloudbeaver.test.platform.dbac.TransactionEnforcementAdapterTest": 19,
+    "io.cloudbeaver.test.platform.dbac.ExplainEnforcementEntryPointTest": 2,
+    "io.cloudbeaver.test.platform.dbac.ExplainEnforcementAdapterTest": 17,
 }
 
 for _postgres_class in POSTGRES_CLASSES:

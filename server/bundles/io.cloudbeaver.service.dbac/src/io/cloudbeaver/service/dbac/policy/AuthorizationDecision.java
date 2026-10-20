@@ -19,6 +19,7 @@ package io.cloudbeaver.service.dbac.policy;
 import org.jkiss.code.NotNull;
 import org.jkiss.code.Nullable;
 
+import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.Objects;
 
@@ -27,8 +28,15 @@ import java.util.Objects;
  * <p>
  * Phase 2 section 6: "boolean만 반환하지 않는다" - the audit entry and the user-facing message must
  * come from the same decision, not be reconstructed afterwards by a caller who might reach a
- * different conclusion. So the reason, the grant that was applied, when it expires and the audit
- * payload all travel together.
+ * different conclusion. So the reason, the grant that was applied, when it expires, how long it has
+ * left and the audit payload all travel together.
+ * <p>
+ * <b>The remaining lifetime is the database's measurement, not the JVM's.</b> On a write-gated
+ * allow it is {@code EXPIRES_AT - DB_NOW}: the two values of the one statement that decided, taken
+ * from the metadata database and from nothing else. It is what
+ * {@link DbAccessPolicyService.ExpiryWindow} subtracts elapsed time from before a write is let
+ * through. It is not itself a margin: {@link DbAccessPolicyService#authorize} still allows a grant
+ * with a microsecond left, and the window is what refuses to spend it.
  * <p>
  * <b>The invariants are enforced, not documented.</b> An ALLOW cannot carry a denial reason and a
  * DENY cannot be built without one. That is checked in the constructor so a wrong pairing fails
@@ -46,7 +54,8 @@ public record AuthorizationDecision(
     @NotNull DbOperationCategory operationCategory,
     @Nullable String appliedGrantId,
     @Nullable OffsetDateTime expiresAt,
-    @Nullable AuthorizationAuditPayload auditPayload
+    @Nullable AuthorizationAuditPayload auditPayload,
+    @Nullable Duration remainingLifetime
 ) {
     /**
      * Rejects every combination that is not one of the three legal shapes
@@ -57,16 +66,19 @@ public record AuthorizationDecision(
      * would be indistinguishable from one this class produced. A shape check in the factories alone
      * would be a convention, not an invariant.
      * <ol>
-     *   <li><b>A write-gated allow</b> names its key, its grant and its expiry, and carries an audit
-     *       payload that agrees with all of them. Nothing may be missing: an allow that cannot say
-     *       when it stops being valid is not an authorization, and an allow with no payload cannot
-     *       be recorded.</li>
+     *   <li><b>A write-gated allow</b> names its key, its grant and its expiry, carries an audit
+     *       payload that agrees with all of them, and carries a remaining lifetime that is strictly
+     *       positive. Nothing may be missing: an allow that cannot say when it stops being valid is
+     *       not an authorization, an allow with no payload cannot be recorded, and an allow with no
+     *       lifetime left - or none stated - gives the expiry window nothing to measure against.</li>
      *   <li><b>A recovery allow</b> is a rollback and nothing else. It carries the recovery
-     *       sentinel, no key, no expiry and no payload, because no permission was consulted. The
+     *       sentinel, no key, no expiry, no remaining lifetime and no payload, because no permission
+     *       was consulted. The
      *       sentinel is refused on every other category, so a rollback cannot be forged into an
      *       allow for a write by relabelling the category.</li>
-     *   <li><b>A denial</b> says why. Once a key is known it must also carry a payload that agrees
-     *       with the decision; only a denial taken before the key exists may omit both.</li>
+     *   <li><b>A denial</b> says why, and carries no remaining lifetime, because it authorizes
+     *       nothing. Once a key is known it must also carry a payload that agrees with the decision;
+     *       only a denial taken before the key exists may omit both.</li>
      * </ol>
      */
     public AuthorizationDecision {
@@ -81,10 +93,10 @@ public record AuthorizationDecision(
                 throw new IllegalArgumentException("An allow cannot carry a denial reason, got " + denialReason);
             }
             if (RECOVERY_GRANT_ID.equals(appliedGrantId)) {
-                requireRecoveryShape(operationCategory, key, expiresAt, auditPayload);
+                requireRecoveryShape(operationCategory, key, expiresAt, auditPayload, remainingLifetime);
             } else {
                 requireWriteAllowShape(decision, denialReason, key, operationCategory,
-                    appliedGrantId, expiresAt, auditPayload);
+                    appliedGrantId, expiresAt, auditPayload, remainingLifetime);
             }
         } else {
             if (denialReason == null) {
@@ -92,6 +104,10 @@ public record AuthorizationDecision(
             }
             if (RECOVERY_GRANT_ID.equals(appliedGrantId)) {
                 throw new IllegalArgumentException("A denial cannot claim the recovery grant");
+            }
+            if (remainingLifetime != null) {
+                throw new IllegalArgumentException(
+                    "A denial authorizes nothing, so it carries no remaining lifetime, got " + remainingLifetime);
             }
             requireDenialShape(decision, denialReason, key, operationCategory,
                 appliedGrantId, expiresAt, auditPayload);
@@ -102,7 +118,8 @@ public record AuthorizationDecision(
         @NotNull DbOperationCategory category,
         @Nullable DbAccessKey key,
         @Nullable OffsetDateTime expiresAt,
-        @Nullable AuthorizationAuditPayload payload
+        @Nullable AuthorizationAuditPayload payload,
+        @Nullable Duration remainingLifetime
     ) {
         if (category != DbOperationCategory.TRANSACTION_ROLLBACK) {
             throw new IllegalArgumentException(
@@ -111,6 +128,10 @@ public record AuthorizationDecision(
         if (key != null || expiresAt != null || payload != null) {
             throw new IllegalArgumentException(
                 "A recovery allow consults no permission, so it carries no key, expiry or audit payload");
+        }
+        if (remainingLifetime != null) {
+            throw new IllegalArgumentException(
+                "A recovery allow consults no grant, so it carries no remaining lifetime, got " + remainingLifetime);
         }
     }
 
@@ -121,7 +142,8 @@ public record AuthorizationDecision(
         @NotNull DbOperationCategory category,
         @Nullable String grantId,
         @Nullable OffsetDateTime expiresAt,
-        @Nullable AuthorizationAuditPayload payload
+        @Nullable AuthorizationAuditPayload payload,
+        @Nullable Duration remainingLifetime
     ) {
         // A grant only ever permits a category the write gate governs. An allow on a category that
         // never needed one - a container read, a grouping query - would be a permission granted for
@@ -147,6 +169,16 @@ public record AuthorizationDecision(
         }
         if (expiresAt == null) {
             throw new IllegalArgumentException("An allow must say when it stops being valid");
+        }
+        // How long the allow has left, as the database measured it. Absent, the expiry window has
+        // nothing to subtract elapsed time from; zero or negative, the grant has already run out,
+        // which no statement that called it unexpired can have measured.
+        if (remainingLifetime == null) {
+            throw new IllegalArgumentException("An allow must carry the remaining lifetime the database measured");
+        }
+        if (remainingLifetime.isNegative() || remainingLifetime.isZero()) {
+            throw new IllegalArgumentException(
+                "An allow's remaining lifetime must be positive, got " + remainingLifetime);
         }
         if (payload == null) {
             throw new IllegalArgumentException("An allow must carry the audit payload that records it");
@@ -263,7 +295,7 @@ public record AuthorizationDecision(
         @NotNull DenialReason reason,
         @NotNull DbOperationCategory category
     ) {
-        return new AuthorizationDecision(DbAccessDecision.DENY, reason, null, category, null, null, null);
+        return new AuthorizationDecision(DbAccessDecision.DENY, reason, null, category, null, null, null, null);
     }
 
     /**
@@ -279,22 +311,28 @@ public record AuthorizationDecision(
     ) {
         return new AuthorizationDecision(
             DbAccessDecision.DENY, reason, key, category, grantId, expiresAt,
-            AuthorizationAuditPayload.of(DbAccessDecision.DENY, reason, key, grantId, category, expiresAt));
+            AuthorizationAuditPayload.of(DbAccessDecision.DENY, reason, key, grantId, category, expiresAt),
+            null);
     }
 
     /**
      * The single allow
+     *
+     * @param remainingLifetime {@code EXPIRES_AT - DB_NOW} from the snapshot that decided; strictly
+     *     positive, or the constructor refuses it
      */
     @NotNull
     static AuthorizationDecision allow(
         @NotNull DbAccessKey key,
         @NotNull DbOperationCategory category,
         @NotNull String grantId,
-        @NotNull OffsetDateTime expiresAt
+        @NotNull OffsetDateTime expiresAt,
+        @NotNull Duration remainingLifetime
     ) {
         return new AuthorizationDecision(
             DbAccessDecision.ALLOW, null, key, category, grantId, expiresAt,
-            AuthorizationAuditPayload.of(DbAccessDecision.ALLOW, null, key, grantId, category, expiresAt));
+            AuthorizationAuditPayload.of(DbAccessDecision.ALLOW, null, key, grantId, category, expiresAt),
+            remainingLifetime);
     }
 
     /**
@@ -307,7 +345,7 @@ public record AuthorizationDecision(
     @NotNull
     static AuthorizationDecision allowRecovery(@NotNull DbOperationCategory category) {
         return new AuthorizationDecision(
-            DbAccessDecision.ALLOW, null, null, category, RECOVERY_GRANT_ID, null, null);
+            DbAccessDecision.ALLOW, null, null, category, RECOVERY_GRANT_ID, null, null, null);
     }
 
     /**

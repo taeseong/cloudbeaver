@@ -47,10 +47,16 @@ public record DbAccessKey(
     }
 
     /**
-     * A form safe to put in a log or an audit row
+     * The three ids joined with {@code /}, unescaped
      * <p>
-     * All three parts are identifiers the server already stores in plain text; none of them is a
-     * credential or a host address.
+     * None of the three parts is a credential or an endpoint: they are identifiers the server
+     * already stores in plain text. They are still not safe to write raw into an unstructured log.
+     * A user id comes from the caller and the project and connection ids from configuration, and
+     * nothing stops any of them containing a control character such as CR or LF, or a log field
+     * delimiter such as {@code ]}, {@code =} or {@code /}. Written as they are, such an id can break
+     * the entry into several lines or forge a field. Each part has to be escaped or encoded on its
+     * own before it goes into an unstructured log; {@code DbAccessPolicyService} URL-encodes each
+     * part separately for exactly this reason.
      */
     @NotNull
     public String describe() {

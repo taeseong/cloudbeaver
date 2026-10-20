@@ -20,10 +20,6 @@ import io.cloudbeaver.service.dbac.db.DbacSchemaConstants;
 import io.cloudbeaver.service.dbac.tempwrite.EndpointSnapshot;
 import org.jkiss.code.NotNull;
 
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
 import java.time.OffsetDateTime;
 
 /**
@@ -61,13 +57,18 @@ import java.time.OffsetDateTime;
  * <p>
  * So running this statement inside a long transaction would hand it the instant that transaction
  * began, and an expired grant would stay alive for as long as the transaction did. It is issued on a
- * connection in auto-commit, and the caller is refused if that is not the case. If either engine's
+ * connection in auto-commit, and a lease refuses to run it on one that is not. If either engine's
  * behaviour ever changes, the test named above fails and this requirement can be revisited - which
  * is the point of measuring it rather than writing it down.
  * <p>
  * <b>Portability.</b> Only constructs common to H2 and PostgreSQL are used: a derived table with an
  * alias, {@code LEFT JOIN}, {@code CASE}, and {@code CURRENT_TIMESTAMP}. No dialect functions, no
  * interval arithmetic, and every key value is bound as a parameter rather than concatenated.
+ * <p>
+ * <b>Through a lease, within a budget.</b> The statement runs on a {@link MetadataLease}: its whole
+ * budget, borrow included, is the query timeout, the timeout is put back before a value is returned,
+ * and the decision is taken from values already copied out of the driver, inside the {@code try}
+ * block, before the lease is closed.
  */
 final class PolicySnapshotRepository {
 
@@ -86,8 +87,7 @@ final class PolicySnapshotRepository {
      * The single authorization statement
      * <p>
      * {@code {table_prefix}} is substituted by {@code InternalProxyConnection.prepareStatement}, which
-     * is why the connection must come from {@code CBDatabase.openConnection()} and not from a raw
-     * data source.
+     * is why the leases must wrap {@code CBDatabase.openConnection()} and not a raw data source.
      */
     private static final String SNAPSHOT_QUERY =
         "SELECT n.DB_NOW,"
@@ -114,57 +114,99 @@ final class PolicySnapshotRepository {
     }
 
     /**
-     * Reads the snapshot for one key
+     * What one read produced: a snapshot, or a reason there is none
+     */
+    sealed interface SnapshotRead permits SnapshotRead.Read, SnapshotRead.Unusable {
+        /**
+         * The snapshot
+         *
+         * @param snapshot what the statement returned
+         */
+        record Read(@NotNull PolicySnapshot snapshot) implements SnapshotRead {
+        }
+
+        /**
+         * No snapshot; the store could not be read
+         *
+         * @param cause which step of the lease failed
+         */
+        record Unusable(@NotNull UnusableCause cause) implements SnapshotRead {
+        }
+    }
+
+    /**
+     * Reads the snapshot for one key, on one lease from {@code leases}, within {@code budget}
      *
-     * @throws SQLException propagated, never converted to an empty snapshot. The caller turns it
-     *     into {@code PERMISSION_STORE_UNAVAILABLE}; a repository that returned "nothing found" for
-     *     an outage would make an outage indistinguishable from a revocation.
-     * @throws IllegalStateException if the connection is not in auto-commit, because the clock this
-     *     statement returns would then belong to a transaction that started at an unknown time
+     * @return the snapshot, or {@code Unusable} - never "nothing found". The caller turns an unusable
+     *     read into {@code PERMISSION_STORE_UNAVAILABLE}; a repository that returned "no grant" for an
+     *     outage would make an outage indistinguishable from a revocation.
+     * @throws MetadataUnavailableException when no lease could be had
      */
     @NotNull
-    static PolicySnapshot read(@NotNull Connection connection, @NotNull DbAccessKey key) throws SQLException {
-        if (!connection.getAutoCommit()) {
-            throw new IllegalStateException(
-                "The authorization snapshot must run in auto-commit; on both supported engines"
-                    + " CURRENT_TIMESTAMP is pinned to the start of an enclosing transaction, which would"
-                    + " hand this statement a clock older than the decision it is about");
-        }
-        try (PreparedStatement dbStat = connection.prepareStatement(SNAPSHOT_QUERY)) {
-            dbStat.setString(1, key.userId());
-            dbStat.setString(2, key.userId());
-            dbStat.setString(3, key.projectId());
-            dbStat.setString(4, key.connectionId());
-            try (ResultSet dbResult = dbStat.executeQuery()) {
-                if (!dbResult.next()) {
-                    // The anchor is a one-row derived table, so this cannot happen against a healthy
-                    // database. Treated as a store failure rather than as "no grant".
-                    throw new SQLException("The DBAC authorization snapshot returned no row");
-                }
-                OffsetDateTime dbNow = dbResult.getObject("DB_NOW", OffsetDateTime.class);
-                if (dbNow == null) {
-                    throw new SQLException("The DBAC authorization snapshot returned no database clock");
-                }
-                boolean userRowPresent = dbResult.getString("FOUND_USER") != null;
-                boolean userActive = ACTIVE_FLAG.equals(dbResult.getString("IS_ACTIVE"));
-                String grantId = dbResult.getString("GRANT_ID");
-                OffsetDateTime expiresAt = dbResult.getObject("EXPIRES_AT", OffsetDateTime.class);
-                OffsetDateTime revokedAt = dbResult.getObject("REVOKED_AT", OffsetDateTime.class);
-                boolean notExpired = dbResult.getInt("NOT_EXPIRED") == 1;
-                // Null whenever any part is missing, which is what a row written by schema
-                // version 2 looks like. Never partially populated: comparing a subset of the
-                // identity is how the port succession this column set exists to catch got through.
-                EndpointSnapshot stored = grantId == null ? null : EndpointSnapshot.ofStored(
-                    dbResult.getString("PROVIDER_ID"),
-                    dbResult.getString("DRIVER_ID"),
-                    dbResult.getString("CONFIGURATION_TYPE"),
-                    dbResult.getString("HOST_SNAPSHOT"),
-                    dbResult.getString("PORT_SNAPSHOT"),
-                    dbResult.getString("DATABASE_SNAPSHOT"));
-                return new PolicySnapshot(
-                    dbNow, userRowPresent, userActive, grantId, expiresAt, revokedAt, notExpired, stored);
+    static SnapshotRead read(
+        @NotNull MetadataLeaseSource leases,
+        @NotNull MetadataBudget budget,
+        @NotNull DbAccessKey key
+    ) throws MetadataUnavailableException {
+        try (MetadataLease lease = leases.open(budget, MetadataPurpose.SNAPSHOT)) {
+            MetadataOutcome<MetadataRows> outcome = lease.query(query(key));
+            if (outcome instanceof MetadataOutcome.Done<MetadataRows> done) {
+                return new SnapshotRead.Read(toSnapshot(done.value().row(0)));
             }
+            return new SnapshotRead.Unusable(((MetadataOutcome.Unusable<MetadataRows>) outcome).cause());
         }
+    }
+
+    /**
+     * The statement for one key, with the columns it is read as
+     * <p>
+     * Exactly one row: the anchor is a one-row derived table, so anything else is a store failure, never
+     * "no grant". {@code DB_NOW} cannot be null for the same reason.
+     */
+    @NotNull
+    private static MetadataQuery query(@NotNull DbAccessKey key) {
+        return MetadataQuery.sql(SNAPSHOT_QUERY)
+            .bindString(key.userId())
+            .bindString(key.userId())
+            .bindString(key.projectId())
+            .bindString(key.connectionId())
+            .columnTimestamp("DB_NOW", false)
+            .columnString("FOUND_USER", true)
+            .columnString("IS_ACTIVE", true)
+            .columnString("GRANT_ID", true)
+            .columnTimestamp("EXPIRES_AT", true)
+            .columnTimestamp("REVOKED_AT", true)
+            .columnString("PROVIDER_ID", true)
+            .columnString("DRIVER_ID", true)
+            .columnString("CONFIGURATION_TYPE", true)
+            .columnString("HOST_SNAPSHOT", true)
+            .columnString("PORT_SNAPSHOT", true)
+            .columnString("DATABASE_SNAPSHOT", true)
+            .columnInt("NOT_EXPIRED")
+            .expectRows(1, 1)
+            .build();
+    }
+
+    @NotNull
+    private static PolicySnapshot toSnapshot(@NotNull MetadataRow row) {
+        OffsetDateTime dbNow = row.timestamp("DB_NOW");
+        boolean userRowPresent = row.string("FOUND_USER") != null;
+        boolean userActive = ACTIVE_FLAG.equals(row.string("IS_ACTIVE"));
+        String grantId = row.string("GRANT_ID");
+        OffsetDateTime expiresAt = row.timestamp("EXPIRES_AT");
+        OffsetDateTime revokedAt = row.timestamp("REVOKED_AT");
+        boolean notExpired = row.integer("NOT_EXPIRED") == 1;
+        // Null whenever any part is missing, which is what a row written by schema
+        // version 2 looks like. Never partially populated: comparing a subset of the
+        // identity is how the port succession this column set exists to catch got through.
+        EndpointSnapshot stored = grantId == null ? null : EndpointSnapshot.ofStored(
+            row.string("PROVIDER_ID"),
+            row.string("DRIVER_ID"),
+            row.string("CONFIGURATION_TYPE"),
+            row.string("HOST_SNAPSHOT"),
+            row.string("PORT_SNAPSHOT"),
+            row.string("DATABASE_SNAPSHOT"));
+        return new PolicySnapshot(dbNow, userRowPresent, userActive, grantId, expiresAt, revokedAt, notExpired, stored);
     }
 
 }

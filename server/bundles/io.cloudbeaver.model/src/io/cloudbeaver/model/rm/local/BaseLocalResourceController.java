@@ -45,6 +45,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.function.Predicate;
 
 public abstract class BaseLocalResourceController implements RMController {
@@ -103,6 +105,28 @@ public abstract class BaseLocalResourceController implements RMController {
             () -> {
                 log.debug("Updating value for property '" + propName + "' in project '" + projectId + "'");
                 webProject.setProjectProperty(propName, propValue);
+                return null;
+            }
+        );
+    }
+
+    /**
+     * Sets several project properties in one write of the project metadata.
+     * <p>
+     * DBeaver's moving {@code RMController} added this bulk setter; older DBeaver revisions do not declare it. This fork
+     * has to build against both, so there is deliberately no {@code @Override}: on a new revision this method implements
+     * the interface, on an old one it is an ordinary public method. The work is done by the project's existing
+     * {@code BaseProjectImpl.setProjectProperties}.
+     */
+    public void setProjectProperties(
+        @NotNull String projectId,
+        @NotNull Map<String, Object> properties
+    ) throws DBException {
+        Objects.requireNonNull(properties, "properties");
+        RMLocalProject webProject = getWebProject(projectId, false);
+        doFileWriteOperation(projectId, webProject.getMetadataFilePath(),
+            () -> {
+                webProject.setProjectProperties(properties);
                 return null;
             }
         );

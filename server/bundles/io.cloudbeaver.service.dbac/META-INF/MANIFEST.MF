@@ -14,5 +14,6 @@ Require-Bundle: io.cloudbeaver.model,
 Export-Package: io.cloudbeaver.service.dbac,
  io.cloudbeaver.service.dbac.tempwrite;x-friends:="io.cloudbeaver.test.platform",
  io.cloudbeaver.service.dbac.policy;x-friends:="io.cloudbeaver.test.platform",
+ io.cloudbeaver.service.dbac.policy.enforcement;x-friends:="io.cloudbeaver.test.platform",
  io.cloudbeaver.service.dbac.db
 Automatic-Module-Name: io.cloudbeaver.service.dbac

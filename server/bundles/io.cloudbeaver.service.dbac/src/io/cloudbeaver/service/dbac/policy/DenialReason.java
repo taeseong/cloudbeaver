@@ -161,8 +161,11 @@ public enum DenialReason {
     GRANT_SUPERSEDED("dbac.denied.superseded", "Temporary write access was replaced."),
 
     /**
-     * Reserved for the audit layer (Phase 2 section 11.1). Not produced in this slice, because
-     * nothing writes {@code DBAC_AUDIT_EVENT} yet.
+     * The pre-execution audit row was not recorded (Phase 2 section 11.1)
+     * <p>
+     * Never produced by the policy core. The enforcement gate produces it when
+     * {@code AccessAuditWriter} does not report the {@code WRITE_ALLOWED} row as recorded, and refuses
+     * the write before the platform is called. No production entry point calls the gate yet.
      */
     AUDIT_WRITE_FAILED("dbac.denied.audit_failed", "Write access cannot be recorded right now."),
 

@@ -19,8 +19,8 @@ package io.cloudbeaver.service.dbac.tempwrite;
 /**
  * Why a mutation was refused without changing anything
  * <p>
- * Both values mean the same thing to the caller - nothing was written, the current row and the
- * history are exactly as they were - and differ only in what the coordinator observed.
+ * Every value means the same thing to the caller - nothing was written, the current row and the
+ * history are exactly as they were - and they differ only in what the coordinator observed.
  */
 public enum TempWriteConflictReason {
 
@@ -41,5 +41,29 @@ public enum TempWriteConflictReason {
      * timeout, a deadlock - repeated past the retry limit. Fail-closed: the request fails and
      * nothing is left half applied.
      */
-    TRANSIENT_RETRY_EXHAUSTED
+    TRANSIENT_RETRY_EXHAUSTED,
+
+    /**
+     * The grant's user does not exist.
+     * <p>
+     * Observed inside the attempt's own transaction while the user's read lock was held, so no
+     * deletion could have been in progress. Not retried: a user that is missing under the lock stays
+     * missing.
+     */
+    USER_MISSING,
+
+    /**
+     * The user's read lock could not be taken within the key lock timeout.
+     * <p>
+     * A deletion or deactivation of that user was holding it. No metadata connection was opened.
+     */
+    USER_LOCK_TIMEOUT,
+
+    /**
+     * The thread was interrupted while waiting for the user's read lock.
+     * <p>
+     * No metadata connection was opened, and the interrupt is set again before the coordinator
+     * returns.
+     */
+    USER_LOCK_INTERRUPTED
 }

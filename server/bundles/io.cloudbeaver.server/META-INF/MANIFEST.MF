@@ -15,7 +15,9 @@ Require-Bundle: org.jkiss.dbeaver.model.sql;visibility:=reexport,
  org.jkiss.dbeaver.net.ssh,
  io.cloudbeaver.model;visibility:=reexport,
  io.cloudbeaver.model.cli,
- io.cloudbeaver.service.security;visibility:=reexport
+ io.cloudbeaver.service.security;visibility:=reexport,
+ io.cloudbeaver.service.dbac,
+ org.jkiss.dbeaver.model.jdbc
 Export-Package: io.cloudbeaver,
  io.cloudbeaver.model,
  io.cloudbeaver.model.app,

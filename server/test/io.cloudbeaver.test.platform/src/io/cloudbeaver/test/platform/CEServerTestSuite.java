@@ -23,22 +23,49 @@ import io.cloudbeaver.model.rm.RMNIOTest;
 import io.cloudbeaver.model.rm.lock.RMLockTest;
 import io.cloudbeaver.model.session.WebSessionProjectTest;
 import io.cloudbeaver.model.session.WebSessionTest;
+import io.cloudbeaver.service.dbac.policy.enforcement.DeploymentGuard;
 import io.cloudbeaver.test.platform.admin.AdminCreateUserTest;
 import io.cloudbeaver.test.platform.admin.AdminLastLoginTimeTest;
+import io.cloudbeaver.test.platform.dbac.AuditFailClosedTest;
+import io.cloudbeaver.test.platform.dbac.BoundedBorrowTest;
 import io.cloudbeaver.test.platform.dbac.DbAccessPolicyModelTest;
 import io.cloudbeaver.test.platform.dbac.DbAccessPolicyPostgresTest;
 import io.cloudbeaver.test.platform.dbac.DbAccessPolicyTest;
+import io.cloudbeaver.test.platform.dbac.DbacFenceMigrationTest;
+import io.cloudbeaver.test.platform.dbac.DbacPlatformContractTest;
 import io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest;
 import io.cloudbeaver.test.platform.dbac.DbacSchemaRecoveryTest;
 import io.cloudbeaver.test.platform.dbac.DbacSchemaTest;
 import io.cloudbeaver.test.platform.dbac.DbacScriptStatementsTest;
 import io.cloudbeaver.test.platform.dbac.DbacScriptTranslationTest;
+import io.cloudbeaver.test.platform.dbac.DeploymentGuardTest;
+import io.cloudbeaver.test.platform.dbac.EnforcementGateTest;
+import io.cloudbeaver.test.platform.dbac.EnforcementLifecycleTest;
+import io.cloudbeaver.test.platform.dbac.EnforcementRegressionGuardTest;
+import io.cloudbeaver.test.platform.dbac.ExceptionRedactionTest;
+import io.cloudbeaver.test.platform.dbac.ExplainEnforcementAdapterTest;
+import io.cloudbeaver.test.platform.dbac.ExplainEnforcementEntryPointTest;
+import io.cloudbeaver.test.platform.dbac.GrantRevokeRaceTest;
+import io.cloudbeaver.test.platform.dbac.KeyLockRegistryTest;
+import io.cloudbeaver.test.platform.dbac.LockIdentityCharacterizationTest;
+import io.cloudbeaver.test.platform.dbac.MetadataCapacityTest;
+import io.cloudbeaver.test.platform.dbac.MetadataDeadlineTest;
+import io.cloudbeaver.test.platform.dbac.MetadataDisposalTest;
+import io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest;
+import io.cloudbeaver.test.platform.dbac.MetadataLeaseTest;
+import io.cloudbeaver.test.platform.dbac.MetadataShutdownTest;
+import io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteModelTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryTest;
+import io.cloudbeaver.test.platform.dbac.TransactionEnforcementAdapterTest;
+import io.cloudbeaver.test.platform.dbac.TransactionEnforcementEntryPointTest;
+import io.cloudbeaver.test.platform.dbac.UserDeactivationRaceTest;
+import io.cloudbeaver.test.platform.dbac.UserRecreationTest;
 import io.cloudbeaver.test.platform.sql.*;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.platform.suite.api.BeforeSuite;
 import org.junit.platform.suite.api.SelectClasses;
 import org.junit.platform.suite.api.Suite;
 
@@ -72,10 +99,57 @@ import org.junit.platform.suite.api.Suite;
         DbAccessPolicyModelTest.class,
         DbAccessPolicyTest.class,
         DbAccessPolicyPostgresTest.class,
-        TempWriteRepositoryPostgresTest.class
+        TempWriteRepositoryPostgresTest.class,
+        DbacPlatformContractTest.class,
+        EnforcementRegressionGuardTest.class,
+        ExceptionRedactionTest.class,
+        EnforcementLifecycleTest.class,
+        DeploymentGuardTest.class,
+        GrantRevokeRaceTest.class,
+        UserDeactivationRaceTest.class,
+        LockIdentityCharacterizationTest.class,
+        MetadataLeaseTest.class,
+        BoundedBorrowTest.class,
+        MetadataDisposalTest.class,
+        MetadataShutdownTest.class,
+        MetadataDeadlineTest.class,
+        MetadataLeasePostgresTest.class,
+        DbacFenceMigrationTest.class,
+        UserRecreationTest.class,
+        TaintRegistryLifecycleTest.class,
+        AuditFailClosedTest.class,
+        EnforcementGateTest.class,
+        KeyLockRegistryTest.class,
+        MetadataCapacityTest.class,
+        TransactionEnforcementEntryPointTest.class,
+        TransactionEnforcementAdapterTest.class,
+        ExplainEnforcementEntryPointTest.class,
+        ExplainEnforcementAdapterTest.class
     }
 )
 public class CEServerTestSuite {
+
+    /**
+     * Acknowledges the test deployment before the first test class starts the server
+     * <p>
+     * The DBAC deployment guard admits the policy service only when {@code dbac.deployment} is
+     * acknowledged, and the test server's in-memory metadata database only in test mode. The suite
+     * engine runs {@code @BeforeSuite} before any selected class, so this precedes the first class's
+     * {@code @BeforeAll}, which is what starts the server; the suite's own {@code @BeforeAll} below is
+     * never run by the suite engine. The value is not restored: the server runs for the whole JVM and
+     * the guard checks that the value does not change. A different value already set fails the run
+     * rather than being overwritten.
+     */
+    @BeforeSuite
+    public static void acknowledgeTestDeployment() {
+        String current = System.getProperty(DeploymentGuard.DEPLOYMENT_PROPERTY);
+        if (current == null) {
+            System.setProperty(DeploymentGuard.DEPLOYMENT_PROPERTY, DeploymentGuard.MODE_TEST);
+        } else if (!DeploymentGuard.MODE_TEST.equals(current)) {
+            throw new IllegalStateException(
+                DeploymentGuard.DEPLOYMENT_PROPERTY + " is already set to a value other than test; the suite runs only in test mode");
+        }
+    }
 
     @BeforeAll
     public static void startServer() throws Exception {

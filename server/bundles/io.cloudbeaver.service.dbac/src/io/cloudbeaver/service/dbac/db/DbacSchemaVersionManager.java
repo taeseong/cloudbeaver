@@ -35,6 +35,7 @@ import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Savepoint;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * Version manager of the fork owned DBAC metadata schema.
@@ -77,6 +78,17 @@ import java.util.List;
  * {@link DbacSchemaConstants#OBSOLETE_SCHEMA_VERSION} must stay at 0 for this to be safe: version 0 would
  * otherwise satisfy {@code currentSchemaVersion < schemaVersionObsolete} in {@code SQLSchemaManager} and
  * trigger {@code dropSchema}, which runs {@code DROP ALL OBJECTS}.
+ *
+ * <h2>Version 4: the quarantine</h2>
+ * Recording {@link DbacSchemaConstants#USER_FENCE_SINCE_VERSION} is the one step that changes data: in the
+ * same transaction it revokes every grant that is not already revoked and writes a {@code REVOKED} event for
+ * each. Every route to version 4 records it here - an upgrade from version 3 (also the last step of one from
+ * version 1 or 2), PostgreSQL version-only recovery, H2 replay and a new installation, where there is nothing
+ * to revoke - and a start on a version 4 database records nothing, so the quarantine never runs twice. A
+ * version 3 build refuses a version 4 database, see {@link #getCurrentSchemaVersion}.
+ * <p>
+ * The quarantine writes nothing before it holds a savepoint of its own, and takes every failure back to it itself
+ * rather than leaving that to the runner: see {@link #enterFenceEra}.
  */
 public class DbacSchemaVersionManager implements SQLSchemaVersionManager {
 
@@ -86,6 +98,60 @@ public class DbacSchemaVersionManager implements SQLSchemaVersionManager {
     private static final String SQL_STATE_UNIQUE_VIOLATION = "23505";
 
     private static final String SAVEPOINT_NAME = "dbac_version_insert";
+    /** The savepoint the fence takes before it writes anything, and takes every failure back to */
+    private static final String FENCE_SAVEPOINT_NAME = "dbac_fence_v4";
+
+    /** Logged when the fence version cannot be recorded by this transaction */
+    static final String EVENT_FENCE_VERSION_REFUSED = "DBAC_SCHEMA_FENCE_VERSION_REFUSED";
+    /** Logged when the version 4 quarantine fails */
+    static final String EVENT_FENCE_QUARANTINE_FAILED = "DBAC_SCHEMA_FENCE_QUARANTINE_FAILED";
+    /** Logged for each step of taking the fence's writes back that fails */
+    static final String EVENT_FENCE_UNDO_FAILED = "DBAC_SCHEMA_FENCE_UNDO_FAILED";
+
+    /** Who the version 4 quarantine records as having revoked a legacy grant, in the row and in its history event */
+    public static final String FENCE_ACTOR = "<dbac-fence-v4>";
+    /** Why, in the row and in its history event */
+    public static final String FENCE_REASON = "quarantined when the user-incarnation fence was introduced";
+
+    private static final String FENCE_NEEDS_TRANSACTION =
+        "DBAC records schema version 4 only inside the migration transaction; nothing was changed";
+    private static final String FENCE_NEEDS_SAVEPOINT =
+        "DBAC records schema version 4 only under a savepoint of the migration transaction; nothing was changed";
+    private static final String FENCE_VERSION_REFUSED =
+        "DBAC could not record schema version 4 in this transaction; no grant was changed";
+    private static final String FENCE_QUARANTINE_FAILED =
+        "DBAC could not quarantine the legacy TEMP_WRITE grants; the version 4 migration is rolled back";
+
+    private static final String CURRENT_TABLE = "{table_prefix}" + DbacSchemaConstants.TABLE_TW_CURRENT;
+    private static final String HISTORY_TABLE = "{table_prefix}" + DbacSchemaConstants.TABLE_TW_HISTORY;
+
+    private static final String INSERT_VERSION = "INSERT INTO {table_prefix}" + DbacSchemaConstants.VERSION_TABLE_NAME
+        + " (MODULE_ID,VERSION,UPDATE_TIME) VALUES(?,?,CURRENT_TIMESTAMP)";
+
+    /** Every grant the quarantine revokes, in key order */
+    private static final String SELECT_UNREVOKED = "SELECT USER_ID, PROJECT_ID, CONNECTION_ID, REVISION FROM " + CURRENT_TABLE
+        + " WHERE REVOKED_AT IS NULL ORDER BY USER_ID, PROJECT_ID, CONNECTION_ID";
+
+    /** One grant revoked by compare-and-set on its revision */
+    private static final String REVOKE_LEGACY = "UPDATE " + CURRENT_TABLE
+        + " SET REVISION=?, REVOKED_AT=CURRENT_TIMESTAMP, REVOKED_BY=?, REVOKE_REASON=?"
+        + " WHERE USER_ID=? AND PROJECT_ID=? AND CONNECTION_ID=? AND REVISION=? AND REVOKED_AT IS NULL";
+
+    /**
+     * Its REVOKED event, copied from the row as revoked
+     * <p>
+     * The bound values in the select list are cast so that both engines know their type when the statement
+     * is prepared. {@code 'REVOKED'} is {@code TempWriteChangeType.REVOKED}, written out because a migration
+     * must not change when that enum does.
+     */
+    private static final String RECORD_LEGACY_REVOCATION = "INSERT INTO " + HISTORY_TABLE
+        + " (EVENT_ID, GRANT_ID, CHANGE_TYPE, CHANGE_TIME, USER_ID, PROJECT_ID, CONNECTION_ID, ACTOR_ID, EXPIRES_AT, REASON, REVISION)"
+        + " SELECT CAST(? AS VARCHAR(128)), GRANT_ID, 'REVOKED', REVOKED_AT, USER_ID, PROJECT_ID, CONNECTION_ID,"
+        + " CAST(? AS VARCHAR(128)), EXPIRES_AT, CAST(? AS VARCHAR(1000)), REVISION FROM " + CURRENT_TABLE
+        + " WHERE USER_ID=? AND PROJECT_ID=? AND CONNECTION_ID=? AND REVISION=?";
+
+    /** The check that nothing was left unrevoked */
+    private static final String COUNT_UNREVOKED = "SELECT COUNT(*) FROM " + CURRENT_TABLE + " WHERE REVOKED_AT IS NULL";
 
     private final int currentSchemaVersion;
     private final String schemaId;
@@ -265,6 +331,18 @@ public class DbacSchemaVersionManager implements SQLSchemaVersionManager {
      * A lost insert race is recognised by SQLSTATE {@code 23505} only, is undone through a savepoint so
      * the surrounding PostgreSQL transaction stays usable, and is accepted only when the row the winner
      * wrote carries exactly the target version. Every other SQLException is propagated unchanged.
+     * <p>
+     * <b>The fence version is recorded strictly.</b> Recording
+     * {@link DbacSchemaConstants#USER_FENCE_SINCE_VERSION} revokes every legacy grant in the same
+     * transaction (see {@link #enterFenceEra}), so it is never adopted from somebody else:
+     * <pre>
+     *   row VERSION = 3        -> UPDATE matches 1 row                       -> recorded, then quarantine
+     *   no row                 -> UPDATE matches 0 rows -> INSERT succeeds   -> recorded, then quarantine
+     *   any other row          -> UPDATE matches 0 rows                      -> FAIL CLOSED, no grant read
+     *   no row, lost insert    -> UPDATE 0 rows -> INSERT 23505              -> FAIL CLOSED, no grant read
+     * </pre>
+     * The last two are what a node that lost a concurrent upgrade sees once the winner has committed; it
+     * fails to start, and its next start finds version 4 and does nothing.
      */
     @Override
     public void updateCurrentSchemaVersion(
@@ -298,11 +376,300 @@ public class DbacSchemaVersionManager implements SQLSchemaVersionManager {
             DbacSchemaValidator.validate(connection, schema);
         }
 
+        if (version == DbacSchemaConstants.USER_FENCE_SINCE_VERSION) {
+            enterFenceEra(connection, schema);
+            return;
+        }
+
         // Sequential migration: version N is only ever reached from N-1.
         if (compareAndSetVersion(connection, version - 1, version) == 1) {
             return;
         }
         insertVersionRow(connection, schema, version);
+    }
+
+    /**
+     * Records the fence version and quarantines every legacy grant, in the migration runner's transaction
+     * <p>
+     * Order inside the transaction, each step required to succeed:
+     * <ol>
+     *     <li>take a savepoint of the fence's own. It is required, not best effort: a connection that cannot give one is refused
+     *     before anything is written;</li>
+     *     <li>record version 4, strictly - from version 3 by compare-and-set, or into an empty version table
+     *     by insert. Recording first serializes two concurrent upgrades on the version row: the second waits
+     *     for the first, then finds its row and fails before reading a single grant;</li>
+     *     <li>revoke every grant that is not revoked - expired or not, since nothing written before the
+     *     fences existed is trusted - each by compare-and-set on its revision, at {@code revision + 1};</li>
+     *     <li>write one {@code REVOKED} history event per revoked grant, with a new UUID;</li>
+     *     <li>check that no unrevoked grant is left.</li>
+     * </ol>
+     * The runner commits once at the end, which ends the savepoint as well.
+     * <p>
+     * <b>A failure is taken back by the fence itself, before anything else happens.</b> The runner rolls back on
+     * {@code Exception} only, and its transaction's {@code close()} turns auto-commit back on - which commits whatever the
+     * transaction still holds, after an {@code Error} and after a rollback of the runner's that failed alike. So every failure,
+     * whatever it is, first goes back to the fence savepoint (see {@link #undoFence}). Then an {@code Error} is passed on as it
+     * is, and anything else becomes a refusal with a fixed message and no cause. The version stays where it was and the start
+     * fails.
+     * <p>
+     * The log records an event code, a new correlation id, a fixed detail and at most an exception class: the runner logs what
+     * it is thrown, so nothing read from the database or the driver may be in it.
+     */
+    private void enterFenceEra(@NotNull Connection connection, @NotNull String schema) throws DBException {
+        requireTransaction(connection);
+        Savepoint fence = requireFenceSavepoint(connection);
+        boolean versionRecorded = false;
+        try {
+            recordFenceVersion(connection, schema);
+            versionRecorded = true;
+            quarantineLegacyGrants(connection);
+        } catch (Throwable failure) {
+            undoFence(connection, fence);
+            if (failure instanceof Error error) {
+                logFenceEvent(versionRecorded ? EVENT_FENCE_QUARANTINE_FAILED : EVENT_FENCE_VERSION_REFUSED, "ERROR", error);
+                throw error;
+            }
+            FenceFailure refused = failure instanceof FenceFailure known ? known : failedStatement(versionRecorded, failure);
+            throw refusal(refused.eventCode, refused.detail, refused.getCause(), refused.getMessage());
+        }
+    }
+
+    /**
+     * Before anything: the fence runs only inside the migration transaction - outside one, the version would commit before the
+     * grants were revoked
+     */
+    private static void requireTransaction(@NotNull Connection connection) throws DBException {
+        boolean autoCommit;
+        try {
+            autoCommit = connection.getAutoCommit();
+        } catch (SQLException | RuntimeException e) {
+            throw refusal(EVENT_FENCE_VERSION_REFUSED, "TRANSACTION_UNKNOWN", e, FENCE_NEEDS_TRANSACTION);
+        }
+        if (autoCommit) {
+            throw refusal(EVENT_FENCE_VERSION_REFUSED, "AUTO_COMMIT", null, FENCE_NEEDS_TRANSACTION);
+        }
+    }
+
+    /**
+     * Step 1: the savepoint every failure of the fence goes back to
+     * <p>
+     * Unlike the savepoint of an ordinary version insert ({@link #trySetSavepoint}), it is not optional: without it the fence
+     * could only leave its writes to a runner whose rollback may fail. A connection that does not support savepoints, or fails to
+     * give one, is refused before anything is written. Both verified metadata databases support them.
+     */
+    @NotNull
+    private static Savepoint requireFenceSavepoint(@NotNull Connection connection) throws DBException {
+        Savepoint savepoint;
+        try {
+            savepoint = connection.setSavepoint(FENCE_SAVEPOINT_NAME);
+        } catch (SQLFeatureNotSupportedException e) {
+            throw refusal(EVENT_FENCE_VERSION_REFUSED, "SAVEPOINT_UNSUPPORTED", e, FENCE_NEEDS_SAVEPOINT);
+        } catch (SQLException | RuntimeException e) {
+            throw refusal(EVENT_FENCE_VERSION_REFUSED, "SAVEPOINT_FAILED", e, FENCE_NEEDS_SAVEPOINT);
+        } catch (Error e) {
+            // Nothing has been written yet; the Error is passed on as it is.
+            logFenceEvent(EVENT_FENCE_VERSION_REFUSED, "SAVEPOINT_FAILED", e);
+            throw e;
+        }
+        if (savepoint == null) {
+            throw refusal(EVENT_FENCE_VERSION_REFUSED, "SAVEPOINT_FAILED", null, FENCE_NEEDS_SAVEPOINT);
+        }
+        return savepoint;
+    }
+
+    /**
+     * Step 2: version 4 from version 3, or into an empty version table - never adopted from a concurrent writer
+     * <p>
+     * A lost insert race is refused like any row that does not hold version 3; the fence savepoint takes the failed insert back,
+     * so the transaction stays usable on PostgreSQL too.
+     */
+    private void recordFenceVersion(@NotNull Connection connection, @NotNull String schema)
+            throws FenceFailure, DBException, SQLException {
+        int fence = DbacSchemaConstants.USER_FENCE_SINCE_VERSION;
+        int moved = compareAndSetVersion(connection, fence - 1, fence);
+        if (moved == 1) {
+            return;
+        }
+        if (moved != 0 || readModuleVersion(connection, schema) != null) {
+            throw new FenceFailure(EVENT_FENCE_VERSION_REFUSED, "VERSION_ROW_UNEXPECTED", FENCE_VERSION_REFUSED, null);
+        }
+        try (PreparedStatement dbStat = connection.prepareStatement(INSERT_VERSION)) {
+            dbStat.setString(1, schemaId);
+            dbStat.setInt(2, fence);
+            dbStat.executeUpdate();
+        } catch (SQLException e) {
+            if (SQL_STATE_UNIQUE_VIOLATION.equals(e.getSQLState())) {
+                throw new FenceFailure(EVENT_FENCE_VERSION_REFUSED, "VERSION_ROW_CONFLICT", FENCE_VERSION_REFUSED, e);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Steps 3 to 5: every unrevoked grant revoked at its next revision, one REVOKED event each, and none left
+     */
+    private void quarantineLegacyGrants(@NotNull Connection connection) throws FenceFailure, SQLException {
+        for (LegacyGrant grant : readUnrevokedGrants(connection)) {
+            long revision;
+            try {
+                revision = Math.addExact(grant.revision(), 1);
+            } catch (ArithmeticException e) {
+                throw new FenceFailure(EVENT_FENCE_QUARANTINE_FAILED, "REVISION_OVERFLOW", FENCE_QUARANTINE_FAILED, e);
+            }
+            if (revokeLegacyGrant(connection, grant, revision) != 1) {
+                throw new FenceFailure(EVENT_FENCE_QUARANTINE_FAILED, "REVOKE_MISSED", FENCE_QUARANTINE_FAILED, null);
+            }
+            if (recordLegacyRevocation(connection, grant, revision) != 1) {
+                throw new FenceFailure(EVENT_FENCE_QUARANTINE_FAILED, "HISTORY_MISSED", FENCE_QUARANTINE_FAILED, null);
+            }
+        }
+        if (countUnrevokedGrants(connection) != 0) {
+            throw new FenceFailure(EVENT_FENCE_QUARANTINE_FAILED, "UNREVOKED_LEFT", FENCE_QUARANTINE_FAILED, null);
+        }
+    }
+
+    /**
+     * A failure the fence did not classify itself: a statement, or the driver under it, failed while the version was recorded or
+     * while the grants were quarantined
+     */
+    @NotNull
+    private static FenceFailure failedStatement(boolean versionRecorded, @NotNull Throwable failure) {
+        return versionRecorded
+            ? new FenceFailure(EVENT_FENCE_QUARANTINE_FAILED, "STATEMENT_FAILED", FENCE_QUARANTINE_FAILED, failure)
+            : new FenceFailure(EVENT_FENCE_VERSION_REFUSED, "VERSION_STATEMENT_FAILED", FENCE_VERSION_REFUSED, failure);
+    }
+
+    /**
+     * A failure the fence has classified: the event and detail it is logged with, and the fixed message it is refused with
+     * <p>
+     * It never leaves this class. Once the fence has taken its writes back it becomes a {@code DBException} with that message
+     * and no cause; the failure it stands for is kept only so that its class can be logged.
+     */
+    private static final class FenceFailure extends Exception {
+        private final String eventCode;
+        private final String detail;
+
+        FenceFailure(@NotNull String eventCode, @NotNull String detail, @NotNull String refusalMessage, @Nullable Throwable cause) {
+            super(refusalMessage, cause, false, false);
+            this.eventCode = eventCode;
+            this.detail = detail;
+        }
+    }
+
+    /** One grant the quarantine revokes, read before any of them is changed */
+    private record LegacyGrant(@NotNull String userId, @NotNull String projectId, @NotNull String connectionId, long revision) {
+    }
+
+    @NotNull
+    private static List<LegacyGrant> readUnrevokedGrants(@NotNull Connection connection) throws SQLException {
+        List<LegacyGrant> grants = new ArrayList<>();
+        try (PreparedStatement dbStat = connection.prepareStatement(SELECT_UNREVOKED);
+             ResultSet dbResult = dbStat.executeQuery()
+        ) {
+            while (dbResult.next()) {
+                grants.add(new LegacyGrant(dbResult.getString(1), dbResult.getString(2), dbResult.getString(3), dbResult.getLong(4)));
+            }
+        }
+        return grants;
+    }
+
+    private static int revokeLegacyGrant(@NotNull Connection connection, @NotNull LegacyGrant grant, long revision) throws SQLException {
+        try (PreparedStatement dbStat = connection.prepareStatement(REVOKE_LEGACY)) {
+            dbStat.setLong(1, revision);
+            dbStat.setString(2, FENCE_ACTOR);
+            dbStat.setString(3, FENCE_REASON);
+            dbStat.setString(4, grant.userId());
+            dbStat.setString(5, grant.projectId());
+            dbStat.setString(6, grant.connectionId());
+            dbStat.setLong(7, grant.revision());
+            return dbStat.executeUpdate();
+        }
+    }
+
+    /**
+     * The REVOKED event, copied from the row just revoked: its grant, key and expiry, and as its time the very instant it was revoked
+     */
+    private static int recordLegacyRevocation(@NotNull Connection connection, @NotNull LegacyGrant grant, long revision)
+            throws SQLException {
+        try (PreparedStatement dbStat = connection.prepareStatement(RECORD_LEGACY_REVOCATION)) {
+            dbStat.setString(1, UUID.randomUUID().toString());
+            dbStat.setString(2, FENCE_ACTOR);
+            dbStat.setString(3, FENCE_REASON);
+            dbStat.setString(4, grant.userId());
+            dbStat.setString(5, grant.projectId());
+            dbStat.setString(6, grant.connectionId());
+            dbStat.setLong(7, revision);
+            return dbStat.executeUpdate();
+        }
+    }
+
+    private static long countUnrevokedGrants(@NotNull Connection connection) throws SQLException {
+        try (PreparedStatement dbStat = connection.prepareStatement(COUNT_UNREVOKED);
+             ResultSet dbResult = dbStat.executeQuery()
+        ) {
+            if (!dbResult.next()) {
+                throw new SQLException("The unrevoked grant count returned no row");
+            }
+            return dbResult.getLong(1);
+        }
+    }
+
+    /**
+     * Logs a fence refusal by event code and returns the fixed-message exception to throw
+     */
+    @NotNull
+    private static DBException refusal(
+        @NotNull String eventCode,
+        @NotNull String detail,
+        @Nullable Throwable cause,
+        @NotNull String message
+    ) {
+        logFenceEvent(eventCode, detail, cause);
+        return new DBException(message);
+    }
+
+    /**
+     * Records a fence failure by event code, a new correlation id, a fixed detail and at most the exception class
+     */
+    private static void logFenceEvent(@NotNull String eventCode, @NotNull String detail, @Nullable Throwable cause) {
+        try {
+            log.error("DBAC user-incarnation fence migration failed [event=" + eventCode
+                + " EVENT_ID=" + UUID.randomUUID()
+                + " detail=" + detail
+                + (cause == null ? "" : " exception=" + cause.getClass().getName()) + "]");
+        } catch (RuntimeException | Error ignored) {
+            // Deliberately nothing: the refusal must not depend on whether it could be logged.
+        }
+    }
+
+    /**
+     * Takes back everything the fence wrote: to its savepoint, else the whole transaction, else by closing the connection
+     * <p>
+     * Runs before any failure of the fence is reported. Going back to the savepoint leaves the transaction as the runner handed
+     * it over - usable on PostgreSQL even after a failed statement. If that fails, the whole transaction is rolled back; if that
+     * fails too, the connection is closed, which ends its transaction without a commit on both engines and when a pool takes
+     * it back. The connection never goes back to the runner with the fence's writes in it, because the runner's
+     * {@code close()} would commit them. Each step that fails is logged by event code and exception class only, and nothing
+     * thrown here - an {@code Error} included - replaces the failure the caller reports.
+     */
+    private static void undoFence(@NotNull Connection connection, @NotNull Savepoint fence) {
+        try {
+            connection.rollback(fence);
+            return;
+        } catch (Throwable e) {
+            logFenceEvent(EVENT_FENCE_UNDO_FAILED, "SAVEPOINT_ROLLBACK_FAILED", e);
+        }
+        try {
+            connection.rollback();
+            return;
+        } catch (Throwable e) {
+            logFenceEvent(EVENT_FENCE_UNDO_FAILED, "ROLLBACK_FAILED", e);
+        }
+        try {
+            connection.close();
+        } catch (Throwable e) {
+            logFenceEvent(EVENT_FENCE_UNDO_FAILED, "CLOSE_FAILED", e);
+        }
     }
 
     /**
