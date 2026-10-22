@@ -54,6 +54,7 @@ import io.cloudbeaver.test.platform.dbac.MetadataDisposalTest;
 import io.cloudbeaver.test.platform.dbac.MetadataLeasePostgresTest;
 import io.cloudbeaver.test.platform.dbac.MetadataLeaseTest;
 import io.cloudbeaver.test.platform.dbac.MetadataShutdownTest;
+import io.cloudbeaver.test.platform.dbac.ServerManagedCredentialTest;
 import io.cloudbeaver.test.platform.dbac.TaintRegistryLifecycleTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteModelTest;
 import io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest;
@@ -124,7 +125,8 @@ import org.junit.platform.suite.api.Suite;
         TransactionEnforcementEntryPointTest.class,
         TransactionEnforcementAdapterTest.class,
         ExplainEnforcementEntryPointTest.class,
-        ExplainEnforcementAdapterTest.class
+        ExplainEnforcementAdapterTest.class,
+        ServerManagedCredentialTest.class
     }
 )
 public class CEServerTestSuite {

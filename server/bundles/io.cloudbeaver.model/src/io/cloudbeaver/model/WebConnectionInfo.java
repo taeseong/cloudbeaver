@@ -19,6 +19,7 @@ package io.cloudbeaver.model;
 import io.cloudbeaver.DBWebException;
 import io.cloudbeaver.WebProjectImpl;
 import io.cloudbeaver.model.app.BaseWebAppConfiguration;
+import io.cloudbeaver.model.session.ServerManagedCredentials;
 import io.cloudbeaver.model.session.WebSession;
 import io.cloudbeaver.server.CBConstants;
 import io.cloudbeaver.service.security.SMUtils;
@@ -357,6 +358,10 @@ public class WebConnectionInfo {
 
     @Property
     public boolean isAuthNeeded() throws DBException {
+        if (ServerManagedCredentials.provider().governs(dataSourceContainer)) {
+            // The server supplies the credential; the client is never asked for one
+            return false;
+        }
         return !dataSourceContainer.isConnected() &&
             !(dataSourceContainer.isCredentialsSaved() || isAuthPropertiesEmpty()) &&
             !dataSourceContainer.getDriver().isAnonymousAccess();

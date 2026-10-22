@@ -70,6 +70,8 @@ REQUIRED_VALUE = "true"
 # leaves, and a rollback the network never answers.
 # The P6-B classes drive the wired Explain entry point on real PostgreSQL target connections: a statement EXPLAIN ANALYZE
 # would run, counted by the sequence it draws from, a lost connection recovered and judged again, and the audit row.
+# ServerManagedCredentialTest connects protected connections through GraphQL with disposable PostgreSQL login roles:
+# which role each backend belongs to is what shows the server read credential, and nothing else, was used.
 POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.DbacSchemaPostgresTest",
     "io.cloudbeaver.test.platform.dbac.TempWriteRepositoryPostgresTest",
@@ -90,6 +92,7 @@ POSTGRES_CLASSES = (
     "io.cloudbeaver.test.platform.dbac.TransactionEnforcementAdapterTest",
     "io.cloudbeaver.test.platform.dbac.ExplainEnforcementEntryPointTest",
     "io.cloudbeaver.test.platform.dbac.ExplainEnforcementAdapterTest",
+    "io.cloudbeaver.test.platform.dbac.ServerManagedCredentialTest",
 )
 
 # Pinned deliberately, as tripwires rather than conveniences. Reading the counts from the report would
@@ -136,6 +139,7 @@ EXPECTED_DBAC_TESTS = {
     "io.cloudbeaver.test.platform.dbac.TransactionEnforcementAdapterTest": 19,
     "io.cloudbeaver.test.platform.dbac.ExplainEnforcementEntryPointTest": 2,
     "io.cloudbeaver.test.platform.dbac.ExplainEnforcementAdapterTest": 17,
+    "io.cloudbeaver.test.platform.dbac.ServerManagedCredentialTest": 17,
 }
 
 for _postgres_class in POSTGRES_CLASSES:

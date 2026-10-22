@@ -828,6 +828,17 @@ public class WebSession extends BaseWebSession
         @NotNull DBPDataSourceContainer dataSourceContainer,
         @NotNull DBPConnectionConfiguration configuration
     ) {
+        ServerManagedCredentials.Provider serverManaged = ServerManagedCredentials.provider();
+        if (serverManaged.governs(dataSourceContainer)) {
+            // The server supplies this connection's credential: nothing from nested sessions, the client or the session
+            serverManaged.supplyReadCredential(
+                dataSourceContainer,
+                configuration,
+                hasClientCredentials(dataSourceContainer),
+                ServerManagedCredentials.isExplicitConnect(dataSourceContainer)
+            );
+            return true;
+        }
         try {
             // Properties from nested auth sessions
             for (DBACredentialsProvider contextCredentialsProvider : getContextCredentialsProviders()) {
@@ -855,6 +866,14 @@ public class WebSession extends BaseWebSession
             log.error(e);
         }
         return true;
+    }
+
+    /** Whether the client left credentials for the connection in this session */
+    private boolean hasClientCredentials(@NotNull DBPDataSourceContainer dataSourceContainer) {
+        WebSessionProjectImpl project = getProjectById(dataSourceContainer.getProject().getId());
+        WebConnectionInfo webConnectionInfo = project == null ? null : project.findWebConnectionInfo(dataSourceContainer.getId());
+        return webConnectionInfo != null && ServerManagedCredentials.carriesCredentials(
+            webConnectionInfo.getSavedAuthProperties(), webConnectionInfo.getSavedNetworkCredentials());
     }
 
     @NotNull

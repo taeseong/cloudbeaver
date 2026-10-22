@@ -121,9 +121,12 @@ public class DbacSecurityControllerFactory<T extends ServletAuthApplication>
 
     /**
      * The server's factory: it initializes the global holder with the production guard, query manager and service
+     * <p>
+     * It also installs, once, the credential provider of the protected connections the server configuration names.
      */
     public DbacSecurityControllerFactory() {
         this(PolicyServiceHolder.global(), null, false);
+        ProtectedConnectionCredentials.installForServer();
     }
 
     /**

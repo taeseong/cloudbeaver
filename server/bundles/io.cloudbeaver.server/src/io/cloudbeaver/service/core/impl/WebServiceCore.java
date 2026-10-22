@@ -21,6 +21,7 @@ import io.cloudbeaver.*;
 import io.cloudbeaver.model.*;
 import io.cloudbeaver.model.app.ServletApplication;
 import io.cloudbeaver.model.app.ServletSystemInformationCollector;
+import io.cloudbeaver.model.session.ServerManagedCredentials;
 import io.cloudbeaver.model.session.WebSession;
 import io.cloudbeaver.registry.WebHandlerRegistry;
 import io.cloudbeaver.registry.WebSessionHandlerDescriptor;
@@ -39,6 +40,7 @@ import org.jkiss.code.Nullable;
 import org.jkiss.dbeaver.DBException;
 import org.jkiss.dbeaver.Log;
 import org.jkiss.dbeaver.model.DBConstants;
+import org.jkiss.dbeaver.model.DBPDataSource;
 import org.jkiss.dbeaver.model.DBPDataSourceContainer;
 import org.jkiss.dbeaver.model.DBPDataSourceFolder;
 import org.jkiss.dbeaver.model.app.DBPDataSourceRegistry;
@@ -58,6 +60,7 @@ import org.jkiss.dbeaver.model.net.DBWTunnel;
 import org.jkiss.dbeaver.model.net.ssh.SSHSession;
 import org.jkiss.dbeaver.model.rm.RMProjectType;
 import org.jkiss.dbeaver.model.runtime.DBRProgressMonitor;
+import org.jkiss.dbeaver.model.runtime.VoidProgressMonitor;
 import org.jkiss.dbeaver.model.secret.DBSSecretController;
 import org.jkiss.dbeaver.model.secret.DBSSecretValue;
 import org.jkiss.dbeaver.registry.DataSourceDescriptor;
@@ -311,6 +314,7 @@ public class WebServiceCore implements DBWServiceCore {
 
         DataSourceDescriptor dataSource = (DataSourceDescriptor) WebDataSourceUtils.getLocalOrGlobalDataSource(
             webSession, projectId, configInput.getConnectionId());
+        refuseServerManaged(dataSource);
         try {
             DataSourceDescriptor testDataSource = getDataSourceDescriptor(webSession, dataSource, configInput, project);
             DBPConnectionConfiguration connectionConfiguration
@@ -351,6 +355,10 @@ public class WebServiceCore implements DBWServiceCore {
     ) throws DBWebException {
         WebConnectionInfo connectionInfo = WebDataSourceUtils.getWebConnectionInfo(webSession, projectId, connectionId);
         connectionInfo.validateConnection();
+        if (ServerManagedCredentials.provider().governs(connectionInfo.getDataSourceContainer())) {
+            return initServerManagedConnection(
+                connectionInfo, authProperties, networkCredentials, saveCredentials, sharedCredentials, selectedSecretId);
+        }
         connectionInfo.setSavedCredentials(authProperties, networkCredentials);
 
         var dataSourceContainer = connectionInfo.getDataSourceContainer();
@@ -459,6 +467,177 @@ public class WebServiceCore implements DBWServiceCore {
         return connectionInfo;
     }
 
+    /**
+     * Connects a connection whose credential the server supplies
+     * <p>
+     * The client may send no credential of any kind, and the connect runs as an explicit one - the only kind that
+     * receives the server credential. Once connected, the session must run as that credential, or it is closed again.
+     * Whatever exception fails it, the client gets the one fixed refusal: no cause, no driver message, nothing about the
+     * endpoint or the credential. The connect does not report its progress to the session log either, whose task names
+     * carry the endpoint.
+     * <p>
+     * An {@link Error} is not a refusal, wherever it was raised - by the check here, inside the platform's connect,
+     * which wraps it in its own exception, or while a failure is handled: that Error itself is rethrown. Clearing the
+     * connect-time copy and closing the connection are attempted as separate steps, independently of each other, and
+     * nothing a cleanup step throws takes the place of the Error being handled. A cleanup step can fail itself; then
+     * the connection may stay open, or the copy may keep the credential - neither is guaranteed.
+     * <p>
+     * DBAC adds no credential to an Error. Nor does it redact one: the message and stack trace of an Error from the
+     * driver or the platform go on unredacted along the platform's handling path, and nothing here guarantees that they
+     * carry no sensitive information.
+     */
+    @NotNull
+    private WebConnectionInfo initServerManagedConnection(
+        @NotNull WebConnectionInfo connectionInfo,
+        @Nullable Map<String, Object> authProperties,
+        @Nullable List<WebNetworkHandlerConfigInput> networkCredentials,
+        boolean saveCredentials,
+        boolean sharedCredentials,
+        @Nullable String selectedSecretId
+    ) throws DBWebException {
+        ServerManagedCredentials.Provider serverManaged = ServerManagedCredentials.provider();
+        DBPDataSourceContainer dataSourceContainer = connectionInfo.getDataSourceContainer();
+        if (ServerManagedCredentials.carriesCredentials(authProperties, networkCredentials)
+            || saveCredentials || sharedCredentials || selectedSecretId != null) {
+            throw serverManagedRefusal(serverManaged.refuseClientInput(dataSourceContainer));
+        }
+        if (dataSourceContainer.isConnected()) {
+            throw new DBWebException("Datasource '" + dataSourceContainer.getName() + "' is already connected");
+        }
+        connectionInfo.setSavedCredentials(null, null);
+        validateDriverLibrariesPresence(dataSourceContainer);
+        DBRProgressMonitor monitor = new VoidProgressMonitor();
+        try (ServerManagedCredentials.Scope ignored = ServerManagedCredentials.explicitConnect(dataSourceContainer)) {
+            dataSourceContainer.connect(monitor, true, false);
+            if (dataSourceContainer.isConnected()) {
+                serverManaged.verifyConnected(dataSourceContainer, monitor);
+            }
+        } catch (Exception e) {
+            Error wrapped = errorCause(e);
+            if (wrapped != null) {
+                throw closeAfterError(serverManaged, dataSourceContainer, monitor, wrapped);
+            }
+            throw refuseAfterFailure(serverManaged, dataSourceContainer, monitor, e);
+        } catch (Error e) {
+            throw closeAfterError(serverManaged, dataSourceContainer, monitor, e);
+        } finally {
+            connectionInfo.clearCache();
+        }
+        return connectionInfo;
+    }
+
+    /** The first Error in a failure's cause chain - the platform's connect wraps any Error it meets */
+    @Nullable
+    private static Error errorCause(@NotNull Throwable failure) {
+        Throwable cause = failure;
+        for (int depth = 0; cause != null && depth < 20; cause = cause.getCause(), depth++) {
+            if (cause instanceof Error error) {
+                return error;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Has the provider clear the copy and log the failure, attempts to close the connection, and returns the fixed
+     * refusal to be thrown
+     * <p>
+     * If the provider raises an Error there, that Error is no refusal either: it is handled as any other Error -
+     * clearing the copy is attempted again and closing the connection attempted, each on its own - and then rethrown.
+     * If the provider fails with a RuntimeException instead, clearing the copy is not attempted again: only the close
+     * is, and the refusal is the fixed one.
+     */
+    @NotNull
+    private static DBWebException refuseAfterFailure(
+        @NotNull ServerManagedCredentials.Provider serverManaged,
+        @NotNull DBPDataSourceContainer dataSourceContainer,
+        @NotNull DBRProgressMonitor monitor,
+        @NotNull Exception failure
+    ) {
+        ServerManagedCredentials.Refusal refusal;
+        try {
+            refusal = serverManaged.connectFailed(dataSourceContainer, failure);
+        } catch (Error error) {
+            throw closeAfterError(serverManaged, dataSourceContainer, monitor, error);
+        } catch (RuntimeException providerFailure) {
+            refusal = new ServerManagedCredentials.Refusal();
+        }
+        closeRefusedConnection(dataSourceContainer, monitor);
+        return serverManagedRefusal(refusal);
+    }
+
+    /**
+     * Attempts to clear the copy and to close the connection after an Error, and returns that Error to be rethrown
+     * <p>
+     * Each step is guarded on its own: nothing a step throws takes the Error's place, and a step that fails is not
+     * retried.
+     */
+    @NotNull
+    private static Error closeAfterError(
+        @NotNull ServerManagedCredentials.Provider serverManaged,
+        @NotNull DBPDataSourceContainer dataSourceContainer,
+        @NotNull DBRProgressMonitor monitor,
+        @NotNull Error error
+    ) {
+        try {
+            serverManaged.connectFailed(dataSourceContainer, error);
+        } catch (Throwable cleanupFailure) {
+            // The original Error is the one thrown
+        }
+        try {
+            closeRefusedConnection(dataSourceContainer, monitor);
+        } catch (Throwable cleanupFailure) {
+            // Likewise
+        }
+        return error;
+    }
+
+    /**
+     * Closes what a refused governed connect opened
+     * <p>
+     * If the container cannot be disconnected, its data source is shut down, so that none of its connections stays
+     * usable. The refusal stands either way; an Error from either step is not swallowed. If the disconnect itself
+     * raises an Error, the shutdown is not attempted and the Error goes on; clearing the connect-time copy has been
+     * attempted before this, but whether it succeeded is not known here.
+     */
+    private static void closeRefusedConnection(@NotNull DBPDataSourceContainer dataSourceContainer, @NotNull DBRProgressMonitor monitor) {
+        if (!dataSourceContainer.isConnected()) {
+            return;
+        }
+        try {
+            dataSourceContainer.disconnect(monitor);
+        } catch (Exception ignored) {
+            // Shut down below
+        }
+        DBPDataSource dataSource = dataSourceContainer.getDataSource();
+        if (dataSourceContainer.isConnected() && dataSource != null) {
+            try {
+                dataSource.shutdown(monitor);
+            } catch (Exception ignored) {
+                // Nothing further can be closed
+            }
+        }
+    }
+
+    /**
+     * Refuses, with the fixed refusal and nothing else, to test, copy, change or describe the driver properties of a
+     * connection whose credential the server supplies
+     */
+    private static void refuseServerManaged(@Nullable DBPDataSourceContainer dataSourceContainer) throws DBWebException {
+        ServerManagedCredentials.Provider serverManaged = ServerManagedCredentials.provider();
+        if (dataSourceContainer != null && serverManaged.governs(dataSourceContainer)) {
+            throw serverManagedRefusal(serverManaged.refuseClientInput(dataSourceContainer));
+        }
+    }
+
+    /** The fixed refusal as a client error: its message only, without the server frames a stack trace would show */
+    @NotNull
+    private static DBWebException serverManagedRefusal(@NotNull ServerManagedCredentials.Refusal refusal) {
+        DBWebException error = new DBWebException(refusal.getMessage());
+        error.setStackTrace(new StackTraceElement[0]);
+        return error;
+    }
+
     @Override
     public WebConnectionInfo createConnection(
         @NotNull WebSession webSession,
@@ -474,7 +653,12 @@ public class WebServiceCore implements DBWServiceCore {
         @Nullable String projectId,
         @NotNull Map<String, Object> connectionConfig
     ) throws DBWebException {
-        return getProjectById(webSession, projectId).updateConnection(connectionConfig);
+        WebSessionProjectImpl project = getProjectById(webSession, projectId);
+        String connectionId = project.getConnectionConfigInput(connectionConfig).getConnectionId();
+        if (!CommonUtils.isEmpty(connectionId)) {
+            refuseServerManaged(project.getDataSourceRegistry().getDataSource(connectionId));
+        }
+        return project.updateConnection(connectionConfig);
     }
 
     @Override
@@ -507,6 +691,11 @@ public class WebServiceCore implements DBWServiceCore {
                 throw new DBException("Node '" + nodePath + "' is not a datasource node");
             }
             DBPDataSourceContainer dataSourceTemplate = dbnDataSource.getDataSourceContainer();
+            ServerManagedCredentials.Provider serverManaged = ServerManagedCredentials.provider();
+            if (serverManaged.governs(dataSourceTemplate)) {
+                // Thrown past the generic copy error below, which would add to the fixed message
+                throw serverManaged.refuseClientInput(dataSourceTemplate);
+            }
             if (!dataSourceTemplate.isExternallyProvided()) {
                 if (!CommonUtils.equalObjects(dataSourceTemplate.getProject(), project)) {
                     throw new DBException("Copying connection to another project is not allowed");
@@ -538,6 +727,8 @@ public class WebServiceCore implements DBWServiceCore {
 
             dataSourceRegistry.checkForErrors();
             return project.addConnection(newDataSource);
+        } catch (ServerManagedCredentials.Refusal e) {
+            throw serverManagedRefusal(e);
         } catch (DBException e) {
             throw new DBWebException("Error copying connection", e);
         }
@@ -556,6 +747,7 @@ public class WebServiceCore implements DBWServiceCore {
 
         DataSourceDescriptor dataSource = (DataSourceDescriptor) WebDataSourceUtils.getLocalOrGlobalDataSource(
             webSession, projectId, configInput.getConnectionId());
+        refuseServerManaged(dataSource);
         DataSourceDescriptor testDataSource = getDataSourceDescriptor(webSession, dataSource, configInput, project);
         testDataSource.setTemporary(true);
         WebConnectionInfo connectionInfo = project.addConnection(testDataSource);
